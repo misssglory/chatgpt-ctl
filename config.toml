@@ -21,7 +21,7 @@ conversation_id = ""
 [browser]
 # Prefer a system Chromium that is NOT the Playwright-bundled one.
 # On NixOS this is often something like /etc/profiles/per-user/$USER/bin/chromium
-executable_path = "/home/mg/.nix-profile/bin/chromium-regular"
+executable_path = ""
 prefer_system_chromium = true
 headless = false
 native_window_viewport = true

@@ -1,133 +1,171 @@
-# chatgpt-history-watcher
+# chatgpt-ctl
 
-Scrape ChatGPT (chatgpt.com) conversation history into **PostgreSQL**, modeled on the same browser-profile / login pattern as `fomo-trending-watcher`.
+CLI (+ optional Bun scraper) for **ChatGPT conversation history** stored in **PostgreSQL**.
 
-## Features
+- **`chatgpt-ctl`** — minimal Rust binary (no Bun, Chromium, rustc, or PostgreSQL client in the runtime closure)
+- Shell **completions** installed with the package (bash / zsh / fish)
+- **NixOS module** for global install + optional local DB/schema
+- Optional **watcher** (`bun run watch`) that scrapes chatgpt.com using a persistent Chromium profile
 
-- **Login mode without Playwright** — Google / OpenAI often reject automated browsers. `bun run login` starts a *normal* Chromium with `--user-data-dir=./var/chatgpt-profile`. After you sign in and close the window, the profile (cookies, local storage) is reused by Playwright via `launchPersistentContext`.
-- **Persist every message when it is completed** — the watcher polls the open chat, detects the “Stop generating” control, and only marks an assistant turn `completed=true` (and stamps `completed_at`) after streaming finishes (with a small settle debounce).
-- **PostgreSQL** — `chats` + `messages` tables; upserts are idempotent by ChatGPT UUIDs.
-- **`flake.nix`** — `nix run .#setup-db` / `nix run .#flush-db` plus a dev shell with Bun, Chromium, Postgres client tools, and Rust.
-- **Rust `chatgpt-ctl`** — list chats, show history of the current (most recent) chat or a specific chat, follow mode, and **DB-backed autocomplete** of chat titles / UUIDs in the interactive prompt. Static shell completions via `chatgpt-ctl completions zsh`.
+---
 
-## Quick start
+## Install `chatgpt-ctl` only on NixOS (global)
 
-```bash
-# 1. Dev shell (optional but recommended on NixOS)
-nix develop
+### 1. Flake input
 
-# 2. Database
-nix run .#setup-db
-# or: bun run migrate   (applies sql/schema.sql using config.toml)
+```nix
+# flake.nix
+{
+  inputs.chatgpt-ctl.url = "github:YOUR_USER/chatgpt-ctl";  # or path:./chatgpt-ctl
 
-# 3. Edit config.toml — set [browser].executable_path if needed
-
-# 4. One-time login (manual Chromium, no automation)
-bun run login
-# Sign into ChatGPT, open a chat, close the window.
-
-# 5. Watch the currently open chat; write completed messages to Postgres
-bun run watch
-
-# 6. Query with the Rust ctl
-cd ctl && cargo build --release
-../ctl/target/release/chatgpt-ctl chats
-../ctl/target/release/chatgpt-ctl history current
-../ctl/target/release/chatgpt-ctl history          # interactive + TAB autocomplete from DB
-../ctl/target/release/chatgpt-ctl history --follow current
+  outputs = { self, nixpkgs, chatgpt-ctl, ... }: {
+    nixosConfigurations.yourHost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ./configuration.nix
+        chatgpt-ctl.nixosModules.default
+        {
+          nixpkgs.overlays = [ chatgpt-ctl.overlays.default ];
+        }
+      ];
+    };
+  };
+}
 ```
 
-## Commands (Bun / TypeScript)
+### 2. Module options
 
-| Command | Purpose |
-|--------|---------|
-| `bun run doctor` | Check Chromium + Postgres connectivity |
-| `bun run login` | Launch normal Chromium → save profile cookies |
-| `bun run migrate` | Apply `sql/schema.sql` |
-| `bun run dump` | One-shot scrape of the open chat → DB |
-| `bun run once` | Same as dump (alias for “single poll”) |
-| `bun run watch` | Continuous poll; persist messages as they complete |
+```nix
+# configuration.nix (or a dedicated module)
+{
+  programs.chatgpt-ctl = {
+    enable = true;
 
-## Commands (Rust ctl)
+    # Optional: create role + database + apply schema via systemd oneshot
+    # (starts services.postgresql if needed)
+    database.ensureLocal = true;
+    database.name = "chatgpt_history";
+    database.user = "chatgpt";
+    # database.passwordFile = "/run/secrets/chatgpt-db-password";  # optional
+
+    # Default DATABASE_URL for shells (socket peer auth when ensureLocal)
+    # databaseUrl = "postgres://chatgpt@/chatgpt_history?host=/run/postgresql";
+  };
+}
+```
+
+Then:
+
+```bash
+sudo nixos-rebuild switch
+chatgpt-ctl chats
+chatgpt-ctl history current
+```
+
+Completions ship with the package (`share/bash-completion`, `share/zsh/site-functions`, …). With bash/zsh completion enabled they load automatically.
+
+### 3. Package-only (no module)
+
+```bash
+# one-off
+nix profile install github:YOUR_USER/chatgpt-ctl
+
+# or in configuration.nix without the module:
+environment.systemPackages = [ inputs.chatgpt-ctl.packages.${system}.chatgpt-ctl ];
+```
+
+If you already ran `nix run .#setup-db`, set `DATABASE_URL` to that instance:
+
+```bash
+export DATABASE_URL='postgres://chatgpt:chatgpt@127.0.0.1:5432/chatgpt_history'
+# or socket:
+export DATABASE_URL='postgres://chatgpt@/chatgpt_history?host=/run/postgresql'
+```
+
+### 4. Build from this repo
+
+```bash
+nix build .#chatgpt-ctl          # root flake
+nix build ./ctl#chatgpt-ctl      # ctl-only flake (no watcher inputs)
+nix run .#chatgpt-ctl -- chats
+```
+
+Runtime of the result is only the binary + completions + `share/chatgpt-ctl/*.sql`.  
+**Not** pulled in: Bun, Chromium, rustc, PostgreSQL server/client, GTK, etc.
+
+---
+
+## `ctl/flake.nix`
+
+Standalone flake for the Rust CLI alone:
+
+```bash
+cd ctl
+nix build
+./result/bin/chatgpt-ctl --help
+```
+
+---
+
+## CLI usage
 
 ```text
 chatgpt-ctl chats [--limit N] [-q substring]
 chatgpt-ctl history [CHAT|current] [--all] [--follow] [--json]
-chatgpt-ctl history                 # interactive readline, TAB completes from DB
+chatgpt-ctl history                 # interactive; TAB completes titles/UUIDs from DB
 chatgpt-ctl message <uuid>
 chatgpt-ctl completions bash|zsh|fish|elvish|powershell
 ```
 
-`CHAT` may be a full UUID, a title substring, or the keyword `current` (most recently updated row in `chats`).
-
-### Shell completions
+`CHAT` may be a UUID, a title substring, or `current` (most recently updated chat).
 
 ```bash
-# zsh example
+# static shell completion (also installed by the Nix package)
 chatgpt-ctl completions zsh > ~/.zfunc/_chatgpt-ctl
 ```
 
-Interactive history completion loads titles and ids from Postgres at prompt time (not static).
+---
 
-## flake.nix apps
+## Optional: Bun watcher (scraper)
+
+Only needed if you scrape chatgpt.com into the same DB. **Not** required for the global `chatgpt-ctl` install.
 
 ```bash
-nix run .#setup-db    # CREATE ROLE/DATABASE + apply schema.sql
-nix run .#flush-db    # TRUNCATE messages, chats
-nix develop           # bun, rustc, chromium, psql, …
+nix develop .#watcher          # Bun + tools; no Chromium package (use your profile binary)
+# config.toml:
+#   [browser]
+#   executable_path = "/home/YOU/.nix-profile/bin/chromium-regular"
+
+bun install
+bun run login                  # normal Chromium → var/chatgpt-profile
+bun run migrate                # or rely on NixOS module schema service
+bun run watch                  # persist messages when streaming completes
 ```
 
-Default connection (override with `DATABASE_URL` or `[database]` in `config.toml`):
+Login uses a **non-Playwright** Chromium process with `--user-data-dir` so Google/OpenAI cookies land in the profile; `watch` reuses it via `launchPersistentContext`.
 
-```text
-postgres://chatgpt:chatgpt@127.0.0.1:5432/chatgpt_history
+---
+
+## Layout
+
+| Path | Purpose |
+|------|---------|
+| `ctl/` | Rust `chatgpt-ctl` source + `ctl/flake.nix` |
+| `modules/chatgpt-ctl.nix` | NixOS module (`programs.chatgpt-ctl`) |
+| `flake.nix` | Package, overlay, nixosModule, setup-db/flush-db apps |
+| `sql/` | `schema.sql` / `flush.sql` (also under `$out/share/chatgpt-ctl/`) |
+| `src/` | Optional Bun/Playwright watcher |
+| `config.toml` | Watcher config |
+
+---
+
+## Database (already set up)
+
+If you previously ran `nix run .#setup-db`, the module’s `database.ensureLocal` is optional — point `DATABASE_URL` at that instance and install only the package:
+
+```nix
+programs.chatgpt-ctl.enable = true;
+programs.chatgpt-ctl.database.ensureLocal = false;
+programs.chatgpt-ctl.databaseUrl =
+  "postgres://chatgpt:chatgpt@127.0.0.1:5432/chatgpt_history";
 ```
-
-## Schema (summary)
-
-```sql
-chats(id uuid PK, title, url, updated_at, last_message_at, …)
-messages(id uuid PK, chat_id FK, role, content, sequence, completed, completed_at, …)
-```
-
-A message row is inserted as soon as it appears in the DOM. `completed` flips to `true` and `completed_at` is set only after the streaming indicator disappears and the settle window elapses.
-
-## DOM notes (from the sample ChatGPT / Codex outerHTML)
-
-- Conversation id: `data-chatgpt-selection-conversation-id` or URL `/c/{uuid}`
-- Message ids: `data-chatgpt-search-message-ids`
-- User bubbles: `[data-user-message-bubble="true"]`, unit key ending in `:user`
-- Assistant: `data-conversation-role="assistant"` / unit key `:assistant`
-- Streaming: presence of a “Stop generating” (or aria-label Stop) button
-
-UI changes on chatgpt.com may require selector updates in `src/index.ts` → `scrapeCurrentChat`.
-
-## Config (`config.toml`)
-
-```toml
-[chatgpt]
-url = "https://chatgpt.com/"
-profile_dir = "./var/chatgpt-profile"
-poll_ms = 1500
-complete_settle_ms = 800
-conversation_id = ""          # empty = follow whatever chat is open
-
-[browser]
-executable_path = ""          # empty = which chromium / chrome
-prefer_system_chromium = true
-headless = false
-native_window_viewport = true
-
-[database]
-url = "postgres://chatgpt:chatgpt@127.0.0.1:5432/chatgpt_history"
-```
-
-## Relation to fomo-trending-watcher
-
-| Concern | fomo | this project |
-|--------|------|--------------|
-| Login | Normal Chromium + `--user-data-dir` | Same |
-| Runtime browser | `chromium.launchPersistentContext(profile)` | Same |
-| Persistence | JSON state file | PostgreSQL |
-| External ctl | `ethctl.sh` (bash/TCP) | `chatgpt-ctl` (Rust, SQL + completions) |
-| “When to record” | first-seen / rank thresholds | message `completed` (streaming ended) |
