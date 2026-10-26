@@ -1,0 +1,44 @@
+# chatgpt-history-watcher v0.1.0
+#
+# Login flow (same idea as fomo-trending-watcher):
+#   1. bun run login   → launches NORMAL Chromium with --user-data-dir=profile
+#                        (no Playwright automation — Google/OpenAI login works)
+#   2. Sign into ChatGPT, verify the sidebar shows your chats, CLOSE the window
+#   3. bun run watch   → Playwright reuses the same profile via launchPersistentContext
+
+[chatgpt]
+url = "https://chatgpt.com/"
+profile_dir = "./var/chatgpt-profile"
+# Poll interval while watching a live chat for newly completed messages.
+poll_ms = 1500
+# How long to wait after the streaming indicator disappears before treating
+# an assistant message as completed (ms).
+complete_settle_ms = 800
+# Optional fixed conversation URL/id. Empty = follow whatever chat is open
+# in the browser (the "current" chat).
+conversation_id = ""
+
+[browser]
+# Prefer a system Chromium that is NOT the Playwright-bundled one.
+# On NixOS this is often something like /etc/profiles/per-user/$USER/bin/chromium
+executable_path = "/home/mg/.nix-profile/bin/chromium-regular"
+prefer_system_chromium = true
+headless = false
+native_window_viewport = true
+viewport_width = 1440
+viewport_height = 900
+navigation_timeout_ms = 45000
+selector_timeout_ms = 20000
+
+[database]
+# libpq-style connection string or discrete fields below.
+url = "postgres://chatgpt:chatgpt@127.0.0.1:5432/chatgpt_history"
+# Used by flake.nix setup / flush helpers when DATABASE_URL is not set.
+host = "127.0.0.1"
+port = 5432
+user = "chatgpt"
+password = "chatgpt"
+name = "chatgpt_history"
+
+[debug]
+network = false

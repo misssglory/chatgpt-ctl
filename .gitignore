@@ -1,0 +1,9 @@
+node_modules/
+var/
+*.log
+.direnv/
+result
+result-*
+ctl/target/
+.env
+.DS_Store
