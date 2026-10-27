@@ -268,12 +268,21 @@ async function launchContext(
       `exe=${executablePath}`
   );
 
-  return await chromium.launchPersistentContext(profileDir, {
-    executablePath,
-    headless,
-    viewport: viewport ?? undefined,
-    args: ["--disable-blink-features=AutomationControlled"],
-  });
+  // Match fomo: pass viewport: null for native-window mode (must be null, not
+  // undefined — undefined makes Playwright use the default 1280x720 viewport).
+  try {
+    return await chromium.launchPersistentContext(profileDir, {
+      executablePath,
+      headless,
+      viewport, // null | { width, height }
+      args: ["--disable-blink-features=AutomationControlled"],
+    });
+  } catch (error) {
+    throw new Error(
+      `Failed to launch ${executablePath}\n${formatError(error)}`,
+      { cause: error }
+    );
+  }
 }
 
 async function getPage(context: BrowserContext): Promise<Page> {
