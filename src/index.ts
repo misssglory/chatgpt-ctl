@@ -77,6 +77,12 @@ interface ScrapedChat {
   messages: ScrapedMessage[];
 }
 
+interface SidebarChat {
+  id: string;
+  title: string;
+  url: string;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -219,6 +225,23 @@ async function upsertChat(sql: Sql, chat: ScrapedChat): Promise<void> {
   `;
 }
 
+/** Synchronize sidebar metadata without making every chat look newly active. */
+async function upsertSidebarChats(sql: Sql, chats: SidebarChat[]): Promise<void> {
+  for (const chat of chats) {
+    await sql`
+      INSERT INTO chats (id, title, url, updated_at)
+      VALUES (${chat.id}::uuid, ${chat.title}, ${chat.url}, NOW())
+      ON CONFLICT (id) DO UPDATE SET
+        title = EXCLUDED.title,
+        url = EXCLUDED.url,
+        updated_at = CASE
+          WHEN chats.title IS DISTINCT FROM EXCLUDED.title THEN NOW()
+          ELSE chats.updated_at
+        END
+    `;
+  }
+}
+
 /**
  * Upsert a message. When `completed` flips to true we stamp completed_at.
  * Content is updated on every observation so partial streaming text is refined
@@ -296,7 +319,6 @@ async function launchContext(
       executablePath,
       headless,
       viewport, // null | { width, height }
-      args: ["--disable-blink-features=AutomationControlled"],
     });
   } catch (error) {
     throw new Error(
@@ -339,6 +361,82 @@ function normalizeUuid(raw: string | null | undefined): string | null {
 // ---------------------------------------------------------------------------
 // DOM scraping (ChatGPT / Codex UI, based on provided outerHTML sample)
 // ---------------------------------------------------------------------------
+
+/**
+ * Read chat IDs and titles from the sidebar. When scrollAll is true, scroll the
+ * virtualized history list to the end so chats outside the viewport are loaded.
+ */
+async function scrapeSidebarChats(page: Page, scrollAll = false): Promise<SidebarChat[]> {
+  return await page.evaluate(async (shouldScroll) => {
+    const uuidRe = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+    const chats = new Map<string, { id: string; title: string; url: string }>();
+    const links = () => Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href*="/c/"]'));
+
+    const collect = () => {
+      for (const link of links()) {
+        const match = link.getAttribute("href")?.match(uuidRe);
+        if (!match) continue;
+        const id = match[0].toLowerCase();
+        const titleNode = link.querySelector("[data-thread-title]");
+        const title = (
+          titleNode?.textContent ||
+          link.getAttribute("aria-label") ||
+          link.textContent ||
+          ""
+        ).replace(/\s+/g, " ").trim();
+        if (!title) continue;
+        chats.set(id, { id, title, url: new URL(link.href, location.origin).toString() });
+      }
+    };
+
+    collect();
+    if (!shouldScroll || links().length === 0) return Array.from(chats.values());
+
+    let scroller: HTMLElement | null = null;
+    let node: HTMLElement | null = links()[0]!;
+    while (node) {
+      const style = getComputedStyle(node);
+      if (
+        node.scrollHeight > node.clientHeight + 20 &&
+        /(auto|scroll)/.test(style.overflowY)
+      ) {
+        scroller = node;
+        break;
+      }
+      node = node.parentElement;
+    }
+    if (!scroller) return Array.from(chats.values());
+
+    const originalTop = scroller.scrollTop;
+    let stableBottomPasses = 0;
+    let previousSize = -1;
+    scroller.scrollTop = 0;
+
+    for (let pass = 0; pass < 200 && stableBottomPasses < 3; pass++) {
+      collect();
+      const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 4;
+      stableBottomPasses = atBottom && chats.size === previousSize
+        ? stableBottomPasses + 1
+        : 0;
+      previousSize = chats.size;
+      if (stableBottomPasses >= 2) break;
+      scroller.scrollTop = Math.min(
+        scroller.scrollTop + Math.max(200, scroller.clientHeight * 0.8),
+        scroller.scrollHeight
+      );
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    }
+    collect();
+    scroller.scrollTop = originalTop;
+    return Array.from(chats.values());
+  }, scrollAll);
+}
+
+async function syncSidebarChats(page: Page, sql: Sql, scrollAll = false): Promise<SidebarChat[]> {
+  const chats = await scrapeSidebarChats(page, scrollAll);
+  await upsertSidebarChats(sql, chats);
+  return chats;
+}
 
 /**
  * Extract the currently open conversation from the page.
@@ -497,10 +595,14 @@ async function scrapeCurrentChat(page: Page): Promise<ScrapedChat | null> {
   });
 }
 
+function configurePage(page: Page, cfg: Config) {
+  page.setDefaultTimeout(cfg.browser?.selector_timeout_ms ?? 20_000);
+  page.setDefaultNavigationTimeout(cfg.browser?.navigation_timeout_ms ?? 45_000);
+}
+
 async function openChatGPT(page: Page, cfg: Config) {
   const timeout = cfg.browser?.navigation_timeout_ms ?? 45_000;
-  page.setDefaultTimeout(cfg.browser?.selector_timeout_ms ?? 20_000);
-  page.setDefaultNavigationTimeout(timeout);
+  configurePage(page, cfg);
 
   let target = cfg.chatgpt.url;
   if (cfg.chatgpt.conversation_id) {
@@ -512,6 +614,118 @@ async function openChatGPT(page: Page, cfg: Config) {
   await page.goto(target, { waitUntil: "domcontentloaded", timeout });
   // Allow React hydration
   await page.waitForTimeout(1500);
+}
+
+/** Keep an existing ChatGPT tab/current chat; only navigate fresh or foreign tabs. */
+async function ensureCurrentChatGPTPage(page: Page, cfg: Config) {
+  configurePage(page, cfg);
+  const configured = new URL(cfg.chatgpt.url);
+  const current = page.url();
+  if (!current.startsWith(`${configured.origin}/`)) {
+    await page.goto(cfg.chatgpt.url, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(1500);
+  }
+}
+
+async function syncChatsCommand(cfg: Config, configPath: string, quiet = false) {
+  const sql = openDb(cfg);
+  const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false);
+  try {
+    const page = await getPage(context);
+    attachNetworkDebug(page, cfg);
+    await openChatGPT(page, cfg);
+    const chats = await syncSidebarChats(page, sql, true);
+    if (!quiet) {
+      for (const chat of chats) console.log(`${chat.id}\t${chat.title}`);
+    }
+    log.info(`[chats] synchronized ${chats.length} sidebar chats`);
+  } finally {
+    await context.close();
+    await sql.end();
+  }
+}
+
+/** Open a chat in a normal browser window and leave it running after the CLI exits. */
+async function openChatCommand(cfg: Config, configPath: string, rawId: string) {
+  const chatId = normalizeUuid(rawId);
+  if (!chatId) throw new Error(`open: invalid chat id "${rawId}"`);
+  const executablePath = await resolveBrowserExecutable(cfg, configPath);
+  const profileDir = resolveFromConfig(configPath, cfg.chatgpt.profile_dir);
+  await mkdir(profileDir, { recursive: true });
+  const target = new URL(`/c/${chatId}`, cfg.chatgpt.url).toString();
+  const proc = Bun.spawn(
+    [
+      executablePath,
+      `--user-data-dir=${profileDir}`,
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--new-window",
+      target,
+    ],
+    { stdin: "ignore", stdout: "ignore", stderr: "ignore", env: process.env }
+  );
+  proc.unref();
+  console.log(target);
+}
+
+async function sendMessageCommand(
+  cfg: Config,
+  configPath: string,
+  text: string,
+  files: string[]
+) {
+  if (!text.trim() && files.length === 0) {
+    throw new Error("send: provide message text or at least one file");
+  }
+  const resolvedFiles = files.map((file) => path.resolve(file));
+  for (const file of resolvedFiles) await access(file, constants.R_OK);
+
+  const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false);
+  try {
+    const page = await getPage(context);
+    attachNetworkDebug(page, cfg);
+    await ensureCurrentChatGPTPage(page, cfg);
+
+    const composer = page.locator(
+      '#prompt-textarea, [data-composer-markdown][contenteditable="true"], ' +
+        '[contenteditable="true"][role="textbox"], textarea'
+    ).first();
+    await composer.waitFor({ state: "visible" });
+
+    if (resolvedFiles.length > 0) {
+      const fileInput = page.locator(
+        'input[type="file"][aria-label="Attach files" i], ' +
+          'input[type="file"]:not([capture]):not([accept*="image" i]):not([accept*="video" i])'
+      ).first();
+      if (await fileInput.count()) {
+        await fileInput.setInputFiles(resolvedFiles);
+      } else {
+        throw new Error("send: could not find ChatGPT's file upload input");
+      }
+      // Let attachment rows initialize; clicking send below still waits for enablement.
+      await page.waitForTimeout(1000);
+    }
+
+    if (text) await composer.fill(text);
+    const sendButton = page.locator(
+      'button[data-testid="send-button"], button[aria-label="Send message" i], ' +
+        'button[aria-label="Send" i], button[data-composer-navigation-target="send"]'
+    ).first();
+
+    try {
+      await sendButton.waitFor({ state: "visible", timeout: 5000 });
+      await sendButton.click();
+    } catch (error) {
+      if (!text || (await sendButton.count())) throw error;
+      await composer.press("Enter");
+    }
+    await page.waitForTimeout(1000);
+    log.info(
+      `[send] submitted text_chars=${text.length} files=${resolvedFiles.length} url=${page.url()}`
+    );
+  } finally {
+    await context.close();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +812,7 @@ async function dump(cfg: Config, configPath: string) {
     const page = await getPage(context);
     attachNetworkDebug(page, cfg);
     await openChatGPT(page, cfg);
+    await syncSidebarChats(page, sql, true);
     const chat = await scrapeCurrentChat(page);
     if (!chat) {
       log.warn("[dump] no conversation detected on the page — are you logged in?");
@@ -653,6 +868,7 @@ async function once(cfg: Config, configPath: string) {
     const page = await getPage(context);
     attachNetworkDebug(page, cfg);
     await openChatGPT(page, cfg);
+    await syncSidebarChats(page, sql, true);
     const chat = await scrapeCurrentChat(page);
     if (!chat) {
       log.warn("[once] no conversation on page");
@@ -687,6 +903,8 @@ async function watch(cfg: Config, configPath: string) {
     const page = await getPage(context);
     attachNetworkDebug(page, cfg);
     await openChatGPT(page, cfg);
+    const sidebarChats = await syncSidebarChats(page, sql, true);
+    log.info(`[watch] synchronized ${sidebarChats.length} sidebar chats`);
     log.info(
       `[watch] poll=${pollMs}ms settle=${settleMs}ms ` +
         `conversation=${cfg.chatgpt.conversation_id || "(follow current)"}`
@@ -694,6 +912,8 @@ async function watch(cfg: Config, configPath: string) {
 
     while (true) {
       try {
+        // Refresh visible rows on every tick so renamed titles reach the DB.
+        await syncSidebarChats(page, sql, false);
         // If user navigated to another chat, pick it up
         const chat = await scrapeCurrentChat(page);
         if (!chat) {
@@ -737,6 +957,32 @@ async function main() {
   switch (command) {
     case "doctor":
       return doctor(cfg, configPath);
+    case "sync-chats":
+      return syncChatsCommand(cfg, configPath, args.includes("--quiet"));
+    case "open": {
+      const id = args[1];
+      if (!id) throw new Error("Usage: open <chat-uuid>");
+      return openChatCommand(cfg, configPath, id);
+    }
+    case "send": {
+      const files: string[] = [];
+      const textParts: string[] = [];
+      for (let i = 1; i < args.length; i++) {
+        const arg = args[i]!;
+        if (arg === "--config") {
+          i++;
+        } else if (arg === "--file" || arg === "-f") {
+          const file = args[++i];
+          if (!file) throw new Error(`send: ${arg} requires a path`);
+          files.push(file);
+        } else if (arg.startsWith("--file=")) {
+          files.push(arg.slice("--file=".length));
+        } else {
+          textParts.push(arg);
+        }
+      }
+      return sendMessageCommand(cfg, configPath, textParts.join(" "), files);
+    }
     case "login":
       return login(cfg, configPath);
     case "migrate":
@@ -751,7 +997,7 @@ async function main() {
       return watch(cfg, configPath);
     default:
       throw new Error(
-        `Unknown command '${command}'. Use doctor | login | migrate | flush | dump | once | watch`
+        `Unknown command '${command}'. Use doctor | login | sync-chats | open | send | migrate | flush | dump | once | watch`
       );
   }
 }

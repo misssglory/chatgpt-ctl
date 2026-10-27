@@ -9,6 +9,9 @@
     "watch": "bun src/index.ts watch",
     "once": "bun src/index.ts once",
     "dump": "bun src/index.ts dump",
+    "chats": "bun src/index.ts sync-chats",
+    "open": "bun src/index.ts open",
+    "send": "bun src/index.ts send",
     "migrate": "bun src/index.ts migrate",
     "flush": "bun src/index.ts flush",
     "typecheck": "bunx tsc --noEmit"

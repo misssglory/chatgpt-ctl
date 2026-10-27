@@ -7,3 +7,5 @@ result-*
 ctl/target/
 .env
 .DS_Store
+*.bkp
+

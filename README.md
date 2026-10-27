@@ -110,14 +110,31 @@ nix build
 ## CLI usage
 
 ```text
-chatgpt-ctl chats [--limit N] [-q substring]
+chatgpt-ctl chats [--limit N] [-q substring] [--refresh]
+chatgpt-ctl send "message text" [-f PATH]...  # current chat; repeatable file uploads
+chatgpt-ctl open [CHAT|current]              # UUID/title; no arg = TAB completion
 chatgpt-ctl history [CHAT|current] [--all] [--follow] [--json]
-chatgpt-ctl history                 # interactive; TAB completes titles/UUIDs from DB
+chatgpt-ctl history                          # interactive; TAB completes titles/UUIDs from DB
 chatgpt-ctl message <uuid>
 chatgpt-ctl completions bash|zsh|fish|elvish|powershell
 ```
 
 `CHAT` may be a UUID, a title substring, or `current` (most recently updated chat).
+`open` without an argument and `history` without an argument provide interactive title/UUID autocomplete.
+
+The browser-backed commands (`chats --refresh`, `open`, and `send`) require Bun and the optional watcher.
+Run them from the repository root, or set `CHATGPT_WATCHER=/absolute/path/to/src/index.ts`.
+`CHATGPT_WATCHER_CONFIG` selects a non-default watcher config. For example:
+
+```bash
+chatgpt-ctl chats --refresh                 # fetch all sidebar chats and proper titles
+chatgpt-ctl open "NixOS Wayland"            # unique title substring
+chatgpt-ctl open                            # interactive title/UUID completion
+chatgpt-ctl send "Review these files" -f ./notes.md -f ./src/main.rs
+```
+
+The watcher performs a full sidebar synchronization at startup and refreshes visible titles on every
+watch tick, so renamed chats are updated in PostgreSQL. `chats --refresh` forces another full scan.
 
 ```bash
 # static shell completion (also installed by the Nix package)

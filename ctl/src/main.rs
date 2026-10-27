@@ -17,6 +17,8 @@ use rustyline::validate::Validator;
 use rustyline::{CompletionType, Config, Context as RlContext, Editor, Helper};
 use std::borrow::Cow;
 use std::io;
+use std::path::PathBuf;
+use std::process::Command;
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
@@ -41,6 +43,27 @@ enum Commands {
         /// Case-insensitive title substring filter
         #[arg(short, long)]
         query: Option<String>,
+        /// Refresh all chats and titles from the live sidebar before listing
+        #[arg(short, long)]
+        refresh: bool,
+    },
+
+    /// Send text to the currently open chat, optionally with file attachments
+    Send {
+        /// Message text (quote text containing spaces)
+        text: String,
+        /// File to upload; repeat for multiple attachments
+        #[arg(short = 'f', long = "file", value_name = "PATH")]
+        files: Vec<PathBuf>,
+    },
+
+    /// Open a chat in the browser by UUID or title.
+    ///
+    /// With no CHAT argument, enters an interactive prompt with DB-backed
+    /// autocomplete on chat titles and UUIDs.
+    Open {
+        /// Chat UUID, title substring, or "current"
+        chat: Option<String>,
     },
 
     /// Show message history for a chat.
@@ -108,6 +131,35 @@ fn default_database_url() -> String {
     std::env::var("CHATGPT_DATABASE_URL").unwrap_or_else(|_| {
         "postgres://chatgpt:chatgpt@127.0.0.1:5432/chatgpt_history".to_string()
     })
+}
+
+/// Browser commands stay in the optional watcher, keeping this Rust binary small.
+fn run_watcher(args: &[String]) -> Result<()> {
+    let script = std::env::var_os("CHATGPT_WATCHER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("src/index.ts"));
+    if !script.is_file() {
+        anyhow::bail!(
+            "watcher script not found at {}; run from the repository root or set CHATGPT_WATCHER=/path/to/src/index.ts",
+            script.display()
+        );
+    }
+    let bun = std::env::var_os("CHATGPT_BUN").unwrap_or_else(|| "bun".into());
+    let status = Command::new(&bun)
+        .arg(&script)
+        .args(args)
+        .status()
+        .with_context(|| format!("run watcher with {:?}", bun))?;
+    if !status.success() {
+        anyhow::bail!("watcher command failed with {status}");
+    }
+    Ok(())
+}
+
+fn watcher_args(command: &str, values: &[String]) -> Vec<String> {
+    std::iter::once(command.to_string())
+        .chain(values.iter().cloned())
+        .collect()
 }
 
 async fn connect(url: &str) -> Result<Client> {
@@ -413,6 +465,33 @@ async fn interactive_history(client: &Client, completed_only: bool, limit: i64, 
     Ok(())
 }
 
+async fn interactive_open(client: &Client) -> Result<Uuid> {
+    let chats = list_chats(client, 200, None).await?;
+    if chats.is_empty() {
+        anyhow::bail!("no chats in database — run `chatgpt-ctl chats --refresh` first");
+    }
+    let candidates = chats
+        .iter()
+        .map(|c| (c.title.clone(), c.id.to_string()))
+        .collect();
+    let helper = ChatHelper { candidates };
+    let config = Config::builder()
+        .completion_type(CompletionType::List)
+        .build();
+    let mut rl = Editor::with_config(config)?;
+    rl.set_helper(Some(helper));
+
+    println!("Type a chat title or UUID (TAB to autocomplete), or 'current':");
+    match rl.readline("open> ") {
+        Ok(line) if !line.trim().is_empty() => resolve_chat_id(client, line.trim()).await,
+        Ok(_) => anyhow::bail!("no chat selected"),
+        Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+            anyhow::bail!("no chat selected")
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 async fn follow_history(
     client: &Client,
     chat_id: Uuid,
@@ -457,7 +536,10 @@ async fn main() -> Result<()> {
             generate(shell, &mut cmd, "chatgpt-ctl", &mut io::stdout());
             return Ok(());
         }
-        Commands::Chats { limit, query } => {
+        Commands::Chats { limit, query, refresh } => {
+            if refresh {
+                run_watcher(&watcher_args("sync-chats", &["--quiet".to_string()]))?;
+            }
             let client = connect(&url).await?;
             let chats = list_chats(&client, limit, query.as_deref()).await?;
             for c in chats {
@@ -470,6 +552,28 @@ async fn main() -> Result<()> {
                     c.id, c.message_count, ts, c.title
                 );
             }
+        }
+        Commands::Send { text, files } => {
+            let mut values = vec![text];
+            for file in files {
+                let file = file
+                    .canonicalize()
+                    .with_context(|| format!("access attachment {}", file.display()))?;
+                values.push("--file".to_string());
+                values.push(file.to_string_lossy().into_owned());
+            }
+            run_watcher(&watcher_args("send", &values))?;
+        }
+        Commands::Open { chat } => {
+            let client = connect(&url).await?;
+            let chat_id = match chat {
+                Some(spec) => resolve_chat_id(&client, &spec).await?,
+                None => interactive_open(&client).await?,
+            };
+            run_watcher(&watcher_args(
+                "open",
+                &[chat_id.to_string()],
+            ))?;
         }
         Commands::History {
             chat,
