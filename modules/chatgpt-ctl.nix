@@ -37,7 +37,7 @@ in
     };
 
     # Default connection string exported for interactive shells / systemd user sessions
-    # that source /etc/set-environment. Override per-user with DATABASE_URL if needed.
+    # that source /etc/set-environment. Override per-user with CHATGPT_DATABASE_URL if needed.
     databaseUrl = mkOption {
       type = types.str;
       default = "postgres://${cfg.database.user}@/${cfg.database.name}?host=/run/postgresql";
@@ -45,7 +45,7 @@ in
         "postgres://''${config.programs.chatgpt-ctl.database.user}@/''${config.programs.chatgpt-ctl.database.name}?host=/run/postgresql"
       '';
       description = ''
-        Default DATABASE_URL written to the environment when enable = true.
+        Default CHATGPT_DATABASE_URL written to the environment when enable = true.
         For a local socket-authenticated DB (ensureLocal) the default uses peer auth
         via /run/postgresql. For a remote DB, set this to a full URL.
       '';
@@ -105,7 +105,7 @@ in
     environment.systemPackages = [ cfg.package ];
 
     environment.sessionVariables = {
-      DATABASE_URL = cfg.databaseUrl;
+      CHATGPT_DATABASE_URL = cfg.databaseUrl;
     };
 
     # Local DB setup ----------------------------------------------------------

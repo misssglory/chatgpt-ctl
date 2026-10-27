@@ -23,8 +23,8 @@ use uuid::Uuid;
 #[derive(Parser, Debug)]
 #[command(name = "chatgpt-ctl", version, about = "Watch / query ChatGPT history from PostgreSQL")]
 struct Cli {
-    /// Postgres connection string (default: DATABASE_URL or local chatgpt_history)
-    #[arg(long, env = "DATABASE_URL", global = true)]
+    /// Postgres connection string (default: CHATGPT_DATABASE_URL or local chatgpt_history)
+    #[arg(long, env = "CHATGPT_DATABASE_URL", global = true)]
     database_url: Option<String>,
 
     #[command(subcommand)]
@@ -105,7 +105,7 @@ impl From<ShellKind> for Shell {
 }
 
 fn default_database_url() -> String {
-    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+    std::env::var("CHATGPT_DATABASE_URL").unwrap_or_else(|_| {
         "postgres://chatgpt:chatgpt@127.0.0.1:5432/chatgpt_history".to_string()
     })
 }

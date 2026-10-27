@@ -48,7 +48,7 @@ CLI (+ optional Bun scraper) for **ChatGPT conversation history** stored in **Po
     database.user = "chatgpt";
     # database.passwordFile = "/run/secrets/chatgpt-db-password";  # optional
 
-    # Default DATABASE_URL for shells (socket peer auth when ensureLocal)
+    # Default CHATGPT_DATABASE_URL for shells (socket peer auth when ensureLocal)
     # databaseUrl = "postgres://chatgpt@/chatgpt_history?host=/run/postgresql";
   };
 }
@@ -74,12 +74,12 @@ nix profile install github:YOUR_USER/chatgpt-ctl
 environment.systemPackages = [ inputs.chatgpt-ctl.packages.${system}.chatgpt-ctl ];
 ```
 
-If you already ran `nix run .#setup-db`, set `DATABASE_URL` to that instance:
+If you already ran `nix run .#setup-db`, set `CHATGPT_DATABASE_URL` to that instance:
 
 ```bash
-export DATABASE_URL='postgres://chatgpt:chatgpt@127.0.0.1:5432/chatgpt_history'
+export CHATGPT_DATABASE_URL='postgres://chatgpt:chatgpt@127.0.0.1:5432/chatgpt_history'
 # or socket:
-export DATABASE_URL='postgres://chatgpt@/chatgpt_history?host=/run/postgresql'
+export CHATGPT_DATABASE_URL='postgres://chatgpt@/chatgpt_history?host=/run/postgresql'
 ```
 
 ### 4. Build from this repo
@@ -161,7 +161,7 @@ Login uses a **non-Playwright** Chromium process with `--user-data-dir` so Googl
 
 ## Database (already set up)
 
-If you previously ran `nix run .#setup-db`, the module’s `database.ensureLocal` is optional — point `DATABASE_URL` at that instance and install only the package:
+If you previously ran `nix run .#setup-db`, the module’s `database.ensureLocal` is optional — point `CHATGPT_DATABASE_URL` at that instance and install only the package:
 
 ```nix
 programs.chatgpt-ctl.enable = true;

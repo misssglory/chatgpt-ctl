@@ -92,13 +92,22 @@ async function loadConfig(configPath: string): Promise<Config> {
   if (!cfg.chatgpt?.url || !cfg.chatgpt?.profile_dir) {
     throw new Error("config.toml: [chatgpt] url and profile_dir are required");
   }
-  if (!cfg.database?.url && !(cfg.database?.host && cfg.database?.name)) {
-    throw new Error("config.toml: [database] url or host+name are required");
+  if (
+    !process.env.CHATGPT_DATABASE_URL?.trim() &&
+    !cfg.database?.url &&
+    !(cfg.database?.host && cfg.database?.name)
+  ) {
+    throw new Error(
+      "Set CHATGPT_DATABASE_URL or config.toml [database] url / host+name"
+    );
   }
   return cfg;
 }
 
 function databaseUrl(cfg: Config): string {
+  // Prefer CHATGPT_DATABASE_URL so the same env works for ctl + watcher.
+  const fromEnv = process.env.CHATGPT_DATABASE_URL?.trim();
+  if (fromEnv) return fromEnv;
   if (cfg.database.url && cfg.database.url.trim()) return cfg.database.url.trim();
   const { host, port, user, password, name } = cfg.database;
   return `postgres://${user}:${password}@${host}:${port ?? 5432}/${name}`;
