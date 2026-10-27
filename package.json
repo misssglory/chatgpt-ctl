@@ -10,6 +10,7 @@
     "once": "bun src/index.ts once",
     "dump": "bun src/index.ts dump",
     "migrate": "bun src/index.ts migrate",
+    "flush": "bun src/index.ts flush",
     "typecheck": "bunx tsc --noEmit"
   },
   "dependencies": {

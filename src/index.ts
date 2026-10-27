@@ -192,10 +192,25 @@ async function migrate(cfg: Config) {
   }
 }
 
+/** TRUNCATE chats + messages. Host-only; no Nix. Uses CHATGPT_DATABASE_URL / config. */
+async function flush(cfg: Config) {
+  const sql = openDb(cfg);
+  try {
+    const flushPath = path.resolve(import.meta.dir, "../sql/flush.sql");
+    const body = await readFile(flushPath, "utf8");
+    await sql.unsafe(body);
+    log.info("[db] flushed (TRUNCATE messages, chats)");
+  } finally {
+    await sql.end();
+  }
+}
+
 async function upsertChat(sql: Sql, chat: ScrapedChat): Promise<void> {
+  const chatId = normalizeUuid(chat.id);
+  if (!chatId) throw new Error(`upsertChat: invalid chat id "${chat.id}"`);
   await sql`
     INSERT INTO chats (id, title, url, updated_at, last_message_at)
-    VALUES (${chat.id}::uuid, ${chat.title}, ${chat.url}, NOW(), NOW())
+    VALUES (${chatId}::uuid, ${chat.title}, ${chat.url}, NOW(), NOW())
     ON CONFLICT (id) DO UPDATE SET
       title = COALESCE(NULLIF(EXCLUDED.title, ''), chats.title),
       url = COALESCE(EXCLUDED.url, chats.url),
@@ -210,11 +225,17 @@ async function upsertChat(sql: Sql, chat: ScrapedChat): Promise<void> {
  * until the message is marked completed.
  */
 async function upsertMessage(sql: Sql, chatId: string, msg: ScrapedMessage): Promise<"inserted" | "updated" | "completed"> {
+  const mid = normalizeUuid(msg.id);
+  const cid = normalizeUuid(chatId);
+  if (!mid || !cid) {
+    log.warn(`[db] skip message with invalid uuid msg="${msg.id}" chat="${chatId}"`);
+    return "updated";
+  }
   const rows = await sql`
     INSERT INTO messages (id, chat_id, role, content, sequence, completed, completed_at, created_at)
     VALUES (
-      ${msg.id}::uuid,
-      ${chatId}::uuid,
+      ${mid}::uuid,
+      ${cid}::uuid,
       ${msg.role},
       ${msg.content},
       ${msg.sequence},
@@ -305,6 +326,16 @@ function attachNetworkDebug(page: Page, cfg: Config) {
   });
 }
 
+
+/** Extract a canonical UUID from strings like "local-chatgpt:f08711aa-…" or raw uuids. */
+function normalizeUuid(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const m = raw.match(
+    /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
+  );
+  return m ? m[0]!.toLowerCase() : null;
+}
+
 // ---------------------------------------------------------------------------
 // DOM scraping (ChatGPT / Codex UI, based on provided outerHTML sample)
 // ---------------------------------------------------------------------------
@@ -326,46 +357,48 @@ async function scrapeCurrentChat(page: Page): Promise<ScrapedChat | null> {
     const uuidRe =
       /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
-    // --- conversation id ---
+    const extractUuid = (s: string | null | undefined): string => {
+      if (!s) return "";
+      const m = String(s).match(uuidRe);
+      return m ? m[0]!.toLowerCase() : "";
+    };
+
+    // --- conversation id: URL first (stable), then page attributes ---
     let chatId = "";
-    const sel = document.querySelector("[data-chatgpt-selection-conversation-id]");
-    if (sel) {
-      chatId = sel.getAttribute("data-chatgpt-selection-conversation-id") || "";
-    }
+    const pathMatch = location.pathname.match(/\/c\/([0-9a-f-]{36})/i);
+    if (pathMatch) chatId = extractUuid(pathMatch[1]);
+
     if (!chatId) {
-      const m = location.pathname.match(/\/c\/([0-9a-f-]{36})/i);
-      if (m) chatId = m[1]!;
-    }
-    if (!chatId) {
-      // fallback: any data attribute containing a conversation uuid
-      const any = document.querySelector("[data-chatgpt-search-unit-key]");
-      if (any) {
-        const key = any.getAttribute("data-chatgpt-search-unit-key") || "";
-        // not the chat id
+      // Prefer the message thread area over floating/sidebar clones
+      const thread = document.querySelector("main") || document.body;
+      const sel = thread.querySelector("[data-chatgpt-selection-conversation-id]");
+      if (sel) {
+        chatId = extractUuid(sel.getAttribute("data-chatgpt-selection-conversation-id"));
       }
     }
+    if (!chatId) chatId = extractUuid(location.href);
     if (!chatId) return null;
 
     // --- title ---
-    let title = document.title || "";
-    // Prefer sidebar active item or header
-    const header = document.querySelector("h2, [class*='truncate'][class*='font-medium']");
-    if (header && header.textContent?.trim()) {
-      title = header.textContent.trim();
+    let title = (document.title || "").replace(/\s*[|·]\s*ChatGPT.*$/i, "").trim();
+    // Sidebar active row often has the real title
+    const activeNav =
+      document.querySelector('[aria-current="page"]') ||
+      document.querySelector("a[href*='/c/" + chatId + "']");
+    if (activeNav?.textContent?.trim()) {
+      const t = activeNav.textContent.trim().split("\n")[0]!.trim();
+      if (t && t.length < 200) title = t;
     }
-    // strip " | ChatGPT" style suffixes
-    title = title.replace(/\s*[|·]\s*ChatGPT.*$/i, "").trim();
 
     // --- streaming? ---
     const stopBtn =
       document.querySelector('button[aria-label*="Stop" i]') ||
-      document.querySelector('button[aria-label*="stop generating" i]') ||
       Array.from(document.querySelectorAll("button")).find((b) =>
         /stop generating/i.test(b.textContent || "")
       );
     const isStreaming = Boolean(stopBtn);
 
-    // --- messages ---
+    // --- messages: only nodes belonging to this conversation ---
     const messages: Array<{
       id: string;
       role: "user" | "assistant" | "system" | "tool";
@@ -374,71 +407,78 @@ async function scrapeCurrentChat(page: Page): Promise<ScrapedChat | null> {
       completed: boolean;
     }> = [];
 
-    // Collect units that carry message ids
-    const units = Array.from(
-      document.querySelectorAll("[data-chatgpt-search-message-ids], [data-user-message-bubble], [data-conversation-role]")
-    );
-
-    // Prefer walking the main thread container
-    const thread =
-      document.querySelector("[data-testid='conversation-turn-list']") ||
-      document.querySelector("main") ||
-      document.body;
-
-    // Strategy: find every element with data-chatgpt-search-message-ids
     const seenIds = new Set<string>();
     let seq = 0;
 
+    // Units that carry message ids. Filter by conversation when attribute present.
     const messageNodes = Array.from(
-      thread.querySelectorAll("[data-chatgpt-search-message-ids]")
-    );
+      document.querySelectorAll("[data-chatgpt-search-message-ids]")
+    ).filter((node) => {
+      const owner =
+        node.closest("[data-chatgpt-selection-conversation-id]") ||
+        node.querySelector("[data-chatgpt-selection-conversation-id]");
+      if (!owner) return true; // no owner attr → keep (legacy)
+      const oid = extractUuid(
+        owner.getAttribute("data-chatgpt-selection-conversation-id")
+      );
+      // If owner has a different conversation id, skip
+      return !oid || oid === chatId;
+    });
 
     for (const node of messageNodes) {
       const idsAttr = node.getAttribute("data-chatgpt-search-message-ids") || "";
-      // may contain one or more space-separated ids (duplicates possible)
-      const ids = idsAttr.split(/\s+/).filter((x) => uuidRe.test(x));
+      const ids = idsAttr
+        .split(/\s+/)
+        .map((x) => extractUuid(x))
+        .filter(Boolean);
       const id = ids[0];
       if (!id || seenIds.has(id)) continue;
       seenIds.add(id);
 
-      // role
-      let role: "user" | "assistant" | "system" | "tool" = "assistant";
       const unitKey = node.getAttribute("data-chatgpt-search-unit-key") || "";
-      if (/:user$/i.test(unitKey) || node.querySelector("[data-user-message-bubble]")) {
+      let role: "user" | "assistant" | "system" | "tool" = "assistant";
+      if (
+        /:user$/i.test(unitKey) ||
+        node.querySelector("[data-user-message-bubble]") ||
+        node.closest(".group\\/user-message")
+      ) {
         role = "user";
       } else if (
+        /:assistant$/i.test(unitKey) ||
         node.getAttribute("data-conversation-role") === "assistant" ||
         node.closest("[data-conversation-role='assistant']") ||
-        /:assistant$/i.test(unitKey)
+        node.querySelector('[data-markdown-text-style="assistant-message"]')
       ) {
         role = "assistant";
-      } else if (node.querySelector("[data-user-message-bubble='true']")) {
-        role = "user";
       }
 
-      // content
+      // Content: user pre-wrap, assistant markdown root, then fallbacks
       let content = "";
-      const preWrap = node.querySelector(".whitespace-pre-wrap, [class*='whitespace-pre-wrap']");
-      const prose = node.querySelector(".markdown, .prose, [class*='markdown']");
-      const bubble = node.querySelector("[data-user-message-bubble] .text-size-chat, [data-user-message-bubble]");
-      const candidate = preWrap || prose || bubble || node;
+      const preWrap = node.querySelector(
+        ".whitespace-pre-wrap, [class*='whitespace-pre-wrap']"
+      );
+      const markdown = node.querySelector(
+        '[data-markdown-text-style="assistant-message"], [class*="MarkdownRoot"]'
+      );
+      const bubble = node.querySelector(
+        "[data-user-message-bubble] .text-size-chat, [data-user-message-bubble]"
+      );
+      const candidate = (role === "user" ? preWrap || bubble : markdown || preWrap) || node;
       content = (candidate.textContent || "").trim();
 
-      // Skip empty placeholder nodes
-      if (!content && role === "assistant" && isStreaming) {
-        // still streaming empty — skip for now
-        continue;
-      }
+      // Drop UI chrome noise that often prefixes assistant blocks
+      content = content.replace(/^ChatGPT said:\s*/i, "").trim();
       if (!content) continue;
 
-      // A message is "completed" if we are not streaming, OR if it is not the
-      // last assistant message while streaming is active.
-      const completed = !isStreaming;
-
-      messages.push({ id, role, content, sequence: seq++, completed });
+      messages.push({
+        id,
+        role,
+        content,
+        sequence: seq++,
+        completed: !isStreaming,
+      });
     }
 
-    // If streaming, force the last assistant message to incomplete
     if (isStreaming && messages.length > 0) {
       for (let i = messages.length - 1; i >= 0; i--) {
         if (messages[i]!.role === "assistant") {
@@ -701,6 +741,8 @@ async function main() {
       return login(cfg, configPath);
     case "migrate":
       return migrate(cfg);
+    case "flush":
+      return flush(cfg);
     case "dump":
       return dump(cfg, configPath);
     case "once":
@@ -709,7 +751,7 @@ async function main() {
       return watch(cfg, configPath);
     default:
       throw new Error(
-        `Unknown command '${command}'. Use doctor | login | migrate | dump | once | watch`
+        `Unknown command '${command}'. Use doctor | login | migrate | flush | dump | once | watch`
       );
   }
 }
