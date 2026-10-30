@@ -211,7 +211,6 @@ chatgpt-ctl hook set "My project chat" --folder ~/src/my-project
 chatgpt-ctl hook set "My Rust chat" --folder ~/src/my-project --child-folder rust-edge-gui --nix-flake
 chatgpt-ctl hook list
 chatgpt-ctl hook show "My project chat"
-chatgpt-ctl hook run "My project chat"      # manually use the newest ZIP already in that chat
 chatgpt-ctl hook disable "My project chat"  # keep configuration, pause automation
 chatgpt-ctl hook enable "My project chat"
 chatgpt-ctl hook remove "My project chat"
@@ -223,11 +222,7 @@ chatgpt-ctl hook remove "My project chat"
 --clipboard-arg clipboard --clipboard-arg -o` (repeat `--clipboard-arg` for each argument).
 
 While that conversation is open, the watcher records existing ZIP links as a baseline and processes
-only subsequently-arriving ZIP attachments. Run `chatgpt-ctl hook run <chat>` (also available as
-`hook trigger`) to manually download the newest ZIP attachment in that conversation and run the
-same extraction, Git commit, and build pipeline immediately. The command opens the specified chat
-in the active watcher pane if needed. Manual runs also work while a hook is disabled; disabling only
-pauses automatic processing of new attachments. Each new ZIP is saved under
+only subsequently-arriving ZIP attachments. Each new ZIP is saved under
 `<folder>/.chatgpt-ctl-downloads/`, checked for path-traversal entries, and extracted into
 `folder`. The hook stages only archive paths, commits the archive's Markdown diff as the commit
 message (or `Auto update` if no Markdown changes are present), then runs `wcc build` from

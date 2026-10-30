@@ -1154,28 +1154,7 @@ async function runHookForZip(
   }
 }
 
-async function runHookWithLastZip(
-  page: Page,
-  chatId: string,
-  hook: ChatHook,
-  cfg: Config,
-  configPath: string
-): Promise<string> {
-  const targetUrl = new URL(`/c/${chatId}`, cfg.chatgpt.url).toString();
-  if (normalizeUuid(page.url()) !== chatId) {
-    await page.goto(targetUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: cfg.browser?.navigation_timeout_ms ?? 45_000,
-    });
-    await page.waitForTimeout(1200);
-  }
-  const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
-  const archive = await downloadLastZip(page, archiveDir);
-  await runHookForZip(page, chatId, hook, archive, configPath);
-  return archive;
-}
-
-function startControlServer(page: Page, cfg: Config, configPath: string, sql: Sql) {
+function startControlServer(page: Page, cfg: Config, configPath: string) {
   const server = Bun.serve({
     hostname: CONTROL_HOST,
     port: CONTROL_PORT,
@@ -1205,16 +1184,6 @@ function startControlServer(page: Page, cfg: Config, configPath: string, sql: Sq
             return Response.json({ error: `ChatGPT redirected away from the new-chat URL: ${finalUrl}`, url: finalUrl }, { status: 409 });
           }
           return Response.json({ ok: true, url: finalUrl });
-        }
-        if (url.pathname === "/hook/run") {
-          const chatId = normalizeUuid(body.chat_id || "");
-          if (!chatId) return Response.json({ error: "valid chat_id is required" }, { status: 400 });
-          const hook = await loadChatHook(sql, chatId);
-          if (!hook) return Response.json({ error: `no hook configured for ${chatId}` }, { status: 404 });
-          // Manual runs deliberately work for disabled hooks: disabled only
-          // pauses automatic processing of newly arriving attachments.
-          const archive = await runHookWithLastZip(page, chatId, hook, cfg, configPath);
-          return Response.json({ ok: true, chat_id: chatId, archive, url: page.url() });
         }
         if (url.pathname === "/download-last-zip") {
           const directory = body.directory
@@ -1287,7 +1256,7 @@ async function watch(cfg: Config, configPath: string) {
     const page = await getPage(context);
     attachNetworkDebug(page, cfg);
     await openChatGPT(page, cfg);
-    controlServer = startControlServer(page, cfg, configPath, sql);
+    controlServer = startControlServer(page, cfg, configPath);
     const sidebarChats = await syncSidebarChats(page, sql, true);
     log.info(`[watch] synchronized ${sidebarChats.length} sidebar chats`);
     log.info(
