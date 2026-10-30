@@ -67,6 +67,9 @@ enum Commands {
         chat: Option<String>,
     },
 
+    /// Navigate the active ChatGPT pane to a blank new chat (URL has no conversation UUID).
+    NewChat,
+
     /// Download the newest ZIP attachment from the currently open conversation.
     DownloadLastZip {
         /// Destination directory (default: ./var/downloads)
@@ -637,6 +640,14 @@ async fn main() -> Result<()> {
                 None => interactive_open(&client).await?,
             };
             request_active_pane_open(chat_id)?;
+        }
+        Commands::NewChat => {
+            let response = watcher_request("POST", "/new-chat", Some("{}"))?;
+            let value: serde_json::Value = serde_json::from_str(&response)?;
+            println!(
+                "{}",
+                value.get("url").and_then(|v| v.as_str()).unwrap_or("opened a new chat")
+            );
         }
         Commands::DownloadLastZip { directory } => {
             let body = match directory {

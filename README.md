@@ -113,6 +113,7 @@ nix build
 chatgpt-ctl chats [--limit N] [-q substring] [--refresh]
 chatgpt-ctl send "message text" [-f PATH]...  # current chat; repeatable file uploads
 chatgpt-ctl open [CHAT|current]              # UUID/title; no arg = TAB completion
+chatgpt-ctl new-chat                         # blank chat at / (no conversation UUID in URL)
 chatgpt-ctl download-last-zip [DIRECTORY]   # save newest ZIP from current browser chat
 chatgpt-ctl history [CHAT|current] [--all] [--follow] [--json]
 chatgpt-ctl history                          # interactive; TAB completes titles/UUIDs from DB
@@ -120,13 +121,13 @@ chatgpt-ctl message <uuid>
 chatgpt-ctl completions bash|zsh|fish|elvish|powershell
 ```
 
-The generated shell completions include all CLI subcommands, including `download-last-zip`.
+The generated shell completions include all CLI subcommands, including `new-chat` and `download-last-zip`.
 After updating the binary, regenerate your shell completion file or rebuild/reinstall the Nix package.
 
 `CHAT` may be a UUID, a title substring, or `current` (most recently updated chat).
 `open` without an argument and `history` without an argument provide interactive title/UUID autocomplete.
 
-The browser-backed commands (`chats --refresh`, `open`, and `send`) require Bun and the optional watcher.
+The browser-backed commands (`chats --refresh`, `open`, `new-chat`, and `send`) require Bun and the optional watcher.
 Run them from the repository root, or set `CHATGPT_WATCHER=/absolute/path/to/src/index.ts`.
 `CHATGPT_WATCHER_CONFIG` selects a non-default watcher config. For example:
 
@@ -143,7 +144,9 @@ watch tick, so renamed chats are updated in PostgreSQL. `chats --refresh` forces
 While `bun run watch` is running, it also exposes a localhost control endpoint
 (default `127.0.0.1:17381`). `chatgpt-ctl open <CHAT>` sends the selected UUID to that
 server and navigates the watcher's existing ChatGPT tab/pane instead of launching a
-second Chromium window. Set `CHATGPT_CTL_ADDR` for the CLI or `CHATGPT_CTL_HOST` /
+second Chromium window. `chatgpt-ctl new-chat` navigates that same pane to the ChatGPT
+root URL (`/`), opening a blank composer without a conversation UUID in the address.
+Set `CHATGPT_CTL_ADDR` for the CLI or `CHATGPT_CTL_HOST` /
 `CHATGPT_CTL_PORT` for the watcher to override the address. The interactive `open`
 prompt uses the cached PostgreSQL chat titles and UUIDs for TAB completion. `chatgpt-ctl chats`
 marks the browser's currently open conversation with a cyan `●` while the watcher is running.

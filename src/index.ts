@@ -1127,6 +1127,18 @@ function startControlServer(page: Page, cfg: Config, configPath: string) {
           await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
           return Response.json({ ok: true, chat_id: chatId, url: target });
         }
+        if (url.pathname === "/new-chat") {
+          // ChatGPT's root route opens the blank composer; unlike /c/<uuid>,
+          // it does not bind the browser to an existing conversation.
+          const target = new URL("/", cfg.chatgpt.url).toString();
+          await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
+          await page.waitForTimeout(1000);
+          const finalUrl = page.url();
+          if (normalizeUuid(finalUrl)) {
+            return Response.json({ error: `ChatGPT redirected away from the new-chat URL: ${finalUrl}`, url: finalUrl }, { status: 409 });
+          }
+          return Response.json({ ok: true, url: finalUrl });
+        }
         if (url.pathname === "/download-last-zip") {
           const directory = body.directory
             ? path.resolve(body.directory)
@@ -1308,7 +1320,7 @@ async function main() {
       return watch(cfg, configPath);
     default:
       throw new Error(
-        `Unknown command '${command}'. Use doctor | login | sync-chats | open | download-last-zip | send | migrate | flush | dump | once | watch`
+        `Unknown command '${command}'. Use doctor | login | sync-chats | open | new-chat | download-last-zip | send | migrate | flush | dump | once | watch`
       );
   }
 }
