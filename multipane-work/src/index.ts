@@ -67,6 +67,8 @@ interface ScrapedMessage {
   role: "user" | "assistant" | "system" | "tool";
   content: string;
   sequence: number;
+  /** Stable ChatGPT turn number when exposed by the DOM; absent means order is unknown. */
+  turnOrder?: number;
   /** true when the UI no longer shows a streaming / "stop generating" state */
   completed: boolean;
 }
@@ -76,6 +78,7 @@ interface ScrapedChat {
   title: string;
   url: string;
   messages: ScrapedMessage[];
+  isStreaming: boolean;
 }
 
 interface SidebarChat {
@@ -608,7 +611,12 @@ async function scrapeCurrentChat(page: Page): Promise<ScrapedChat | null> {
       if (!id || seenIds.has(id)) continue;
       seenIds.add(id);
 
-      const unitKey = node.getAttribute("data-chatgpt-search-unit-key") || "";
+      const unitKey =
+        node.getAttribute("data-content-search-unit-key") ||
+        node.getAttribute("data-chatgpt-search-unit-key") ||
+        node.closest("[data-content-search-unit-key], [data-chatgpt-search-unit-key]")?.getAttribute("data-content-search-unit-key") ||
+        node.closest("[data-chatgpt-search-unit-key]")?.getAttribute("data-chatgpt-search-unit-key") ||
+        "";
       let role: "user" | "assistant" | "system" | "tool" = "assistant";
       if (
         /:user$/i.test(unitKey) ||
@@ -643,11 +651,13 @@ async function scrapeCurrentChat(page: Page): Promise<ScrapedChat | null> {
       content = content.replace(/^ChatGPT said:\s*/i, "").trim();
       if (!content) continue;
 
+      const turnMatch = unitKey.match(/(?:fallback-)?turn[-_](\d+)/i);
       messages.push({
         id,
         role,
         content,
         sequence: seq++,
+        ...(turnMatch ? { turnOrder: Number(turnMatch[1]) } : {}),
         completed: !isStreaming,
       });
     }
@@ -666,8 +676,62 @@ async function scrapeCurrentChat(page: Page): Promise<ScrapedChat | null> {
       title: title || chatId,
       url: location.href,
       messages,
+      isStreaming,
     };
   });
+}
+
+/**
+ * Bring a newly opened conversation to its end and wait for React hydration,
+ * message history and any initial generation to settle. Hooks must not inspect
+ * a pane until this has completed.
+ */
+async function waitForConversationReady(
+  page: Page,
+  chatId: string,
+  timeoutMs = 45_000
+): Promise<ScrapedChat> {
+  const deadline = Date.now() + timeoutMs;
+  await page.waitForLoadState("domcontentloaded", { timeout: Math.min(timeoutMs, 15_000) }).catch(() => undefined);
+  await page.locator("main").first().waitFor({ state: "visible", timeout: Math.min(timeoutMs, 20_000) });
+  await page.locator('#prompt-textarea, [data-composer-markdown][contenteditable="true"], [contenteditable="true"][role="textbox"], textarea').first()
+    .waitFor({ state: "visible", timeout: Math.min(timeoutMs, 20_000) });
+
+  let previousSignature = "";
+  let stableSamples = 0;
+  while (Date.now() < deadline) {
+    // ChatGPT's scrollable thread container differs between UI revisions.
+    // Move every scrollable descendant of main to its end, plus the document.
+    await page.evaluate(() => {
+      const roots = Array.from(document.querySelectorAll<HTMLElement>("main, main *"));
+      for (const element of roots) {
+        if (element.scrollHeight > element.clientHeight + 80) {
+          element.scrollTop = element.scrollHeight;
+        }
+      }
+      const scrolling = document.scrollingElement;
+      if (scrolling) scrolling.scrollTop = scrolling.scrollHeight;
+      window.scrollTo(0, document.body.scrollHeight);
+    }).catch(() => undefined);
+    await page.waitForTimeout(500);
+
+    const snapshot = await scrapeCurrentChat(page).catch(() => null);
+    if (!snapshot || snapshot.id !== chatId || snapshot.messages.length === 0 || snapshot.isStreaming) {
+      previousSignature = "";
+      stableSamples = 0;
+      continue;
+    }
+    const signature = JSON.stringify(snapshot.messages.map((message) => [
+      message.id, message.role, message.content.length, message.completed, message.turnOrder ?? null,
+    ]));
+    if (signature === previousSignature) stableSamples++;
+    else stableSamples = 0;
+    previousSignature = signature;
+    // Three equal snapshots over ~1.5s avoids treating an early partial render
+    // as the baseline while older turns or attachment controls are still mounting.
+    if (stableSamples >= 3) return snapshot;
+  }
+  throw new Error(`conversation ${chatId} did not finish loading within ${timeoutMs}ms`);
 }
 
 function configurePage(page: Page, cfg: Config) {
@@ -1215,8 +1279,8 @@ async function runHookWithLastZip(
       waitUntil: "domcontentloaded",
       timeout: cfg.browser?.navigation_timeout_ms ?? 45_000,
     });
-    await page.waitForTimeout(1200);
   }
+  await waitForConversationReady(page, chatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
   const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
   const archive = await downloadLastZip(page, archiveDir);
   await runHookForZip(page, chatId, hook, archive, configPath);
@@ -1304,6 +1368,7 @@ function startControlServer(
           if (normalizeUuid(page.url()) !== chatId) {
             await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
           }
+          await waitForConversationReady(page, chatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
           await page.bringToFront();
           return Response.json({ ok: true, chat_id: chatId, url: target, already_open: alreadyOpen, pane_index: openConversationPages(context).findIndex((item) => item.chatId === chatId) });
         }
@@ -1385,8 +1450,8 @@ function startControlServer(
             if (normalizeUuid(page.url()) !== requestedChatId) {
               const target = new URL(`/c/${requestedChatId}`, cfg.chatgpt.url).toString();
               await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
-              await page.waitForTimeout(900);
             }
+            await waitForConversationReady(page, requestedChatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
           } else {
             page = getActivePage();
             if (page.isClosed()) {
@@ -1481,6 +1546,8 @@ async function watch(cfg: Config, configPath: string) {
   const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false);
   const prevIncomplete = new Map<string, number>();
   const lastSeenChatByPage = new WeakMap<Page, string>();
+  const readyChatByPage = new WeakMap<Page, string>();
+  const baselineAssistantTurnByChat = new Map<string, number | null>();
   let activePage: Page;
   let controlServer: ReturnType<typeof Bun.serve> | undefined;
   const handledHookDownloads = new Set<string>();
@@ -1530,6 +1597,33 @@ async function watch(cfg: Config, configPath: string) {
               log.info(`[watch] pane chat=${chat.id} title="${chat.title}"`);
               lastSeenChatByPage.set(page, chat.id);
             }
+            if (readyChatByPage.get(page) !== chat.id) {
+              // First observation of this route (including in-page navigation):
+              // scroll to the actual end and wait for a stable, completed history
+              // before persisting or considering any automation.
+              const readySnapshot = await waitForConversationReady(
+                page, chat.id, cfg.browser?.navigation_timeout_ms ?? 45_000
+              );
+              await persistChat(sql, readySnapshot, settleMs, prevIncomplete);
+              const lastAssistant = [...readySnapshot.messages].reverse().find((message) => message.role === "assistant");
+              baselineAssistantTurnByChat.set(chat.id, lastAssistant?.turnOrder ?? null);
+              readyChatByPage.set(page, chat.id);
+              lastSeenChatByPage.set(page, chat.id);
+
+              const initialHook = await loadChatHook(sql, chat.id);
+              if (initialHook?.enabled) {
+                const initialTargets = await findZipTargets(page);
+                for (const target of initialTargets) handledHookDownloads.add(`${chat.id}:${target.identity}`);
+                initializedHookChats.add(chat.id);
+                pendingHookMessages.delete(chat.id);
+                log.info(`[hook] ready baseline chat=${chat.id}; ${readySnapshot.messages.length} messages, ${initialTargets.length} ZIP controls; no hook run`);
+              } else {
+                initializedHookChats.delete(chat.id);
+                pendingHookMessages.delete(chat.id);
+              }
+              return;
+            }
+
             const hook = await loadChatHook(sql, chat.id);
             const hookWasInitialized = initializedHookChats.has(chat.id);
             const newAssistantMessages = await persistChat(sql, chat, settleMs, prevIncomplete);
@@ -1566,11 +1660,18 @@ async function watch(cfg: Config, configPath: string) {
                 if (!pending) { pending = new Map<string, number>(); pendingHookMessages.set(chat.id, pending); }
                 for (const messageId of newAssistantMessages) pending.set(messageId, now + 5 * 60_000);
                 for (const [messageId, expiresAt] of pending) if (expiresAt < now) pending.delete(messageId);
+                const latestAssistant = [...chat.messages].reverse().find((message) => message.role === "assistant");
+                const baselineTurn = baselineAssistantTurnByChat.get(chat.id);
                 for (const target of targets) {
-                  // A ZIP link only triggers a hook when it belongs to an
-                  // assistant message that was newly inserted/completed since
-                  // this chat's baseline. No UUID means fail closed.
-                  if (!target.messageId || !pending.has(target.messageId)) continue;
+                  // Fail closed unless the ZIP belongs to the *latest* assistant
+                  // message, that message completed after the baseline, and its
+                  // stable global turn number proves it is newer. This excludes
+                  // historical attachments revealed by scrolling/editing older turns.
+                  if (!latestAssistant || !target.messageId || target.messageId !== latestAssistant.id) continue;
+                  if (!pending.has(latestAssistant.id) || !newAssistantMessages.has(latestAssistant.id)) continue;
+                  if (baselineTurn === null || baselineTurn === undefined ||
+                      latestAssistant.turnOrder === undefined || target.messageOrder === null ||
+                      target.messageOrder !== latestAssistant.turnOrder || latestAssistant.turnOrder <= baselineTurn) continue;
                   const hookKey = `${chat.id}:${target.identity}`;
                   if (handledHookDownloads.has(hookKey)) continue;
                   handledHookDownloads.add(hookKey);

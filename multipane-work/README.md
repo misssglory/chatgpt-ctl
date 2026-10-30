@@ -258,14 +258,19 @@ chatgpt-ctl hook remove "My project chat"
 `wl-paste -n`; override it with `--clipboard-command xclip --clipboard-arg -selection
 --clipboard-arg clipboard --clipboard-arg -o` (repeat `--clipboard-arg` for each argument).
 
-When a hook-enabled chat is first seen, the watcher records existing ZIP links as a baseline and
-never runs the hook just because the conversation was opened. Automatic processing is gated by a
-newly inserted or completed assistant message ID; ZIP links without a stable message UUID are
-ignored, and message/attachment identity is stable across polling scans. Run `chatgpt-ctl hook run <chat>` (also available as
-`hook trigger`) to manually download the newest ZIP attachment in that conversation and run the
-same extraction, Git commit, and build pipeline immediately. The command opens the specified chat
-in the active watcher pane if needed. Manual runs also work while a hook is disabled; disabling only
-pauses automatic processing of new attachments. Each new ZIP is saved under
+When a conversation pane is opened or navigated to, the watcher scrolls to the bottom, waits for
+the composer and conversation UI to hydrate, and requires several consecutive stable message-list
+snapshots with no active generation. It then persists the existing history and records the latest
+assistant turn and all existing ZIP controls as a baseline; this initialization never runs a hook.
+After initialization, automatic processing is restricted to a ZIP control whose stable message UUID
+belongs to the latest assistant message, whose turn number is newer than the baseline, and whose
+message has just completed. Historical ZIP links revealed by scrolling, revisiting, or editing older
+turns are therefore ignored. ZIP controls without stable message/turn metadata fail closed rather
+than triggering automation. Run `chatgpt-ctl hook run <chat>` (also available as `hook trigger`) to
+manually download the newest ZIP attachment in that conversation and run the same extraction, Git
+commit, and build pipeline immediately. The command opens the specified chat in the active watcher
+pane if needed. Manual runs also work while a hook is disabled; disabling only pauses automatic
+processing of new attachments. Each new ZIP is saved under
 `<folder>/.chatgpt-ctl-downloads/`, checked for path-traversal entries, and extracted into
 `folder`. The hook stages only archive paths, commits the archive's Markdown diff as the commit
 message (or `Auto update` if no Markdown changes are present), then runs `wcc build` from
@@ -341,3 +346,13 @@ The automatic ZIP hook now shares the same `findZipTargets` and
 `downloadZipTarget` helpers as the manual `download-last-zip` command. ZIP
 attachments are de-duplicated using their containing message ID and filename,
 and existing attachments are marked as the initial baseline when a hook starts.
+
+
+## Conversation loading and hook safety (2026-10-31)
+
+Every pane now has an initialization barrier: navigate, scroll to the bottom, wait for the composer
+and message list to hydrate, then wait for three consecutive stable snapshots while generation is
+idle. The watcher persists this snapshot and establishes the per-chat hook baseline before processing
+any automation. Hook candidates must be the newest completed assistant message and have a stable
+turn number greater than the initialization baseline. This prevents historical ZIP links that appear
+when scrolling through or editing older messages from being clicked by automatic hooks.
