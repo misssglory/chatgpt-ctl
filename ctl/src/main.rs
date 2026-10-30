@@ -157,6 +157,9 @@ enum HookAction {
     List,
     /// Show one chat's hook
     Show { chat: String },
+    /// Manually run a hook using the newest ZIP attachment in that conversation
+    #[command(alias = "trigger")]
+    Run { chat: String },
     /// Enable a hook
     Enable { chat: String },
     /// Disable a hook without deleting it
@@ -403,6 +406,18 @@ async fn run_hook_action(client: &Client, action: HookAction) -> Result<()> {
             let row = client.query_opt("SELECT folder, child_folder, nix_flake, clipboard_command, enabled FROM chat_hooks WHERE chat_id=$1", &[&id]).await?.context("no hook configured for this chat")?;
             let command: serde_json::Value = row.get(3);
             println!("chat: {id}\nfolder: {}\nchild_folder: {}\nnix_flake: {}\nenabled: {}\nclipboard_command: {}", row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, bool>(2), row.get::<_, bool>(4), command);
+        }
+        HookAction::Run { chat } => {
+            let id = resolve_chat_id(client, &chat).await?;
+            let body = serde_json::json!({ "chat_id": id }).to_string();
+            let response = watcher_request("POST", "/hook/run", Some(&body))
+                .context("could not trigger hook; is `bun run watch` running?")?;
+            let value: serde_json::Value = serde_json::from_str(&response)?;
+            if let Some(path) = value.get("archive").and_then(|v| v.as_str()) {
+                println!("hook completed for {id}: {path}");
+            } else {
+                println!("hook completed for {id}");
+            }
         }
         HookAction::Enable { chat } => {
             let id = resolve_chat_id(client, &chat).await?;
