@@ -112,6 +112,14 @@ enum Commands {
         json: bool,
     },
 
+    /// Enable or disable automatic clicking of a Retry button at the end of a chat
+    Retry {
+        /// Chat UUID or unique title substring
+        chat: String,
+        /// Whether automatic retry clicking is enabled
+        mode: RetryMode,
+    },
+
     /// Manage per-conversation ZIP/build automation hooks (stored in PostgreSQL)
     Hook {
         #[command(subcommand)]
@@ -166,6 +174,12 @@ enum HookAction {
     Disable { chat: String },
     /// Remove a hook
     Remove { chat: String },
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum RetryMode {
+    Enable,
+    Disable,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -329,6 +343,32 @@ async fn resolve_chat_id(client: &Client, spec: &str) -> Result<Uuid> {
         anyhow::bail!("refine the query (or pass a full UUID)");
     }
     Ok(rows[0].get(0))
+}
+
+async fn ensure_retry_table(client: &Client) -> Result<()> {
+    client.execute(
+        r#"CREATE TABLE IF NOT EXISTS chat_retry_settings (
+             chat_id uuid PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+             enabled boolean NOT NULL DEFAULT false,
+             updated_at timestamptz NOT NULL DEFAULT now()
+           )"#,
+        &[],
+    ).await?;
+    Ok(())
+}
+
+async fn set_retry_setting(client: &Client, chat: &str, mode: RetryMode) -> Result<()> {
+    ensure_retry_table(client).await?;
+    let id = resolve_chat_id(client, chat).await?;
+    let enabled = matches!(mode, RetryMode::Enable);
+    client.execute(
+        r#"INSERT INTO chat_retry_settings (chat_id, enabled, updated_at)
+           VALUES ($1, $2, now())
+           ON CONFLICT (chat_id) DO UPDATE SET enabled=EXCLUDED.enabled, updated_at=now()"#,
+        &[&id, &enabled],
+    ).await?;
+    println!("automatic Retry clicking {} for {id}", if enabled { "enabled" } else { "disabled" });
+    Ok(())
 }
 
 async fn ensure_hook_table(client: &Client) -> Result<()> {
@@ -759,6 +799,10 @@ async fn main() -> Result<()> {
         .unwrap_or_else(default_database_url);
 
     match cli.command {
+        Commands::Retry { chat, mode } => {
+            let client = connect(&url).await?;
+            set_retry_setting(&client, &chat, mode).await?;
+        }
         Commands::Hook { action } => {
             let client = connect(&url).await?;
             run_hook_action(&client, action).await?;
@@ -917,5 +961,10 @@ mod cli_completion_tests {
         assert!(hook.find_subcommand("set").is_some());
         assert!(hook.find_subcommand("list").is_some());
         assert!(hook.find_subcommand("remove").is_some());
+    }
+
+    #[test]
+    fn automatic_retry_command_is_exposed_to_clap_shell_completions() {
+        assert!(Cli::command().find_subcommand("retry").is_some());
     }
 }

@@ -116,6 +116,7 @@ chatgpt-ctl open [CHAT|current]              # UUID/title; no arg = TAB completi
 chatgpt-ctl new-chat                         # blank chat at / (no conversation UUID in URL)
 chatgpt-ctl download-last-zip [DIRECTORY] [--extract-to DIR]  # download, optionally extract
 chatgpt-ctl history [CHAT|current] [--all] [--follow] [--json]
+chatgpt-ctl retry <CHAT> enable|disable      # auto-click the final Retry button per chat
 chatgpt-ctl history                          # interactive; TAB completes titles/UUIDs from DB
 chatgpt-ctl message <uuid>
 chatgpt-ctl hook set|list|show|enable|disable|remove ...
@@ -136,7 +137,7 @@ _chatgpt_ctl() {
   local cur prev words cword
   _init_completion || return
   case "${words[1]}" in
-    open|history)
+    open|history|retry)
       if (( cword == 2 )); then
         mapfile -t COMPREPLY < <(chatgpt-ctl __complete-chat "$cur" 2>/dev/null | cut -f1)
         (( ${#COMPREPLY[@]} )) && return
@@ -200,6 +201,25 @@ context. It can also send file attachments without message text:
 chatgpt-ctl send "Review this" -f ./src/main.rs
 chatgpt-ctl send -f ./archive.zip
 ```
+
+### Per-chat automatic Retry button
+
+Automatic retry clicking is configured independently from ZIP/build hooks and persisted in
+PostgreSQL. The watcher checks the currently open conversation on each poll and, when enabled,
+clicks the last visible button whose accessible name is exactly `Retry`. This targets the Retry
+action at the end of the conversation (including the delivery-timeout alert shown in the supplied
+ChatGPT page snapshot). A 30-second per-chat cooldown prevents repeated clicks if the UI keeps the
+button visible after a click.
+
+```bash
+chatgpt-ctl retry "My project chat" enable
+chatgpt-ctl retry "My project chat" disable
+```
+
+The command accepts a chat UUID or unique title substring. It can be used without configuring a
+ZIP/build hook. The setting is stored in `chat_retry_settings` and takes effect on the next watcher
+poll; no watcher restart is required. Automatic clicking only applies while the watcher is on that
+conversation and a visible, enabled exact-name `Retry` button is present.
 
 ### Per-chat ZIP automation hooks
 
