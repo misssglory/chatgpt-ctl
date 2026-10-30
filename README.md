@@ -112,8 +112,7 @@ nix build
 ```text
 chatgpt-ctl chats [--limit N] [-q substring] [--refresh]
 chatgpt-ctl send "message text" [-f PATH]...  # current chat; repeatable file uploads
-chatgpt-ctl open [CHAT|current]              # UUID/title; new pane unless already open
-chatgpt-ctl close <CHAT|INDEX>               # close by UUID/title or 0-based open-pane index
+chatgpt-ctl open [CHAT|current]              # UUID/title; no arg = TAB completion
 chatgpt-ctl new-chat                         # blank chat at / (no conversation UUID in URL)
 chatgpt-ctl download-last-zip [DIRECTORY] [--extract-to DIR]  # download, optionally extract
 chatgpt-ctl history [CHAT|current] [--all] [--follow] [--json]
@@ -138,7 +137,7 @@ _chatgpt_ctl() {
   local cur prev words cword
   _init_completion || return
   case "${words[1]}" in
-    open|history|retry|close)
+    open|history|retry)
       if (( cword == 2 )); then
         mapfile -t COMPREPLY < <(chatgpt-ctl __complete-chat "$cur" 2>/dev/null | cut -f1)
         (( ${#COMPREPLY[@]} )) && return
@@ -173,19 +172,16 @@ chatgpt-ctl send "Review these files" -f ./notes.md -f ./src/main.rs
 The watcher performs a full sidebar synchronization at startup and refreshes visible titles on every
 watch tick, so renamed chats are updated in PostgreSQL. `chats --refresh` forces another full scan.
 
-While `bun run watch` is running, it exposes a localhost control endpoint
-(default `127.0.0.1:17381`). Each conversation is kept in its own Chromium tab/page:
-`chatgpt-ctl open <CHAT>` focuses the existing page when that chat is already open,
-or creates a new page and opens it otherwise. The watcher polls and persists messages,
-Retry settings, and ZIP/build hooks independently in every open conversation page.
-`chatgpt-ctl chats` marks every opened conversation with a cyan `●` and its 0-based
-pane index. `chatgpt-ctl close <CHAT>` closes a pane by UUID or unique title substring;
-`chatgpt-ctl close 0` closes the first currently opened conversation pane (indices follow
-the order shown by `chats`). Closing the active pane focuses another open conversation,
-or creates a blank ChatGPT page if none remain. `chatgpt-ctl send` submits into the most recently opened/focused pane through the CLI.
-`chatgpt-ctl new-chat` navigates that pane to ChatGPT's root URL (`/`), opening a blank composer. Set `CHATGPT_CTL_ADDR` for the CLI
-or `CHATGPT_CTL_HOST` / `CHATGPT_CTL_PORT` for the watcher to override the address.
-The interactive `open` prompt uses cached PostgreSQL chat titles and UUIDs for TAB completion.
+While `bun run watch` is running, it also exposes a localhost control endpoint
+(default `127.0.0.1:17381`). `chatgpt-ctl open <CHAT>` sends the selected UUID to that
+server and navigates the watcher's existing ChatGPT tab/pane instead of launching a
+second Chromium window. `chatgpt-ctl send` submits into that same page without launching another
+browser context. `chatgpt-ctl new-chat` navigates that same pane to the ChatGPT
+root URL (`/`), opening a blank composer without a conversation UUID in the address.
+Set `CHATGPT_CTL_ADDR` for the CLI or `CHATGPT_CTL_HOST` /
+`CHATGPT_CTL_PORT` for the watcher to override the address. The interactive `open`
+prompt uses the cached PostgreSQL chat titles and UUIDs for TAB completion. `chatgpt-ctl chats`
+marks the browser's currently open conversation with a cyan `●` while the watcher is running.
 
 `chatgpt-ctl download-last-zip [DIRECTORY]` asks the watcher to download the newest ZIP attachment
 from the currently open conversation. With no directory it uses `[downloads].directory` from
