@@ -57,11 +57,3 @@ directory = "./var/downloads"
 # child_folder = "rust-edge-gui"        # build cwd under folder; defaults to "."
 # nix_flake = false                     # true => nix develop <build-dir> -c wcc build
 # clipboard_command = ["wl-paste", "-n"] # default on Wayland; read wcc's clipboard output
-
-
-[hooks."6ae4c5ad-6410-83ed-abf0-7944c8969abf"]
-enabled = true
-folder = "/home/mg/chatgpt-history-watcher"  # Git working tree / extraction root
-child_folder = "ctl"        # build cwd under folder; defaults to "."
-nix_flake = false                     # true => nix develop <build-dir> -c wcc build
-clipboard_command = ["wl-paste", "-n"] # default on Wayland; read wcc's clipboard output

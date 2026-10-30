@@ -894,7 +894,7 @@ function safeFilename(raw: string): string {
   return leaf && leaf.toLowerCase().endsWith(".zip") ? leaf : `${leaf || "chatgpt-download"}.zip`;
 }
 
-type ZipTarget = { index: number; label: string; selector: string; kind: "link" | "card"; messageOrder: number | null };
+type ZipTarget = { index: number; label: string; selector: string; kind: "link" | "card"; messageOrder: number | null; identity: string };
 
 /**
  * ChatGPT renders assistant-generated files as DIL pressables (`role=link`),
@@ -912,37 +912,54 @@ async function findZipTargets(page: Page): Promise<ZipTarget[]> {
       const title = el.getAttribute("title") || "";
       const href = el instanceof HTMLAnchorElement ? el.href : "";
       const text = (el.innerText || "").replace(/\s+/g, " ").trim();
+      const isLink = el instanceof HTMLAnchorElement || el.getAttribute("role") === "link";
+      const context = `${aria} ${downloadName} ${title} ${text} ${href}`;
+      const hasZipExtension = /\.zip(?:$|[?#\s])/i.test(context);
+      // DIL download pressables sometimes expose only a descriptive label such
+      // as "Open Download the repaired full project ZIP", with no filename.
+      // Include those links; the browser Download event supplies the real name.
+      const isDescriptiveZipLink = isLink && /\bzip\b/i.test(`${aria} ${title} ${text}`);
+      if (!hasZipExtension && !isDescriptiveZipLink) return;
+
       const label = [aria, downloadName, title, text].find((value) => /\.zip(?:$|[?#\s])/i.test(value))
         || aria || downloadName || title || text || href;
-      const context = `${aria} ${downloadName} ${title} ${text} ${href}`;
-      if (!/\.zip(?:$|[?#\s])/i.test(context)) return;
-
-      const isLink = el instanceof HTMLAnchorElement || el.getAttribute("role") === "link";
       // ChatGPT's conversation DOM is not guaranteed to be chronological.
       // DIL attachment nodes can be nested in portals, so inspect all ancestors
       // for either of the conversation search-unit attributes.
       let ancestor: HTMLElement | null = el;
       let messageOrder: number | null = null;
-      while (ancestor && messageOrder === null) {
-        const keys = [
-          ancestor.getAttribute("data-content-search-unit-key") || "",
-          ancestor.getAttribute("data-chatgpt-search-unit-key") || "",
-        ];
-        for (const key of keys) {
-          const match = key.match(/(?:fallback-)?turn[-_](\d+)/i);
-          if (match) {
-            messageOrder = Number(match[1]);
-            break;
+      let messageId = "";
+      while (ancestor) {
+        if (!messageId) {
+          messageId =
+            ancestor.getAttribute("data-dil-message-id") ||
+            ancestor.getAttribute("data-dil-source-message-id") ||
+            ancestor.getAttribute("data-chatgpt-selection-message-id") ||
+            "";
+        }
+        if (messageOrder === null) {
+          const keys = [
+            ancestor.getAttribute("data-content-search-unit-key") || "",
+            ancestor.getAttribute("data-chatgpt-search-unit-key") || "",
+          ];
+          for (const key of keys) {
+            const match = key.match(/(?:fallback-)?turn[-_](\d+)/i);
+            if (match) {
+              messageOrder = Number(match[1]);
+              break;
+            }
           }
         }
         ancestor = ancestor.parentElement;
       }
+      const cleanLabel = label.replace(/^Open\s+Download\s+/i, "").trim();
       result.push({
         index,
-        label: label.replace(/^Open\s+Download\s+/i, "").trim(),
+        label: cleanLabel,
         selector,
         kind: isLink ? "link" : "card",
         messageOrder,
+        identity: `${messageId || `turn-${messageOrder ?? "unknown"}-index-${index}`}|${cleanLabel}`,
       });
     });
     return result;
@@ -981,7 +998,7 @@ async function downloadZipTarget(page: Page, targetInfo: ZipTarget, directory: s
   }
 
   const suggested = download.suggestedFilename() || targetInfo.label || "chatgpt-download.zip";
-  const filename = safeFilename(/\.zip/i.test(targetInfo.label) ? targetInfo.label : suggested);
+  const filename = safeFilename(suggested);
   const target = path.join(directory, filename);
   await download.saveAs(target);
   log.info(`[download] saved ${target}`);
@@ -1185,21 +1202,23 @@ async function watch(cfg: Config, configPath: string) {
           await persistChat(sql, chat, settleMs, prevIncomplete);
           const hook = cfg.hooks?.[chat.id];
           if (hook && hook.enabled !== false) {
-            const links = await findZipLinks(page);
+            const targets = await findZipTargets(page);
             if (!initializedHookChats.has(chat.id)) {
               // Existing attachments are history, not newly arrived ZIPs.
-              for (const link of links) handledHookDownloads.add(`${chat.id}:${link.href}`);
+              for (const target of targets) {
+                handledHookDownloads.add(`${chat.id}:${target.identity}`);
+              }
               initializedHookChats.add(chat.id);
-              log.info(`[hook] initialized ZIP baseline for chat=${chat.id} (${links.length} existing links)`);
+              log.info(`[hook] initialized ZIP baseline for chat=${chat.id} (${targets.length} existing attachments)`);
             }
-            for (const link of links) {
-              const hookKey = `${chat.id}:${link.href}`;
+            for (const target of targets) {
+              const hookKey = `${chat.id}:${target.identity}`;
               if (handledHookDownloads.has(hookKey)) continue;
               // Mark before running: a failed automation must not repeatedly process each poll.
               handledHookDownloads.add(hookKey);
               try {
                 const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
-                const archive = await downloadZipLink(page, link, archiveDir);
+                const archive = await downloadZipTarget(page, target, archiveDir);
                 await runHookForZip(page, chat.id, hook, archive, configPath);
               } catch (hookError) {
                 log.error(`[hook] chat=${chat.id} failed: ${formatError(hookError)}`);

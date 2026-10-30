@@ -236,3 +236,10 @@ numbers, logs detected ZIP candidates, and prefers candidates with a known
 conversation turn over unpositioned resource-card attachments. This prevents
 an uploaded ZIP card without turn metadata from overriding an assistant
 attachment whose conversation position is known.
+\n
+## Watch hook repair (2026-10-30)
+
+The automatic ZIP hook now shares the same `findZipTargets` and
+`downloadZipTarget` helpers as the manual `download-last-zip` command. ZIP
+attachments are de-duplicated using their containing message ID and filename,
+and existing attachments are marked as the initial baseline when a hook starts.
