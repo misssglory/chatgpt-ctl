@@ -15,6 +15,7 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{CompletionType, Config, Context as RlContext, Editor, Helper};
+use std::borrow::Cow;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -407,7 +408,7 @@ async fn run_hook_action(client: &Client, action: HookAction) -> Result<()> {
         }
         HookAction::Enable { chat } => {
             let id = resolve_chat_id(client, &chat).await?;
-            let changed = client.execute("UPDATE chat_hooks SET enabled=true, updated_at=now() WHERE chat_id=$1", &[&id]).await?;
+            let changed = client.execute("UPDATE chat_hooks SET enabled=$2, updated_at=now() WHERE chat_id=$1", &[&id, &enabled]).await?;
             if changed == 0 { anyhow::bail!("no hook configured for {id}"); }
             println!("hook enabled for {id}");
         }
