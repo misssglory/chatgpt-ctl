@@ -849,7 +849,7 @@ async fn main() -> Result<()> {
                 let pane_index = open_chats.iter().position(|id| *id == c.id);
                 if focused_chat == Some(c.id) {
                     // The active browser pane is the target for download-last-zip.
-                    println!("\x1b[1;30;103m▶ FOCUSED / ZIP TARGET [{pane_index.unwrap_or(0)}] {}\t{:>4} msgs\t{}\t{}\x1b[0m", c.id, c.message_count, ts, c.title);
+                    println!("\x1b[1;30;103m▶ FOCUSED / ZIP TARGET [{}] {}\t{:>4} msgs\t{}\t{}\x1b[0m", pane_index.unwrap_or(0), c.id, c.message_count, ts, c.title);
                 } else if let Some(pane_index) = pane_index {
                     println!("\x1b[1;36m● OPEN [{pane_index}] {}\t{:>4} msgs\t{}\t{}\x1b[0m", c.id, c.message_count, ts, c.title);
                 } else {
