@@ -67,6 +67,12 @@ enum Commands {
         chat: Option<String>,
     },
 
+    /// Download the newest ZIP attachment from the currently open conversation.
+    DownloadLastZip {
+        /// Destination directory (default: ./var/downloads)
+        directory: Option<PathBuf>,
+    },
+
     /// Show message history for a chat.
     ///
     /// With no CHAT argument, enters an interactive prompt with DB-backed
@@ -548,6 +554,37 @@ fn request_active_pane_open(chat_id: Uuid) -> Result<()> {
     Ok(())
 }
 
+fn watcher_request(method: &str, path: &str, body: Option<&str>) -> Result<String> {
+    let address = std::env::var("CHATGPT_CTL_ADDR").unwrap_or_else(|_| "127.0.0.1:17381".into());
+    let mut stream = TcpStream::connect(&address)
+        .with_context(|| format!("connect to watcher control server at {address}; start `bun run watch`"))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(120)))?;
+    let payload = body.unwrap_or("");
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    stream.write_all(request.as_bytes())?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let (headers, body) = response.split_once("\r\n\r\n").unwrap_or((&response, ""));
+    let status = headers.lines().next().unwrap_or("HTTP/1.1 500");
+    if !status.contains(" 200 ") { anyhow::bail!("watcher request failed ({status}): {body}"); }
+    Ok(body.to_string())
+}
+
+fn watcher_active_chat() -> Option<Uuid> {
+    let address = std::env::var("CHATGPT_CTL_ADDR").unwrap_or_else(|_| "127.0.0.1:17381".into());
+    let mut stream = TcpStream::connect(address).ok()?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok()?;
+    stream.write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    let body = response.split_once("\r\n\r\n")?.1;
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value.get("chat_id")?.as_str()?.parse().ok()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -569,15 +606,17 @@ async fn main() -> Result<()> {
             }
             let client = connect(&url).await?;
             let chats = list_chats(&client, limit, query.as_deref()).await?;
+            let active_chat = watcher_active_chat();
             for c in chats {
                 let ts = c
                     .updated_at
                     .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or_else(|| "-".into());
-                println!(
-                    "{}\t{:>4} msgs\t{}\t{}",
-                    c.id, c.message_count, ts, c.title
-                );
+                if active_chat == Some(c.id) {
+                    println!("\x1b[1;36m● {}\t{:>4} msgs\t{}\t{}\x1b[0m", c.id, c.message_count, ts, c.title);
+                } else {
+                    println!("  {}\t{:>4} msgs\t{}\t{}", c.id, c.message_count, ts, c.title);
+                }
             }
         }
         Commands::Send { text, files } => {
@@ -598,6 +637,15 @@ async fn main() -> Result<()> {
                 None => interactive_open(&client).await?,
             };
             request_active_pane_open(chat_id)?;
+        }
+        Commands::DownloadLastZip { directory } => {
+            let body = match directory {
+                Some(directory) => serde_json::json!({ "directory": directory }).to_string(),
+                None => "{}".to_string(),
+            };
+            let response = watcher_request("POST", "/download-last-zip", Some(&body))?;
+            let value: serde_json::Value = serde_json::from_str(&response)?;
+            println!("{}", value.get("path").and_then(|v| v.as_str()).unwrap_or("download complete"));
         }
         Commands::History {
             chat,
@@ -652,4 +700,16 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+
+#[cfg(test)]
+mod cli_completion_tests {
+    use super::*;
+
+    #[test]
+    fn download_last_zip_is_exposed_to_clap_shell_completions() {
+        let command = Cli::command();
+        assert!(command.find_subcommand("download-last-zip").is_some());
+    }
 }

@@ -10,7 +10,7 @@
  */
 
 import { TOML } from "bun";
-import { chromium, type BrowserContext, type Page } from "playwright-core";
+import { chromium, type BrowserContext, type Download, type Page } from "playwright-core";
 import { Logger } from "tslog";
 import { access, constants, mkdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -59,6 +59,14 @@ interface Config {
     name?: string;
   };
   debug?: { network?: boolean };
+  downloads?: { directory?: string };
+  hooks?: Record<string, {
+    folder: string;
+    child_folder?: string;
+    nix_flake?: boolean;
+    clipboard_command?: string[];
+    enabled?: boolean;
+  }>;
 }
 
 interface ScrapedMessage {
@@ -128,8 +136,8 @@ async function isNixOS(): Promise<boolean> {
   }
 }
 
-async function commandOutput(cmd: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
-  const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
+async function commandOutput(cmd: string[], cwd?: string): Promise<{ code: number; stdout: string; stderr: string }> {
+  const proc = Bun.spawn(cmd, { cwd, stdout: "pipe", stderr: "pipe" });
   const [stdout, stderr] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
@@ -881,28 +889,244 @@ async function once(cfg: Config, configPath: string) {
 const CONTROL_HOST = process.env.CHATGPT_CTL_HOST || "127.0.0.1";
 const CONTROL_PORT = Number(process.env.CHATGPT_CTL_PORT || 17381);
 
-function startControlServer(page: Page, cfg: Config) {
+function safeFilename(raw: string): string {
+  const leaf = path.basename(raw.replace(/\\/g, "/")).replace(/[^\p{L}\p{N}._ -]/gu, "_").trim();
+  return leaf && leaf.toLowerCase().endsWith(".zip") ? leaf : `${leaf || "chatgpt-download"}.zip`;
+}
+
+type ZipTarget = { index: number; label: string; selector: string; kind: "link" | "card"; messageOrder: number | null };
+
+/**
+ * ChatGPT renders assistant-generated files as DIL pressables (`role=link`),
+ * not ordinary <a href> elements. User-uploaded files use resource-card
+ * buttons. Keep ordinary anchors as a fallback for older ChatGPT builds.
+ */
+async function findZipTargets(page: Page): Promise<ZipTarget[]> {
+  const selector = 'a[href], [role="link"][aria-label], button[aria-label]';
+  return page.locator(selector).evaluateAll((elements) => {
+    const result: ZipTarget[] = [];
+    elements.forEach((element, index) => {
+      const el = element as HTMLElement;
+      const aria = el.getAttribute("aria-label") || "";
+      const downloadName = el.getAttribute("download") || "";
+      const title = el.getAttribute("title") || "";
+      const href = el instanceof HTMLAnchorElement ? el.href : "";
+      const text = (el.innerText || "").replace(/\s+/g, " ").trim();
+      const label = [aria, downloadName, title, text].find((value) => /\.zip(?:$|[?#\s])/i.test(value))
+        || aria || downloadName || title || text || href;
+      const context = `${aria} ${downloadName} ${title} ${text} ${href}`;
+      if (!/\.zip(?:$|[?#\s])/i.test(context)) return;
+
+      const isLink = el instanceof HTMLAnchorElement || el.getAttribute("role") === "link";
+      // ChatGPT's conversation DOM is not guaranteed to be chronological.
+      // DIL attachment nodes can be nested in portals, so inspect all ancestors
+      // for either of the conversation search-unit attributes.
+      let ancestor: HTMLElement | null = el;
+      let messageOrder: number | null = null;
+      while (ancestor && messageOrder === null) {
+        const keys = [
+          ancestor.getAttribute("data-content-search-unit-key") || "",
+          ancestor.getAttribute("data-chatgpt-search-unit-key") || "",
+        ];
+        for (const key of keys) {
+          const match = key.match(/(?:fallback-)?turn[-_](\d+)/i);
+          if (match) {
+            messageOrder = Number(match[1]);
+            break;
+          }
+        }
+        ancestor = ancestor.parentElement;
+      }
+      result.push({
+        index,
+        label: label.replace(/^Open\s+Download\s+/i, "").trim(),
+        selector,
+        kind: isLink ? "link" : "card",
+        messageOrder,
+      });
+    });
+    return result;
+  });
+}
+
+async function waitForDownload(click: () => Promise<unknown>, page: Page): Promise<Download> {
+  const downloadPromise = page.waitForEvent("download", { timeout: 12_000 });
+  try {
+    await click();
+    return await downloadPromise;
+  } catch (error) {
+    // Avoid an unhandled timeout rejection if the click itself failed first.
+    void downloadPromise.catch(() => undefined);
+    throw error;
+  }
+}
+
+async function downloadZipTarget(page: Page, targetInfo: ZipTarget, directory: string): Promise<string> {
+  await mkdir(directory, { recursive: true });
+  const targetLocator = page.locator(targetInfo.selector).nth(targetInfo.index);
+  let download: Download;
+  try {
+    download = await waitForDownload(() => targetLocator.click(), page);
+  } catch (firstError) {
+    // Resource-card buttons open a preview in some ChatGPT builds. In that
+    // preview the actual download action is a separate button.
+    const downloadButton = page.getByRole("button", { name: /^download(?:\s|$)/i }).last();
+    if (!(await downloadButton.isVisible().catch(() => false))) {
+      throw new Error(
+        `Could not trigger download for '${targetInfo.label}'. ` +
+        `ChatGPT may have changed its attachment UI. Initial error: ${String(firstError)}`,
+      );
+    }
+    download = await waitForDownload(() => downloadButton.click(), page);
+  }
+
+  const suggested = download.suggestedFilename() || targetInfo.label || "chatgpt-download.zip";
+  const filename = safeFilename(/\.zip/i.test(targetInfo.label) ? targetInfo.label : suggested);
+  const target = path.join(directory, filename);
+  await download.saveAs(target);
+  log.info(`[download] saved ${target}`);
+  return target;
+}
+
+async function downloadLastZip(page: Page, directory: string): Promise<string> {
+  const targets = await findZipTargets(page);
+  if (targets.length === 0) {
+    throw new Error(
+      "no ZIP attachment found in the current conversation; expected a ChatGPT file link " +
+      "(role=link with a .zip name), an attachment card, or an <a href> download link",
+    );
+  }
+  // Log candidates to make UI changes diagnosable. User-uploaded resource
+  // cards may not expose a turn key; do not let such an unknown item override
+  // assistant attachments whose conversation turns are known.
+  log.info(`[download] candidates: ${JSON.stringify(targets.map(({ index, label, messageOrder, kind }) => ({
+    index, label, messageOrder, kind,
+  })))}`);
+
+  const knownTargets = targets.filter(
+    (target) => target.messageOrder !== null,
+  );
+  const candidates = knownTargets.length > 0 ? knownTargets : targets;
+  const newest = candidates.reduce((best, current) => {
+    const bestTurn = best.messageOrder;
+    const currentTurn = current.messageOrder;
+    if (bestTurn !== null && currentTurn !== null) {
+      if (currentTurn > bestTurn) return current;
+      if (currentTurn < bestTurn) return best;
+    }
+    return current.index > best.index ? current : best;
+  });
+
+  log.info(`[download] selected ${newest.label} (message turn ${newest.messageOrder ?? "unknown"})`);
+  return downloadZipTarget(page, newest, directory);
+}
+
+async function sendInPage(page: Page, text: string, chatId?: string) {
+  if (chatId && normalizeUuid(page.url()) !== chatId) {
+    await page.goto(new URL(`/c/${chatId}`, "https://chatgpt.com").toString(), { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(900);
+  }
+  const composer = page.locator('#prompt-textarea, [data-composer-markdown][contenteditable="true"], [contenteditable="true"][role="textbox"], textarea').first();
+  await composer.waitFor({ state: "visible" });
+  await composer.fill(text);
+  const sendButton = page.locator('button[data-testid="send-button"], button[aria-label="Send message" i], button[aria-label="Send" i], button[data-composer-navigation-target="send"]').first();
+  await sendButton.waitFor({ state: "visible", timeout: 8000 });
+  await sendButton.click();
+  await page.waitForTimeout(700);
+}
+
+async function runHookForZip(
+  page: Page,
+  chatId: string,
+  hook: NonNullable<Config["hooks"]>[string],
+  archive: string,
+  configPath: string
+) {
+  const projectDir = resolveFromConfig(configPath, hook.folder);
+  await mkdir(projectDir, { recursive: true });
+  const listing = await commandOutput(["unzip", "-Z1", archive]);
+  if (listing.code !== 0) throw new Error(`cannot list ZIP entries: ${listing.stderr}`);
+  const entries = listing.stdout.split("\n").map((x) => x.trim()).filter(Boolean);
+  if (!entries.length) throw new Error("ZIP archive is empty");
+  for (const entry of entries) {
+    const normalized = path.posix.normalize(entry.replace(/\\/g, "/"));
+    if (normalized.startsWith("/") || normalized === ".." || normalized.startsWith("../") || normalized.includes("/../")) {
+      throw new Error(`unsafe ZIP entry rejected: ${entry}`);
+    }
+  }
+  const extract = await commandOutput(["unzip", "-o", "-q", archive, "-d", projectDir]);
+  if (extract.code !== 0) throw new Error(`ZIP extraction failed: ${extract.stderr}`);
+
+  // Stage only paths supplied by this archive, avoiding unrelated working-tree changes.
+  const stagedPaths = entries.map((entry) => path.posix.normalize(entry.replace(/\\/g, "/")));
+  const add = await commandOutput(["git", "-C", projectDir, "add", "-A", "--", ...stagedPaths]);
+  if (add.code !== 0) throw new Error(`git add failed: ${add.stderr}`);
+  const staged = await commandOutput(["git", "-C", projectDir, "diff", "--cached", "--quiet", "--", ...stagedPaths]);
+  if (staged.code === 1) {
+    const mdPaths = stagedPaths.filter((entry) => entry.toLowerCase().endsWith(".md"));
+    const mdDiff = mdPaths.length
+      ? await commandOutput(["git", "-C", projectDir, "diff", "--cached", "--", ...mdPaths])
+      : { code: 0, stdout: "", stderr: "" };
+    const commitMessage = (mdDiff.stdout || "Auto update").slice(0, 18000);
+    const commit = await commandOutput(["git", "-C", projectDir, "commit", "--only", "-m", commitMessage, "--", ...stagedPaths]);
+    if (commit.code !== 0) throw new Error(`git commit failed: ${commit.stderr || commit.stdout}`);
+    log.info(`[hook] committed ZIP update in ${projectDir}`);
+  } else if (staged.code !== 0) {
+    throw new Error(`git diff failed: ${staged.stderr}`);
+  } else {
+    log.info(`[hook] archive produced no Git changes in ${projectDir}`);
+  }
+
+  const buildDir = path.resolve(projectDir, hook.child_folder || ".");
+  const buildCommand = hook.nix_flake
+    ? ["nix", "develop", buildDir, "-c", "wcc", "build"]
+    : ["wcc", "build"];
+  const build = await commandOutput(buildCommand, buildDir);
+  log.info(`[hook] build exit=${build.code}${build.stdout ? ` stdout=${build.stdout.slice(-1000)}` : ""}${build.stderr ? ` stderr=${build.stderr.slice(-1000)}` : ""}`);
+  if (build.code !== 0) {
+    const clipboardCommand = hook.clipboard_command?.length ? hook.clipboard_command : ["wl-paste", "-n"];
+    const clipboard = await commandOutput(clipboardCommand);
+    const diagnostic = clipboard.stdout || clipboard.stderr || build.stderr || build.stdout || `wcc build failed with exit code ${build.code}; clipboard was empty`;
+    await sendInPage(page, `Build failed (exit code ${build.code}). Latest build output from clipboard:\n\n${diagnostic}`, chatId);
+  }
+}
+
+function startControlServer(page: Page, cfg: Config, configPath: string) {
   const server = Bun.serve({
     hostname: CONTROL_HOST,
     port: CONTROL_PORT,
     async fetch(request) {
       const url = new URL(request.url);
-      if (request.method !== "POST" || url.pathname !== "/open") {
-        return new Response("not found", { status: 404 });
+      if (request.method === "GET" && url.pathname === "/status") {
+        return Response.json({ chat_id: normalizeUuid(page.url()), url: page.url() });
       }
+      if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
       try {
-        const body = (await request.json()) as { chat_id?: string };
-        const chatId = normalizeUuid(body.chat_id || "");
-        if (!chatId) return Response.json({ error: "invalid chat_id" }, { status: 400 });
-        const target = new URL(`/c/${chatId}`, cfg.chatgpt.url).toString();
-        await page.goto(target, {
-          waitUntil: "domcontentloaded",
-          timeout: cfg.browser?.navigation_timeout_ms ?? 45_000,
-        });
-        return Response.json({ ok: true, chat_id: chatId, url: target });
+        const body = await request.json().catch(() => ({})) as { chat_id?: string; directory?: string; text?: string };
+        if (url.pathname === "/open") {
+          const chatId = normalizeUuid(body.chat_id || "");
+          if (!chatId) return Response.json({ error: "invalid chat_id" }, { status: 400 });
+          const target = new URL(`/c/${chatId}`, cfg.chatgpt.url).toString();
+          await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
+          return Response.json({ ok: true, chat_id: chatId, url: target });
+        }
+        if (url.pathname === "/download-last-zip") {
+          const directory = body.directory
+            ? path.resolve(body.directory)
+            : resolveFromConfig(configPath, cfg.downloads?.directory || "./var/downloads");
+          const saved = await downloadLastZip(page, directory);
+          return Response.json({ ok: true, path: saved });
+        }
+        if (url.pathname === "/send") {
+          const chatId = normalizeUuid(body.chat_id || "");
+          if (!body.text?.trim()) return Response.json({ error: "text is required" }, { status: 400 });
+          await sendInPage(page, body.text, chatId || undefined);
+          return Response.json({ ok: true, chat_id: chatId });
+        }
+        return new Response("not found", { status: 404 });
       } catch (error) {
-        log.error(`[ctl] open failed: ${formatError(error)}`);
-        return Response.json({ error: String(error) }, { status: 500 });
+        log.error(`[ctl] request failed: ${formatError(error)}`);
+        return Response.json({ error: formatError(error) }, { status: 500 });
       }
     },
   });
@@ -919,6 +1143,8 @@ async function watch(cfg: Config, configPath: string) {
   const prevIncomplete = new Map<string, number>();
   let lastChatId = "";
   let controlServer: ReturnType<typeof Bun.serve> | undefined;
+  const handledHookDownloads = new Set<string>();
+  const initializedHookChats = new Set<string>();
 
   const stop = async () => {
     log.info("\n[watch] stopping...");
@@ -934,7 +1160,7 @@ async function watch(cfg: Config, configPath: string) {
     const page = await getPage(context);
     attachNetworkDebug(page, cfg);
     await openChatGPT(page, cfg);
-    controlServer = startControlServer(page, cfg);
+    controlServer = startControlServer(page, cfg, configPath);
     const sidebarChats = await syncSidebarChats(page, sql, true);
     log.info(`[watch] synchronized ${sidebarChats.length} sidebar chats`);
     log.info(
@@ -957,6 +1183,29 @@ async function watch(cfg: Config, configPath: string) {
             prevIncomplete.clear();
           }
           await persistChat(sql, chat, settleMs, prevIncomplete);
+          const hook = cfg.hooks?.[chat.id];
+          if (hook && hook.enabled !== false) {
+            const links = await findZipLinks(page);
+            if (!initializedHookChats.has(chat.id)) {
+              // Existing attachments are history, not newly arrived ZIPs.
+              for (const link of links) handledHookDownloads.add(`${chat.id}:${link.href}`);
+              initializedHookChats.add(chat.id);
+              log.info(`[hook] initialized ZIP baseline for chat=${chat.id} (${links.length} existing links)`);
+            }
+            for (const link of links) {
+              const hookKey = `${chat.id}:${link.href}`;
+              if (handledHookDownloads.has(hookKey)) continue;
+              // Mark before running: a failed automation must not repeatedly process each poll.
+              handledHookDownloads.add(hookKey);
+              try {
+                const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
+                const archive = await downloadZipLink(page, link, archiveDir);
+                await runHookForZip(page, chat.id, hook, archive, configPath);
+              } catch (hookError) {
+                log.error(`[hook] chat=${chat.id} failed: ${formatError(hookError)}`);
+              }
+            }
+          }
         }
       } catch (error) {
         log.error(`[watch] scan failed:\n${formatError(error)}`);
@@ -997,6 +1246,16 @@ async function main() {
       if (!id) throw new Error("Usage: open <chat-uuid>");
       return openChatCommand(cfg, configPath, id);
     }
+    case "download-last-zip": {
+      const directory = args[1] ? path.resolve(args[1]) : path.resolve(cfg.downloads?.directory || "./var/downloads");
+      const response = await fetch(`http://${CONTROL_HOST}:${CONTROL_PORT}/download-last-zip`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ directory }),
+      });
+      const result = await response.json().catch(() => ({})) as { error?: string; path?: string };
+      if (!response.ok) throw new Error(result.error || `watch control server returned ${response.status}`);
+      console.log(result.path);
+      return;
+    }
     case "send": {
       const files: string[] = [];
       const textParts: string[] = [];
@@ -1030,7 +1289,7 @@ async function main() {
       return watch(cfg, configPath);
     default:
       throw new Error(
-        `Unknown command '${command}'. Use doctor | login | sync-chats | open | send | migrate | flush | dump | once | watch`
+        `Unknown command '${command}'. Use doctor | login | sync-chats | open | download-last-zip | send | migrate | flush | dump | once | watch`
       );
   }
 }

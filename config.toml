@@ -42,3 +42,26 @@ name = "chatgpt_history"
 
 [debug]
 network = false
+
+# Default destination for `chatgpt-ctl download-last-zip`.
+[downloads]
+directory = "./var/downloads"
+
+# Per-conversation automation hooks. The table key is the conversation UUID
+# stored in PostgreSQL (chats.id). Paths are relative to this config file unless
+# absolute. The watcher only runs a hook while that conversation is open.
+#
+# [hooks."00000000-0000-0000-0000-000000000000"]
+# enabled = true
+# folder = "/home/YOU/src/my-project"  # Git working tree / extraction root
+# child_folder = "rust-edge-gui"        # build cwd under folder; defaults to "."
+# nix_flake = false                     # true => nix develop <build-dir> -c wcc build
+# clipboard_command = ["wl-paste", "-n"] # default on Wayland; read wcc's clipboard output
+
+
+[hooks."6ae4c5ad-6410-83ed-abf0-7944c8969abf"]
+enabled = true
+folder = "/home/mg/chatgpt-history-watcher"  # Git working tree / extraction root
+child_folder = "ctl"        # build cwd under folder; defaults to "."
+nix_flake = false                     # true => nix develop <build-dir> -c wcc build
+clipboard_command = ["wl-paste", "-n"] # default on Wayland; read wcc's clipboard output

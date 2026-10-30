@@ -113,11 +113,15 @@ nix build
 chatgpt-ctl chats [--limit N] [-q substring] [--refresh]
 chatgpt-ctl send "message text" [-f PATH]...  # current chat; repeatable file uploads
 chatgpt-ctl open [CHAT|current]              # UUID/title; no arg = TAB completion
+chatgpt-ctl download-last-zip [DIRECTORY]   # save newest ZIP from current browser chat
 chatgpt-ctl history [CHAT|current] [--all] [--follow] [--json]
 chatgpt-ctl history                          # interactive; TAB completes titles/UUIDs from DB
 chatgpt-ctl message <uuid>
 chatgpt-ctl completions bash|zsh|fish|elvish|powershell
 ```
+
+The generated shell completions include all CLI subcommands, including `download-last-zip`.
+After updating the binary, regenerate your shell completion file or rebuild/reinstall the Nix package.
 
 `CHAT` may be a UUID, a title substring, or `current` (most recently updated chat).
 `open` without an argument and `history` without an argument provide interactive title/UUID autocomplete.
@@ -141,7 +145,38 @@ While `bun run watch` is running, it also exposes a localhost control endpoint
 server and navigates the watcher's existing ChatGPT tab/pane instead of launching a
 second Chromium window. Set `CHATGPT_CTL_ADDR` for the CLI or `CHATGPT_CTL_HOST` /
 `CHATGPT_CTL_PORT` for the watcher to override the address. The interactive `open`
-prompt uses the cached PostgreSQL chat titles and UUIDs for TAB completion.
+prompt uses the cached PostgreSQL chat titles and UUIDs for TAB completion. `chatgpt-ctl chats`
+marks the browser's currently open conversation with a cyan `●` while the watcher is running.
+
+`chatgpt-ctl download-last-zip [DIRECTORY]` asks the watcher to download the newest ZIP attachment
+from the currently open conversation. With no directory it uses `[downloads].directory` from
+`config.toml` (default `./var/downloads`).
+
+### Per-chat ZIP automation hooks
+
+Add a TOML table keyed by the conversation UUID from `chatgpt-ctl chats`:
+
+```toml
+[hooks."YOUR-CHAT-UUID"]
+enabled = true
+folder = "/home/YOU/src/my-project" # extraction root and Git working tree
+child_folder = "rust-edge-gui"      # optional; defaults to "."
+nix_flake = false                   # true runs `nix develop <build-dir> -c wcc build`
+clipboard_command = ["wl-paste", "-n"] # optional; this is the default on Wayland
+```
+
+Paths in hook configuration are relative to the `config.toml` directory unless absolute. While
+that conversation is open, the watcher records existing ZIP links as a baseline and processes
+only subsequently-arriving ZIP attachments. Each new ZIP is saved under
+`<folder>/.chatgpt-ctl-downloads/`, checked for path-traversal entries, and extracted into
+`folder`. The hook stages only archive paths, commits the archive's Markdown diff as the commit
+message (or `Auto update` if no Markdown changes are present), then runs `wcc build` from
+`child_folder` (or `.`). Set `nix_flake = true` to run the build inside that directory's Nix
+flake dev shell. On build failure it reads the configured clipboard command (default
+`wl-paste -n`) and sends that diagnostic to the hooked conversation.
+
+The hook requires `unzip`, `git`, `wcc`, and, when `nix_flake = true`, `nix` on the watcher's
+`PATH`. The target folder must already be a Git repository with commit identity configured.
 
 ```bash
 # static shell completion (also installed by the Nix package)
@@ -193,3 +228,11 @@ programs.chatgpt-ctl.database.ensureLocal = false;
 programs.chatgpt-ctl.databaseUrl =
   "postgres://chatgpt:chatgpt@127.0.0.1:5432/chatgpt_history";
 ```
+
+## ZIP download selection fix (2026-10-30)
+
+The `download-last-zip` watcher checks ancestor conversation metadata for turn
+numbers, logs detected ZIP candidates, and prefers candidates with a known
+conversation turn over unpositioned resource-card attachments. This prevents
+an uploaded ZIP card without turn metadata from overriding an assistant
+attachment whose conversation position is known.
