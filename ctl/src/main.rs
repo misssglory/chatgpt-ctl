@@ -85,7 +85,7 @@ enum Commands {
         /// Destination directory for the ZIP file (default: ./var/downloads)
         directory: Option<PathBuf>,
         /// Extract the downloaded ZIP into this directory (keeps the ZIP file)
-        #[arg(long = "extract-to", alias = "unzip-to", value_name = "DIR", value_hint = clap::ValueHint::Dir)]
+        #[arg(long = "extract-to", alias = "unzip-to", value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
         extract_to: Option<PathBuf>,
     },
 
