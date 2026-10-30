@@ -77,7 +77,7 @@ enum Commands {
         chat: String,
     },
 
-    /// Navigate the active ChatGPT pane to a blank new chat (URL has no conversation UUID).
+    /// Open a blank new chat in its own watcher browser pane (URL has no conversation UUID).
     NewChat,
 
     /// Download the newest ZIP attachment from the currently open conversation.
@@ -85,7 +85,7 @@ enum Commands {
         /// Destination directory for the ZIP file (default: ./var/downloads)
         directory: Option<PathBuf>,
         /// Extract the downloaded ZIP into this directory (keeps the ZIP file)
-        #[arg(long = "extract-to", alias = "unzip-to", value_name = "DIR")]
+        #[arg(long = "extract-to", alias = "unzip-to", value_name = "DIR", value_hint = clap::ValueHint::Dir)]
         extract_to: Option<PathBuf>,
     },
 
@@ -162,7 +162,10 @@ enum HookAction {
         /// Build directory below --folder (default: .)
         #[arg(long, default_value = ".")]
         child_folder: String,
-        /// Run `nix develop <build-dir> -c wcc build`
+        /// Build command executed from --child-folder; use `none` to skip building (default: wcc build)
+        #[arg(long, default_value = "wcc build")]
+        build_command: String,
+        /// Run the build command inside `nix develop <build-dir>`
         #[arg(long)]
         nix_flake: bool,
         /// Clipboard executable (default: wl-paste)
@@ -391,12 +394,15 @@ async fn ensure_hook_table(client: &Client) -> Result<()> {
           child_folder text NOT NULL DEFAULT '.',
           nix_flake boolean NOT NULL DEFAULT false,
           clipboard_command jsonb NOT NULL DEFAULT '["wl-paste", "-n"]'::jsonb,
+          build_command text DEFAULT 'wcc build',
           enabled boolean NOT NULL DEFAULT true,
           updated_at timestamptz NOT NULL DEFAULT now()
         )
         "#,
         &[],
     ).await?;
+    // Additive migration for databases created by older watcher versions.
+    client.execute("ALTER TABLE chat_hooks ADD COLUMN IF NOT EXISTS build_command text DEFAULT 'wcc build'", &[]).await?;
     Ok(())
 }
 
@@ -417,7 +423,7 @@ async fn complete_chat_values(client: &Client, prefix: &str) -> Result<()> {
 async fn run_hook_action(client: &Client, action: HookAction) -> Result<()> {
     ensure_hook_table(client).await?;
     match action {
-        HookAction::Set { chat, folder, child_folder, nix_flake, clipboard_command, clipboard_args } => {
+        HookAction::Set { chat, folder, child_folder, build_command, nix_flake, clipboard_command, clipboard_args } => {
             let id = resolve_chat_id(client, &chat).await?;
             let folder = folder.canonicalize().with_context(|| format!("resolve hook folder {}", folder.display()))?;
             if !folder.is_dir() { anyhow::bail!("hook folder is not a directory: {}", folder.display()); }
@@ -428,35 +434,38 @@ async fn run_hook_action(client: &Client, action: HookAction) -> Result<()> {
                 command.extend(clipboard_args);
             }
             let command_json = serde_json::to_value(command)?;
+            let build_command = if build_command.trim().eq_ignore_ascii_case("none") { None } else { Some(build_command.trim().to_string()) };
             let folder_text = folder.to_string_lossy().to_string();
             client.execute(
-                r#"INSERT INTO chat_hooks (chat_id, folder, child_folder, nix_flake, clipboard_command, enabled, updated_at)
-                   VALUES ($1, $2, $3, $4, $5::jsonb, true, now())
+                r#"INSERT INTO chat_hooks (chat_id, folder, child_folder, nix_flake, clipboard_command, build_command, enabled, updated_at)
+                   VALUES ($1, $2, $3, $4, $5::jsonb, $6, true, now())
                    ON CONFLICT (chat_id) DO UPDATE SET folder=EXCLUDED.folder,
                      child_folder=EXCLUDED.child_folder, nix_flake=EXCLUDED.nix_flake,
-                     clipboard_command=EXCLUDED.clipboard_command, enabled=true, updated_at=now()"#,
-                &[&id, &folder_text, &child_folder, &nix_flake, &command_json],
+                     clipboard_command=EXCLUDED.clipboard_command, build_command=EXCLUDED.build_command,
+                     enabled=true, updated_at=now()"#,
+                &[&id, &folder_text, &child_folder, &nix_flake, &command_json, &build_command],
             ).await?;
             println!("hook configured for {id} ({})", chat);
         }
         HookAction::List => {
             let rows = client.query(
-                "SELECT h.chat_id, c.title, h.folder, h.child_folder, h.nix_flake, h.enabled FROM chat_hooks h JOIN chats c ON c.id=h.chat_id ORDER BY c.updated_at DESC NULLS LAST",
+                "SELECT h.chat_id, c.title, h.folder, h.child_folder, h.nix_flake, h.enabled, h.build_command FROM chat_hooks h JOIN chats c ON c.id=h.chat_id ORDER BY c.updated_at DESC NULLS LAST",
                 &[],
             ).await?;
             if rows.is_empty() { println!("no hooks configured"); }
             for row in rows {
                 let id: Uuid = row.get(0); let title: String = row.get(1);
                 let folder: String = row.get(2); let child: String = row.get(3);
-                let nix: bool = row.get(4); let enabled: bool = row.get(5);
-                println!("{} [{}] {} -> {}{}", id, if enabled { "enabled" } else { "disabled" }, title, folder, if nix { format!(" (nix develop, build dir: {child})") } else { format!(" (build dir: {child})") });
+                let nix: bool = row.get(4); let enabled: bool = row.get(5); let build: Option<String> = row.get(6);
+                println!("{} [{}] {} -> {} (build dir: {}; build: {}; nix_flake: {})", id, if enabled { "enabled" } else { "disabled" }, title, folder, child, build.as_deref().unwrap_or("none"), nix);
             }
         }
         HookAction::Show { chat } => {
             let id = resolve_chat_id(client, &chat).await?;
-            let row = client.query_opt("SELECT folder, child_folder, nix_flake, clipboard_command, enabled FROM chat_hooks WHERE chat_id=$1", &[&id]).await?.context("no hook configured for this chat")?;
+            let row = client.query_opt("SELECT folder, child_folder, nix_flake, clipboard_command, enabled, build_command FROM chat_hooks WHERE chat_id=$1", &[&id]).await?.context("no hook configured for this chat")?;
             let command: serde_json::Value = row.get(3);
-            println!("chat: {id}\nfolder: {}\nchild_folder: {}\nnix_flake: {}\nenabled: {}\nclipboard_command: {}", row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, bool>(2), row.get::<_, bool>(4), command);
+            let build_command: Option<String> = row.get(5);
+            println!("chat: {id}\nfolder: {}\nchild_folder: {}\nbuild_command: {}\nnix_flake: {}\nenabled: {}\nclipboard_command: {}", row.get::<_, String>(0), row.get::<_, String>(1), build_command.as_deref().unwrap_or("none"), row.get::<_, bool>(2), row.get::<_, bool>(4), command);
         }
         HookAction::Run { chat } => {
             let id = resolve_chat_id(client, &chat).await?;
@@ -894,10 +903,7 @@ async fn main() -> Result<()> {
         Commands::NewChat => {
             let response = watcher_request("POST", "/new-chat", Some("{}"))?;
             let value: serde_json::Value = serde_json::from_str(&response)?;
-            println!(
-                "{}",
-                value.get("url").and_then(|v| v.as_str()).unwrap_or("opened a new chat")
-            );
+            println!("opened blank chat in a new pane ({})", value.get("url").and_then(|v| v.as_str()).unwrap_or("ChatGPT"));
         }
         Commands::DownloadLastZip { directory, extract_to } => {
             let cwd = std::env::current_dir()?;

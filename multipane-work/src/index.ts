@@ -12,7 +12,7 @@
 import { TOML } from "bun";
 import { chromium, type BrowserContext, type Download, type Page } from "playwright-core";
 import { Logger } from "tslog";
-import { access, constants, mkdir, readFile } from "node:fs/promises";
+import { access, constants, mkdir, mkdtemp, readdir, rename, rm, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import postgres from "postgres";
@@ -189,6 +189,7 @@ type ChatHook = {
   child_folder: string;
   nix_flake: boolean;
   clipboard_command: string[];
+  build_command: string | null;
   enabled: boolean;
 };
 
@@ -233,15 +234,18 @@ async function ensureHookSchema(sql: Sql): Promise<void> {
       child_folder text NOT NULL DEFAULT '.',
       nix_flake boolean NOT NULL DEFAULT false,
       clipboard_command jsonb NOT NULL DEFAULT '["wl-paste", "-n"]'::jsonb,
+      build_command text DEFAULT 'wcc build',
       enabled boolean NOT NULL DEFAULT true,
       updated_at timestamptz NOT NULL DEFAULT now()
     )
   `);
+  // Keep existing installations compatible; this is a non-destructive additive migration.
+  await sql.unsafe("ALTER TABLE chat_hooks ADD COLUMN IF NOT EXISTS build_command text DEFAULT 'wcc build'");
 }
 
 async function loadChatHook(sql: Sql, chatId: string): Promise<ChatHook | null> {
   const rows = await sql`
-    SELECT folder, child_folder, nix_flake, clipboard_command, enabled
+    SELECT folder, child_folder, nix_flake, clipboard_command, enabled, build_command
     FROM chat_hooks WHERE chat_id = ${chatId}::uuid
   `;
   if (!rows.length) return null;
@@ -254,6 +258,7 @@ async function loadChatHook(sql: Sql, chatId: string): Promise<ChatHook | null> 
     child_folder: row.child_folder || ".",
     nix_flake: Boolean(row.nix_flake),
     clipboard_command: Array.isArray(command) && command.length ? command : ["wl-paste", "-n"],
+    build_command: row.build_command == null ? null : String(row.build_command),
     enabled: Boolean(row.enabled),
   };
 }
@@ -1112,35 +1117,41 @@ async function findZipTargets(page: Page): Promise<ZipTarget[]> {
   });
 }
 
-async function waitForDownload(click: () => Promise<unknown>, page: Page): Promise<Download> {
-  const downloadPromise = page.waitForEvent("download", { timeout: 12_000 });
-  try {
-    await click();
-    return await downloadPromise;
-  } catch (error) {
-    // Avoid an unhandled timeout rejection if the click itself failed first.
-    void downloadPromise.catch(() => undefined);
-    throw error;
-  }
+async function waitForDownload(click: () => Promise<unknown>, page: Page): Promise<Download | null> {
+  // Attach the listener before clicking. A timeout is a recoverable UI race,
+  // not a fatal watcher error; importantly, it must never cause a second,
+  // unscoped click on an arbitrary button elsewhere in the page.
+  const downloadPromise = page.waitForEvent("download", { timeout: 12_000 }).then(
+    (download) => download,
+    () => null,
+  );
+  await click();
+  return await downloadPromise;
 }
 
-async function downloadZipTarget(page: Page, targetInfo: ZipTarget, directory: string): Promise<string> {
+async function downloadZipTarget(page: Page, targetInfo: ZipTarget, directory: string): Promise<string | null> {
   await mkdir(directory, { recursive: true });
-  const targetLocator = page.locator(targetInfo.selector).nth(targetInfo.index);
-  let download: Download;
+  // Re-resolve the attachment immediately before interaction. A DOM index
+  // captured during an earlier poll can point at an unrelated button after
+  // streaming/layout changes, so only click a currently matching identity.
+  const currentTargets = await findZipTargets(page);
+  const currentMatches = currentTargets.filter((candidate) => candidate.identity === targetInfo.identity);
+  if (currentMatches.length !== 1) {
+    log.warn(`[download] target '${targetInfo.label}' is no longer uniquely present; refusing to click`);
+    return null;
+  }
+  const currentTarget = currentMatches[0]!;
+  const targetLocator = page.locator(currentTarget.selector).nth(currentTarget.index);
+  let download: Download | null;
   try {
-    download = await waitForDownload(() => targetLocator.click(), page);
-  } catch (firstError) {
-    // Resource-card buttons open a preview in some ChatGPT builds. In that
-    // preview the actual download action is a separate button.
-    const downloadButton = page.getByRole("button", { name: /^download(?:\s|$)/i }).last();
-    if (!(await downloadButton.isVisible().catch(() => false))) {
-      throw new Error(
-        `Could not trigger download for '${targetInfo.label}'. ` +
-        `ChatGPT may have changed its attachment UI. Initial error: ${String(firstError)}`,
-      );
-    }
-    download = await waitForDownload(() => downloadButton.click(), page);
+    download = await waitForDownload(() => targetLocator.click({ timeout: 5_000 }), page);
+  } catch (error) {
+    log.warn(`[download] click failed for '${targetInfo.label}': ${formatError(error)}`);
+    return null;
+  }
+  if (!download) {
+    log.warn(`[download] no Playwright download event for '${targetInfo.label}'; skipping hook instead of clicking another page button`);
+    return null;
   }
 
   const suggested = download.suggestedFilename() || targetInfo.label || "chatgpt-download.zip";
@@ -1181,7 +1192,9 @@ async function downloadLastZip(page: Page, directory: string): Promise<string> {
   });
 
   log.info(`[download] selected ${newest.label} (message turn ${newest.messageOrder ?? "unknown"})`);
-  return downloadZipTarget(page, newest, directory);
+  const downloaded = await downloadZipTarget(page, newest, directory);
+  if (!downloaded) throw new Error(`no download event for ${newest.label}; ZIP was not captured`);
+  return downloaded;
 }
 
 async function sendInPage(page: Page, text: string, chatId?: string, files: string[] = []) {
@@ -1253,16 +1266,20 @@ async function runHookForZip(
   }
 
   const buildDir = path.resolve(projectDir, hook.child_folder || ".");
-  const buildCommand = hook.nix_flake
-    ? ["nix", "develop", buildDir, "-c", "wcc", "build"]
-    : ["wcc", "build"];
-  const build = await commandOutput(buildCommand, buildDir);
-  log.info(`[hook] build exit=${build.code}${build.stdout ? ` stdout=${build.stdout.slice(-1000)}` : ""}${build.stderr ? ` stderr=${build.stderr.slice(-1000)}` : ""}`);
-  if (build.code !== 0) {
-    const clipboardCommand = hook.clipboard_command?.length ? hook.clipboard_command : ["wl-paste", "-n"];
-    const clipboard = await commandOutput(clipboardCommand);
-    const diagnostic = clipboard.stdout || clipboard.stderr || build.stderr || build.stdout || `wcc build failed with exit code ${build.code}; clipboard was empty`;
-    await sendInPage(page, `Build failed (exit code ${build.code}). Latest build output from clipboard:\n\n${diagnostic}`, chatId);
+  if (hook.build_command !== null && hook.build_command.trim() !== "") {
+    const buildCommand = hook.nix_flake
+      ? ["nix", "develop", buildDir, "-c", "sh", "-lc", hook.build_command]
+      : ["sh", "-lc", hook.build_command];
+    const build = await commandOutput(buildCommand, buildDir);
+    log.info(`[hook] build exit=${build.code}${build.stdout ? ` stdout=${build.stdout.slice(-1000)}` : ""}${build.stderr ? ` stderr=${build.stderr.slice(-1000)}` : ""}`);
+    if (build.code !== 0) {
+      const clipboardCommand = hook.clipboard_command?.length ? hook.clipboard_command : ["wl-paste", "-n"];
+      const clipboard = await commandOutput(clipboardCommand);
+      const diagnostic = clipboard.stdout || clipboard.stderr || build.stderr || build.stdout || `build command failed with exit code ${build.code}; clipboard was empty`;
+      await sendInPage(page, `Build failed (exit code ${build.code}). Latest build output from clipboard:\n\n${diagnostic}`, chatId);
+    }
+  } else {
+    log.info(`[hook] build command disabled for ${chatId}; skipping build`);
   }
 }
 
@@ -1415,14 +1432,19 @@ function startControlServer(
           return Response.json({ ok: true, closed_chat_id: closedId, chat_ids: openConversationPages(context).map((item) => item.chatId) });
         }
         if (url.pathname === "/new-chat") {
-          const page = getActivePage();
+          const page = await context.newPage();
+          attachNetworkDebug(page, cfg);
           const target = new URL("/", cfg.chatgpt.url).toString();
           await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
-          await page.waitForTimeout(1000);
+          await page.locator('#prompt-textarea, [data-composer-markdown][contenteditable="true"], [contenteditable="true"][role="textbox"], textarea').first()
+            .waitFor({ state: "visible", timeout: 30_000 });
           const finalUrl = page.url();
           if (normalizeUuid(finalUrl)) {
+            await page.close();
             return Response.json({ error: `ChatGPT redirected away from the new-chat URL: ${finalUrl}`, url: finalUrl }, { status: 409 });
           }
+          setActivePage(page);
+          await page.bringToFront();
           return Response.json({ ok: true, url: finalUrl });
         }
         if (url.pathname === "/send") {
@@ -1519,10 +1541,31 @@ function startControlServer(
               }
             }
             await mkdir(extractTo, { recursive: true });
-            const extracted = await commandOutput(["unzip", "-o", "-q", saved, "-d", extractTo]);
-            if (extracted.code !== 0) throw new Error(`ZIP extraction failed: ${extracted.stderr}`);
+            const topLevel = new Set(entries.map((entry) => entry.replace(/\\/g, "/").split("/")[0]).filter(Boolean));
+            const singleRoot = topLevel.size === 1 ? [...topLevel][0]! : null;
+            const flattenRoot = Boolean(singleRoot && entries.some((entry) => entry.replace(/\\/g, "/").startsWith(`${singleRoot}/`)));
+            if (flattenRoot && singleRoot) {
+              // Extract to a temporary sibling first, then move the sole root
+              // folder's contents into the requested destination.
+              const staging = await mkdtemp(path.join(extractTo, ".chatgpt-ctl-unzip-"));
+              try {
+                const extracted = await commandOutput(["unzip", "-o", "-q", saved, "-d", staging]);
+                if (extracted.code !== 0) throw new Error(`ZIP extraction failed: ${extracted.stderr}`);
+                const rootDir = path.join(staging, singleRoot);
+                const children = await readdir(rootDir, { withFileTypes: true });
+                for (const child of children) {
+                  await rename(path.join(rootDir, child.name), path.join(extractTo, child.name));
+                }
+                log.info(`[download] flattened single root folder '${singleRoot}' from ${saved} into ${extractTo}`);
+              } finally {
+                await rm(staging, { recursive: true, force: true });
+              }
+            } else {
+              const extracted = await commandOutput(["unzip", "-o", "-q", saved, "-d", extractTo]);
+              if (extracted.code !== 0) throw new Error(`ZIP extraction failed: ${extracted.stderr}`);
+            }
             log.info(`[download] extracted ${saved} to ${extractTo}`);
-            return Response.json({ ok: true, path: saved, extracted_to: extractTo });
+            return Response.json({ ok: true, path: saved, extracted_to: extractTo, flattened: flattenRoot });
           }
           return Response.json({ ok: true, path: saved });
         }
@@ -1548,6 +1591,9 @@ async function watch(cfg: Config, configPath: string) {
   const lastSeenChatByPage = new WeakMap<Page, string>();
   const readyChatByPage = new WeakMap<Page, string>();
   const baselineAssistantTurnByChat = new Map<string, number | null>();
+  const baselineUserTurnByChat = new Map<string, number | null>();
+  const baselineUserMessageByChat = new Map<string, string | null>();
+  const baselineUserSequenceByChat = new Map<string, number | null>();
   let activePage: Page;
   let controlServer: ReturnType<typeof Bun.serve> | undefined;
   const handledHookDownloads = new Set<string>();
@@ -1606,7 +1652,11 @@ async function watch(cfg: Config, configPath: string) {
               );
               await persistChat(sql, readySnapshot, settleMs, prevIncomplete);
               const lastAssistant = [...readySnapshot.messages].reverse().find((message) => message.role === "assistant");
+              const lastUser = [...readySnapshot.messages].reverse().find((message) => message.role === "user");
               baselineAssistantTurnByChat.set(chat.id, lastAssistant?.turnOrder ?? null);
+              baselineUserTurnByChat.set(chat.id, lastUser?.turnOrder ?? null);
+              baselineUserMessageByChat.set(chat.id, lastUser?.id ?? null);
+              baselineUserSequenceByChat.set(chat.id, lastUser?.sequence ?? null);
               readyChatByPage.set(page, chat.id);
               lastSeenChatByPage.set(page, chat.id);
 
@@ -1661,13 +1711,22 @@ async function watch(cfg: Config, configPath: string) {
                 for (const messageId of newAssistantMessages) pending.set(messageId, now + 5 * 60_000);
                 for (const [messageId, expiresAt] of pending) if (expiresAt < now) pending.delete(messageId);
                 const latestAssistant = [...chat.messages].reverse().find((message) => message.role === "assistant");
+                const latestUser = [...chat.messages].reverse().find((message) => message.role === "user");
                 const baselineTurn = baselineAssistantTurnByChat.get(chat.id);
+                const baselineUserTurn = baselineUserTurnByChat.get(chat.id);
+                const baselineUserMessage = baselineUserMessageByChat.get(chat.id);
+                // A new assistant node alone is insufficient: editing/regenerating
+                // an older turn can create a fresh message id. Require a genuinely
+                // new user turn beyond the settled history baseline as well.
+                const hasNewUserTurn = Boolean(latestUser && latestUser.id !== baselineUserMessage &&
+                  latestUser.turnOrder !== undefined && baselineUserTurn !== null &&
+                  baselineUserTurn !== undefined && latestUser.turnOrder > baselineUserTurn);
                 for (const target of targets) {
                   // Fail closed unless the ZIP belongs to the *latest* assistant
                   // message, that message completed after the baseline, and its
                   // stable global turn number proves it is newer. This excludes
                   // historical attachments revealed by scrolling/editing older turns.
-                  if (!latestAssistant || !target.messageId || target.messageId !== latestAssistant.id) continue;
+                  if (!hasNewUserTurn || !latestAssistant || !target.messageId || target.messageId !== latestAssistant.id) continue;
                   if (!pending.has(latestAssistant.id) || !newAssistantMessages.has(latestAssistant.id)) continue;
                   if (baselineTurn === null || baselineTurn === undefined ||
                       latestAssistant.turnOrder === undefined || target.messageOrder === null ||
@@ -1678,7 +1737,7 @@ async function watch(cfg: Config, configPath: string) {
                   try {
                     const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
                     const archive = await downloadZipTarget(page, target, archiveDir);
-                    await runHookForZip(page, chat.id, hook, archive, configPath);
+                    if (archive) await runHookForZip(page, chat.id, hook, archive, configPath);
                   } catch (hookError) {
                     log.error(`[hook] chat=${chat.id} failed: ${formatError(hookError)}`);
                   }

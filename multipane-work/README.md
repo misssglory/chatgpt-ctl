@@ -114,7 +114,7 @@ chatgpt-ctl chats [--limit N] [-q substring] [--refresh]
 chatgpt-ctl send "message text" [--chat CHAT | --new-chat] [-f PATH]...  # focused, targeted, or new chat
 chatgpt-ctl open [CHAT|current]              # UUID/title; new pane unless already open
 chatgpt-ctl close <CHAT|INDEX>               # close by UUID/title or 0-based open-pane index
-chatgpt-ctl new-chat                         # blank chat at / (no conversation UUID in URL)
+chatgpt-ctl new-chat                         # open a blank chat in a separate pane
 chatgpt-ctl download-last-zip [DIRECTORY] [--extract-to DIR]  # download, optionally extract
 chatgpt-ctl history [CHAT|current] [--all] [--follow] [--json]
 chatgpt-ctl retry <CHAT> enable|disable      # auto-click the final Retry button per chat
@@ -186,15 +186,18 @@ or creates a blank ChatGPT page if none remain. `chatgpt-ctl send` submits into 
 send to a specific chat by UUID or title substring; if it is not already open, the watcher creates
 a new pane for it. Sending focuses the destination pane. Browser tab focus is tracked from page
 focus/visibility events, in addition to `open` and `send` commands.
-`chatgpt-ctl new-chat` navigates that pane to ChatGPT's root URL (`/`), opening a blank composer. Set `CHATGPT_CTL_ADDR` for the CLI
+`chatgpt-ctl new-chat` opens a separate browser pane at ChatGPT's root URL (`/`), leaving
+existing conversation panes untouched. Set `CHATGPT_CTL_ADDR` for the CLI
 or `CHATGPT_CTL_HOST` / `CHATGPT_CTL_PORT` for the watcher to override the address.
 The interactive `open` prompt uses cached PostgreSQL chat titles and UUIDs for TAB completion.
 
 `chatgpt-ctl download-last-zip [DIRECTORY]` asks the watcher to download the newest ZIP attachment
 from the currently open conversation. With no directory it uses `[downloads].directory` from
 `config.toml` (default `./var/downloads`). Add `--extract-to DIR` (alias `--unzip-to`) to
-extract the downloaded archive into `DIR`; the original ZIP is kept. Relative paths are resolved
-from the directory where you run `chatgpt-ctl`. Example:
+extract the downloaded archive into `DIR`; the original ZIP is kept. If the archive contains
+exactly one top-level directory, its contents are moved directly into `DIR` (so no redundant
+wrapper directory is created). Relative paths are resolved from the directory where you run
+`chatgpt-ctl`; `--extract-to` is marked as a directory argument for shell path completion. Example:
 
 ```bash
 chatgpt-ctl download-last-zip ./var/downloads --extract-to ./work/latest-project
@@ -245,6 +248,8 @@ needed in `config.toml`, and changes are picked up by the running watcher on its
 ```bash
 chatgpt-ctl hook set "My project chat" --folder ~/src/my-project
 chatgpt-ctl hook set "My Rust chat" --folder ~/src/my-project --child-folder rust-edge-gui --nix-flake
+chatgpt-ctl hook set "Docs chat" --folder ~/src/docs --child-folder website --build-command "bun run build"
+chatgpt-ctl hook set "No build chat" --folder ~/src/docs --child-folder website --build-command none
 chatgpt-ctl hook list
 chatgpt-ctl hook show "My project chat"
 chatgpt-ctl hook run "My project chat"      # manually use the newest ZIP already in that chat
@@ -253,15 +258,23 @@ chatgpt-ctl hook enable "My project chat"
 chatgpt-ctl hook remove "My project chat"
 ```
 
-`--folder` is resolved and stored as an absolute path. `--child-folder` defaults to `.`;
-`--nix-flake` runs `nix develop <build-dir> -c wcc build`. The clipboard command defaults to
+`--folder` is resolved and stored as an absolute path. `--child-folder` defaults to `.`.
+`--build-command` is a shell command executed with the child folder as its working directory;
+it defaults to `wcc build`. Set it to `none` to skip the build step entirely. With
+`--nix-flake`, the command runs inside `nix develop <build-dir> -c sh -lc <build-command>`.
+The clipboard command defaults to
 `wl-paste -n`; override it with `--clipboard-command xclip --clipboard-arg -selection
 --clipboard-arg clipboard --clipboard-arg -o` (repeat `--clipboard-arg` for each argument).
 
 When a conversation pane is opened or navigated to, the watcher scrolls to the bottom, waits for
 the composer and conversation UI to hydrate, and requires several consecutive stable message-list
 snapshots with no active generation. It then persists the existing history and records the latest
-assistant turn and all existing ZIP controls as a baseline; this initialization never runs a hook.
+assistant turn, latest user turn/message, and all existing ZIP controls as a baseline; this
+initialization never runs a hook. Automatic hooks additionally require a newly completed latest
+assistant message and a genuinely new user turn beyond that baseline. Before clicking, the watcher
+re-resolves the ZIP target by its message identity; if the target is no longer uniquely present or
+Playwright does not report a download, it refuses to click a fallback button and skips the hook.
+This is deliberately fail-closed to avoid accidental clicks while switching chats or editing old turns.
 After initialization, automatic processing is restricted to a ZIP control whose stable message UUID
 belongs to the latest assistant message, whose turn number is newer than the baseline, and whose
 message has just completed. Historical ZIP links revealed by scrolling, revisiting, or editing older
@@ -273,13 +286,13 @@ pane if needed. Manual runs also work while a hook is disabled; disabling only p
 processing of new attachments. Each new ZIP is saved under
 `<folder>/.chatgpt-ctl-downloads/`, checked for path-traversal entries, and extracted into
 `folder`. The hook stages only archive paths, commits the archive's Markdown diff as the commit
-message (or `Auto update` if no Markdown changes are present), then runs `wcc build` from
-`child_folder` (or `.`). Set `nix_flake = true` to run the build inside that directory's Nix
-flake dev shell. On build failure it reads the configured clipboard command (default
+message (or `Auto update` if no Markdown changes are present), then runs the configured `build_command` from `child_folder` (or `.`). The default is
+`wcc build`; set `--build-command none` to skip building. `--nix-flake` runs the configured
+command inside that directory's Nix flake dev shell. On build failure it reads the configured clipboard command (default
 `wl-paste -n`) and sends that diagnostic to the hooked conversation.
 
-The hook requires `unzip`, `git`, `wcc`, and, when `--nix-flake` is used, `nix` on the watcher's
-`PATH`. The target folder must already be a Git repository with commit identity configured.
+The hook requires `unzip` and `git`; the configured build executable and, when `--nix-flake` is
+used, `nix` must be on the watcher's `PATH`. The target folder must already be a Git repository with commit identity configured.
 
 ```bash
 # static shell completion (also installed by the Nix package)
