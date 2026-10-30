@@ -112,14 +112,6 @@ enum Commands {
         json: bool,
     },
 
-    /// Enable or disable automatic clicking of a Retry button at the end of a chat
-    Retry {
-        /// Chat UUID or unique title substring
-        chat: String,
-        /// Whether automatic retry clicking is enabled
-        mode: RetryMode,
-    },
-
     /// Manage per-conversation ZIP/build automation hooks (stored in PostgreSQL)
     Hook {
         #[command(subcommand)]
@@ -165,21 +157,12 @@ enum HookAction {
     List,
     /// Show one chat's hook
     Show { chat: String },
-    /// Manually run a hook using the newest ZIP attachment in that conversation
-    #[command(alias = "trigger")]
-    Run { chat: String },
     /// Enable a hook
     Enable { chat: String },
     /// Disable a hook without deleting it
     Disable { chat: String },
     /// Remove a hook
     Remove { chat: String },
-}
-
-#[derive(Clone, Debug, ValueEnum)]
-enum RetryMode {
-    Enable,
-    Disable,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -345,32 +328,6 @@ async fn resolve_chat_id(client: &Client, spec: &str) -> Result<Uuid> {
     Ok(rows[0].get(0))
 }
 
-async fn ensure_retry_table(client: &Client) -> Result<()> {
-    client.execute(
-        r#"CREATE TABLE IF NOT EXISTS chat_retry_settings (
-             chat_id uuid PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
-             enabled boolean NOT NULL DEFAULT false,
-             updated_at timestamptz NOT NULL DEFAULT now()
-           )"#,
-        &[],
-    ).await?;
-    Ok(())
-}
-
-async fn set_retry_setting(client: &Client, chat: &str, mode: RetryMode) -> Result<()> {
-    ensure_retry_table(client).await?;
-    let id = resolve_chat_id(client, chat).await?;
-    let enabled = matches!(mode, RetryMode::Enable);
-    client.execute(
-        r#"INSERT INTO chat_retry_settings (chat_id, enabled, updated_at)
-           VALUES ($1, $2, now())
-           ON CONFLICT (chat_id) DO UPDATE SET enabled=EXCLUDED.enabled, updated_at=now()"#,
-        &[&id, &enabled],
-    ).await?;
-    println!("automatic Retry clicking {} for {id}", if enabled { "enabled" } else { "disabled" });
-    Ok(())
-}
-
 async fn ensure_hook_table(client: &Client) -> Result<()> {
     client.execute(
         r#"
@@ -417,6 +374,7 @@ async fn run_hook_action(client: &Client, action: HookAction) -> Result<()> {
                 command.extend(clipboard_args);
             }
             let command_json = serde_json::to_value(command)?;
+            let command_text = serde_json::to_string(&command_json)?;
             let folder_text = folder.to_string_lossy().to_string();
             client.execute(
                 r#"INSERT INTO chat_hooks (chat_id, folder, child_folder, nix_flake, clipboard_command, enabled, updated_at)
@@ -424,7 +382,7 @@ async fn run_hook_action(client: &Client, action: HookAction) -> Result<()> {
                    ON CONFLICT (chat_id) DO UPDATE SET folder=EXCLUDED.folder,
                      child_folder=EXCLUDED.child_folder, nix_flake=EXCLUDED.nix_flake,
                      clipboard_command=EXCLUDED.clipboard_command, enabled=true, updated_at=now()"#,
-                &[&id, &folder_text, &child_folder, &nix_flake, &command_json],
+                &[&id, &folder_text, &child_folder, &nix_flake, &command_text],
             ).await?;
             println!("hook configured for {id} ({})", chat);
         }
@@ -446,18 +404,6 @@ async fn run_hook_action(client: &Client, action: HookAction) -> Result<()> {
             let row = client.query_opt("SELECT folder, child_folder, nix_flake, clipboard_command, enabled FROM chat_hooks WHERE chat_id=$1", &[&id]).await?.context("no hook configured for this chat")?;
             let command: serde_json::Value = row.get(3);
             println!("chat: {id}\nfolder: {}\nchild_folder: {}\nnix_flake: {}\nenabled: {}\nclipboard_command: {}", row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, bool>(2), row.get::<_, bool>(4), command);
-        }
-        HookAction::Run { chat } => {
-            let id = resolve_chat_id(client, &chat).await?;
-            let body = serde_json::json!({ "chat_id": id }).to_string();
-            let response = watcher_request("POST", "/hook/run", Some(&body))
-                .context("could not trigger hook; is `bun run watch` running?")?;
-            let value: serde_json::Value = serde_json::from_str(&response)?;
-            if let Some(path) = value.get("archive").and_then(|v| v.as_str()) {
-                println!("hook completed for {id}: {path}");
-            } else {
-                println!("hook completed for {id}");
-            }
         }
         HookAction::Enable { chat } => {
             let id = resolve_chat_id(client, &chat).await?;
@@ -799,10 +745,6 @@ async fn main() -> Result<()> {
         .unwrap_or_else(default_database_url);
 
     match cli.command {
-        Commands::Retry { chat, mode } => {
-            let client = connect(&url).await?;
-            set_retry_setting(&client, &chat, mode).await?;
-        }
         Commands::Hook { action } => {
             let client = connect(&url).await?;
             run_hook_action(&client, action).await?;
@@ -961,10 +903,5 @@ mod cli_completion_tests {
         assert!(hook.find_subcommand("set").is_some());
         assert!(hook.find_subcommand("list").is_some());
         assert!(hook.find_subcommand("remove").is_some());
-    }
-
-    #[test]
-    fn automatic_retry_command_is_exposed_to_clap_shell_completions() {
-        assert!(Cli::command().find_subcommand("retry").is_some());
     }
 }

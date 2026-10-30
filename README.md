@@ -116,7 +116,6 @@ chatgpt-ctl open [CHAT|current]              # UUID/title; no arg = TAB completi
 chatgpt-ctl new-chat                         # blank chat at / (no conversation UUID in URL)
 chatgpt-ctl download-last-zip [DIRECTORY] [--extract-to DIR]  # download, optionally extract
 chatgpt-ctl history [CHAT|current] [--all] [--follow] [--json]
-chatgpt-ctl retry <CHAT> enable|disable      # auto-click the final Retry button per chat
 chatgpt-ctl history                          # interactive; TAB completes titles/UUIDs from DB
 chatgpt-ctl message <uuid>
 chatgpt-ctl hook set|list|show|enable|disable|remove ...
@@ -137,7 +136,7 @@ _chatgpt_ctl() {
   local cur prev words cword
   _init_completion || return
   case "${words[1]}" in
-    open|history|retry)
+    open|history)
       if (( cword == 2 )); then
         mapfile -t COMPREPLY < <(chatgpt-ctl __complete-chat "$cur" 2>/dev/null | cut -f1)
         (( ${#COMPREPLY[@]} )) && return
@@ -202,25 +201,6 @@ chatgpt-ctl send "Review this" -f ./src/main.rs
 chatgpt-ctl send -f ./archive.zip
 ```
 
-### Per-chat automatic Retry button
-
-Automatic retry clicking is configured independently from ZIP/build hooks and persisted in
-PostgreSQL. The watcher checks the currently open conversation on each poll and, when enabled,
-clicks the last visible button whose accessible name is exactly `Retry`. This targets the Retry
-action at the end of the conversation (including the delivery-timeout alert shown in the supplied
-ChatGPT page snapshot). A 30-second per-chat cooldown prevents repeated clicks if the UI keeps the
-button visible after a click.
-
-```bash
-chatgpt-ctl retry "My project chat" enable
-chatgpt-ctl retry "My project chat" disable
-```
-
-The command accepts a chat UUID or unique title substring. It can be used without configuring a
-ZIP/build hook. The setting is stored in `chat_retry_settings` and takes effect on the next watcher
-poll; no watcher restart is required. Automatic clicking only applies while the watcher is on that
-conversation and a visible, enabled exact-name `Retry` button is present.
-
 ### Per-chat ZIP automation hooks
 
 Hooks are managed dynamically by `chatgpt-ctl` and stored in PostgreSQL; no hook entries are
@@ -231,7 +211,6 @@ chatgpt-ctl hook set "My project chat" --folder ~/src/my-project
 chatgpt-ctl hook set "My Rust chat" --folder ~/src/my-project --child-folder rust-edge-gui --nix-flake
 chatgpt-ctl hook list
 chatgpt-ctl hook show "My project chat"
-chatgpt-ctl hook run "My project chat"      # manually use the newest ZIP already in that chat
 chatgpt-ctl hook disable "My project chat"  # keep configuration, pause automation
 chatgpt-ctl hook enable "My project chat"
 chatgpt-ctl hook remove "My project chat"
@@ -243,11 +222,7 @@ chatgpt-ctl hook remove "My project chat"
 --clipboard-arg clipboard --clipboard-arg -o` (repeat `--clipboard-arg` for each argument).
 
 While that conversation is open, the watcher records existing ZIP links as a baseline and processes
-only subsequently-arriving ZIP attachments. Run `chatgpt-ctl hook run <chat>` (also available as
-`hook trigger`) to manually download the newest ZIP attachment in that conversation and run the
-same extraction, Git commit, and build pipeline immediately. The command opens the specified chat
-in the active watcher pane if needed. Manual runs also work while a hook is disabled; disabling only
-pauses automatic processing of new attachments. Each new ZIP is saved under
+only subsequently-arriving ZIP attachments. Each new ZIP is saved under
 `<folder>/.chatgpt-ctl-downloads/`, checked for path-traversal entries, and extracted into
 `folder`. The hook stages only archive paths, commits the archive's Markdown diff as the commit
 message (or `Auto update` if no Markdown changes are present), then runs `wcc build` from

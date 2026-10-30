@@ -189,39 +189,6 @@ type ChatHook = {
   enabled: boolean;
 };
 
-async function ensureRetrySchema(sql: Sql): Promise<void> {
-  await sql.unsafe(`
-    CREATE TABLE IF NOT EXISTS chat_retry_settings (
-      chat_id uuid PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
-      enabled boolean NOT NULL DEFAULT false,
-      updated_at timestamptz NOT NULL DEFAULT now()
-    )
-  `);
-}
-
-async function isAutoRetryEnabled(sql: Sql, chatId: string): Promise<boolean> {
-  const rows = await sql`
-    SELECT enabled FROM chat_retry_settings WHERE chat_id = ${chatId}::uuid
-  `;
-  return rows.length > 0 && Boolean(rows[0]!.enabled);
-}
-
-/** Click only the last visible exact-name Retry button, which is the end-of-thread action. */
-async function clickRetryAtConversationEnd(page: Page, chatId: string): Promise<boolean> {
-  if (normalizeUuid(page.url()) !== chatId) return false;
-  const buttons = page.getByRole("button", { name: "Retry", exact: true });
-  const count = await buttons.count();
-  for (let index = count - 1; index >= 0; index--) {
-    const button = buttons.nth(index);
-    if (!(await button.isVisible().catch(() => false))) continue;
-    if (!(await button.isEnabled().catch(() => false))) continue;
-    await button.click({ timeout: 3000 });
-    log.info(`[retry] clicked end-of-conversation Retry button for chat=${chatId}`);
-    return true;
-  }
-  return false;
-}
-
 async function ensureHookSchema(sql: Sql): Promise<void> {
   await sql.unsafe(`
     CREATE TABLE IF NOT EXISTS chat_hooks (
@@ -1187,28 +1154,7 @@ async function runHookForZip(
   }
 }
 
-async function runHookWithLastZip(
-  page: Page,
-  chatId: string,
-  hook: ChatHook,
-  cfg: Config,
-  configPath: string
-): Promise<string> {
-  const targetUrl = new URL(`/c/${chatId}`, cfg.chatgpt.url).toString();
-  if (normalizeUuid(page.url()) !== chatId) {
-    await page.goto(targetUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: cfg.browser?.navigation_timeout_ms ?? 45_000,
-    });
-    await page.waitForTimeout(1200);
-  }
-  const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
-  const archive = await downloadLastZip(page, archiveDir);
-  await runHookForZip(page, chatId, hook, archive, configPath);
-  return archive;
-}
-
-function startControlServer(page: Page, cfg: Config, configPath: string, sql: Sql) {
+function startControlServer(page: Page, cfg: Config, configPath: string) {
   const server = Bun.serve({
     hostname: CONTROL_HOST,
     port: CONTROL_PORT,
@@ -1238,16 +1184,6 @@ function startControlServer(page: Page, cfg: Config, configPath: string, sql: Sq
             return Response.json({ error: `ChatGPT redirected away from the new-chat URL: ${finalUrl}`, url: finalUrl }, { status: 409 });
           }
           return Response.json({ ok: true, url: finalUrl });
-        }
-        if (url.pathname === "/hook/run") {
-          const chatId = normalizeUuid(body.chat_id || "");
-          if (!chatId) return Response.json({ error: "valid chat_id is required" }, { status: 400 });
-          const hook = await loadChatHook(sql, chatId);
-          if (!hook) return Response.json({ error: `no hook configured for ${chatId}` }, { status: 404 });
-          // Manual runs deliberately work for disabled hooks: disabled only
-          // pauses automatic processing of newly arriving attachments.
-          const archive = await runHookWithLastZip(page, chatId, hook, cfg, configPath);
-          return Response.json({ ok: true, chat_id: chatId, archive, url: page.url() });
         }
         if (url.pathname === "/download-last-zip") {
           const directory = body.directory
@@ -1296,7 +1232,6 @@ function startControlServer(page: Page, cfg: Config, configPath: string, sql: Sq
 async function watch(cfg: Config, configPath: string) {
   const sql = openDb(cfg);
   await ensureHookSchema(sql);
-  await ensureRetrySchema(sql);
   const pollMs = Math.max(500, cfg.chatgpt.poll_ms ?? 1500);
   const settleMs = cfg.chatgpt.complete_settle_ms ?? 800;
   const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false);
@@ -1306,7 +1241,6 @@ async function watch(cfg: Config, configPath: string) {
   let controlServer: ReturnType<typeof Bun.serve> | undefined;
   const handledHookDownloads = new Set<string>();
   const initializedHookChats = new Set<string>();
-  const retryClickCooldowns = new Map<string, number>();
 
   const stop = async () => {
     log.info("\n[watch] stopping...");
@@ -1322,7 +1256,7 @@ async function watch(cfg: Config, configPath: string) {
     const page = await getPage(context);
     attachNetworkDebug(page, cfg);
     await openChatGPT(page, cfg);
-    controlServer = startControlServer(page, cfg, configPath, sql);
+    controlServer = startControlServer(page, cfg, configPath);
     const sidebarChats = await syncSidebarChats(page, sql, true);
     log.info(`[watch] synchronized ${sidebarChats.length} sidebar chats`);
     log.info(
@@ -1345,26 +1279,6 @@ async function watch(cfg: Config, configPath: string) {
             prevIncomplete.clear();
           }
           await persistChat(sql, chat, settleMs, prevIncomplete);
-
-          // Per-chat retry behavior is independent of ZIP/build hooks and is read
-          // from PostgreSQL each poll so `chatgpt-ctl retry` takes effect live.
-          if (await isAutoRetryEnabled(sql, chat.id)) {
-            const now = Date.now();
-            const lastClick = retryClickCooldowns.get(chat.id) ?? 0;
-            if (now - lastClick >= 30_000) {
-              try {
-                const clicked = await clickRetryAtConversationEnd(page, chat.id);
-                if (clicked) retryClickCooldowns.set(chat.id, now);
-                else retryClickCooldowns.delete(chat.id);
-              } catch (retryError) {
-                retryClickCooldowns.set(chat.id, now);
-                log.warn(`[retry] chat=${chat.id} click failed: ${formatError(retryError)}`);
-              }
-            }
-          } else {
-            retryClickCooldowns.delete(chat.id);
-          }
-
           // Read hook configuration from PostgreSQL every poll so ctl changes
           // take effect without editing config.toml or restarting the watcher.
           const hook = await loadChatHook(sql, chat.id);
