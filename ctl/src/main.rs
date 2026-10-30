@@ -755,12 +755,22 @@ async fn follow_history(
 
 
 /// Return every conversation UUID currently open in a watcher browser pane.
-fn watcher_open_chats() -> Vec<Uuid> {
-    let Ok(response) = watcher_request("GET", "/status", None) else { return Vec::new() };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&response) else { return Vec::new() };
-    value.get("chat_ids").and_then(|v| v.as_array()).into_iter().flatten()
+fn watcher_status() -> (Vec<Uuid>, Option<Uuid>) {
+    let Ok(response) = watcher_request("GET", "/status", None) else {
+        return (Vec::new(), None);
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&response) else {
+        return (Vec::new(), None);
+    };
+    let open = value.get("chat_ids").and_then(|v| v.as_array()).into_iter().flatten()
         .filter_map(|item| item.as_str()?.parse().ok())
-        .collect()
+        .collect();
+    let focused = value.get("chat_id").and_then(|v| v.as_str()).and_then(|id| id.parse().ok());
+    (open, focused)
+}
+
+fn watcher_open_chats() -> Vec<Uuid> {
+    watcher_status().0
 }
 
 fn watcher_request(method: &str, path: &str, body: Option<&str>) -> Result<String> {
@@ -816,7 +826,7 @@ async fn main() -> Result<()> {
             }
             let client = connect(&url).await?;
             let mut chats = list_chats(&client, limit, query.as_deref()).await?;
-            let open_chats = watcher_open_chats();
+            let (open_chats, focused_chat) = watcher_status();
             // Include open panes even when their conversations fall outside --limit.
             if query.is_none() {
                 for id in &open_chats {
@@ -837,8 +847,11 @@ async fn main() -> Result<()> {
                     .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or_else(|| "-".into());
                 let pane_index = open_chats.iter().position(|id| *id == c.id);
-                if let Some(pane_index) = pane_index {
-                    println!("\x1b[1;36m● [{pane_index}] {}\t{:>4} msgs\t{}\t{}\x1b[0m", c.id, c.message_count, ts, c.title);
+                if focused_chat == Some(c.id) {
+                    // The active browser pane is the target for download-last-zip.
+                    println!("\x1b[1;30;103m▶ FOCUSED / ZIP TARGET [{pane_index.unwrap_or(0)}] {}\t{:>4} msgs\t{}\t{}\x1b[0m", c.id, c.message_count, ts, c.title);
+                } else if let Some(pane_index) = pane_index {
+                    println!("\x1b[1;36m● OPEN [{pane_index}] {}\t{:>4} msgs\t{}\t{}\x1b[0m", c.id, c.message_count, ts, c.title);
                 } else {
                     println!("  {}\t{:>4} msgs\t{}\t{}", c.id, c.message_count, ts, c.title);
                 }

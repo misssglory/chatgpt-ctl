@@ -1271,11 +1271,34 @@ async function runHookForZip(
       throw new Error(`unsafe ZIP entry rejected: ${entry}`);
     }
   }
-  const extract = await commandOutput(["unzip", "-o", "-q", archive, "-d", projectDir]);
-  if (extract.code !== 0) throw new Error(`ZIP extraction failed: ${extract.stderr}`);
+  const normalizedEntries = entries.map((entry) => path.posix.normalize(entry.replace(/\\/g, "/")));
+  const topLevel = new Set(normalizedEntries.map((entry) => entry.split("/")[0]).filter(Boolean));
+  const singleRoot = topLevel.size === 1 ? [...topLevel][0]! : null;
+  // Auto-hook extraction mirrors `download-last-zip --extract-to`: if every
+  // archive entry is inside one top-level directory, merge that directory's
+  // contents directly into the configured project folder.
+  const flattenRoot = Boolean(singleRoot && normalizedEntries.some((entry) => entry.startsWith(`${singleRoot}/`)));
+  let stagedPaths: string[];
+  if (flattenRoot && singleRoot) {
+    const staging = await mkdtemp(path.join(projectDir, ".chatgpt-ctl-hook-unzip-"));
+    try {
+      const extract = await commandOutput(["unzip", "-o", "-q", archive, "-d", staging]);
+      if (extract.code !== 0) throw new Error(`ZIP extraction failed: ${extract.stderr}`);
+      await mergeDirectoryContents(path.join(staging, singleRoot), projectDir);
+    } finally {
+      await rm(staging, { recursive: true, force: true });
+    }
+    stagedPaths = normalizedEntries
+      .map((entry) => entry === singleRoot ? "" : entry.startsWith(`${singleRoot}/`) ? entry.slice(singleRoot.length + 1) : entry)
+      .filter(Boolean);
+    log.info(`[hook] flattened single root folder '${singleRoot}' into ${projectDir}`);
+  } else {
+    const extract = await commandOutput(["unzip", "-o", "-q", archive, "-d", projectDir]);
+    if (extract.code !== 0) throw new Error(`ZIP extraction failed: ${extract.stderr}`);
+    stagedPaths = normalizedEntries;
+  }
 
   // Stage only paths supplied by this archive, avoiding unrelated working-tree changes.
-  const stagedPaths = entries.map((entry) => path.posix.normalize(entry.replace(/\\/g, "/")));
   const add = await commandOutput(["git", "-C", projectDir, "add", "-A", "--", ...stagedPaths]);
   if (add.code !== 0) throw new Error(`git add failed: ${add.stderr}`);
   const staged = await commandOutput(["git", "-C", projectDir, "diff", "--cached", "--quiet", "--", ...stagedPaths]);
