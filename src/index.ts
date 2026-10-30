@@ -12,7 +12,7 @@
 import { TOML } from "bun";
 import { chromium, type BrowserContext, type Download, type Page } from "playwright-core";
 import { Logger } from "tslog";
-import { access, constants, mkdir, mkdtemp, readdir, rename, rm, readFile } from "node:fs/promises";
+import { access, constants, lstat, mkdir, mkdtemp, readdir, rename, rm, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import postgres from "postgres";
@@ -90,6 +90,35 @@ interface SidebarChat {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Merge a staged directory into an existing destination. Directories merge
+ * recursively; archive files replace conflicting destination files/directories.
+ */
+async function mergeDirectoryContents(sourceDir: string, destinationDir: string): Promise<void> {
+  await mkdir(destinationDir, { recursive: true });
+  const children = await readdir(sourceDir, { withFileTypes: true });
+  for (const child of children) {
+    const source = path.join(sourceDir, child.name);
+    const destination = path.join(destinationDir, child.name);
+    let destinationIsDirectory = false;
+    try {
+      destinationIsDirectory = (await lstat(destination)).isDirectory();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+
+    if (child.isDirectory() && destinationIsDirectory) {
+      await mergeDirectoryContents(source, destination);
+      await rm(source, { recursive: true, force: true });
+      continue;
+    }
+
+    // Remove any conflicting file, symlink, or directory before moving the
+    // staged entry. This avoids rename(2)'s ENOTEMPTY behavior for dir/dir.
+    await rm(destination, { recursive: true, force: true });
+    await rename(source, destination);
+  }
+}
 
 function resolveFromConfig(configPath: string, rel: string): string {
   if (path.isAbsolute(rel)) return rel;
@@ -1552,11 +1581,8 @@ function startControlServer(
                 const extracted = await commandOutput(["unzip", "-o", "-q", saved, "-d", staging]);
                 if (extracted.code !== 0) throw new Error(`ZIP extraction failed: ${extracted.stderr}`);
                 const rootDir = path.join(staging, singleRoot);
-                const children = await readdir(rootDir, { withFileTypes: true });
-                for (const child of children) {
-                  await rename(path.join(rootDir, child.name), path.join(extractTo, child.name));
-                }
-                log.info(`[download] flattened single root folder '${singleRoot}' from ${saved} into ${extractTo}`);
+                await mergeDirectoryContents(rootDir, extractTo);
+                log.info(`[download] flattened and merged single root folder '${singleRoot}' from ${saved} into ${extractTo}`);
               } finally {
                 await rm(staging, { recursive: true, force: true });
               }

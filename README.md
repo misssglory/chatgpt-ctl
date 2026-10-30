@@ -195,8 +195,10 @@ The interactive `open` prompt uses cached PostgreSQL chat titles and UUIDs for T
 from the currently open conversation. With no directory it uses `[downloads].directory` from
 `config.toml` (default `./var/downloads`). Add `--extract-to DIR` (alias `--unzip-to`) to
 extract the downloaded archive into `DIR`; the original ZIP is kept. If the archive contains
-exactly one top-level directory, its contents are moved directly into `DIR` (so no redundant
-wrapper directory is created). Relative paths are resolved from the directory where you run
+exactly one top-level directory, its contents are merged directly into `DIR` (so no redundant
+wrapper directory is created). Existing directories are merged recursively; files supplied by the
+archive replace files at the same relative path, while unrelated existing files are preserved.
+Relative paths are resolved from the directory where you run
 `chatgpt-ctl`; `--extract-to` is marked as a directory argument for shell path completion. Example:
 
 ```bash
