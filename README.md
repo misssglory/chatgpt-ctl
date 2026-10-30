@@ -111,11 +111,13 @@ nix build
 
 ```text
 chatgpt-ctl chats [--limit N] [-q substring] [--refresh]
-chatgpt-ctl send "message text" [-f PATH]...  # current chat; repeatable file uploads
-chatgpt-ctl open [CHAT|current]              # UUID/title; no arg = TAB completion
-chatgpt-ctl new-chat                         # blank chat at / (no conversation UUID in URL)
+chatgpt-ctl send "message text" [--chat CHAT | --new-chat] [-f PATH]...  # focused, targeted, or new chat
+chatgpt-ctl open [CHAT|current]              # UUID/title; new pane unless already open
+chatgpt-ctl close <CHAT|INDEX>               # close by UUID/title or 0-based open-pane index
+chatgpt-ctl new-chat                         # open a blank chat in a separate pane
 chatgpt-ctl download-last-zip [DIRECTORY] [--extract-to DIR]  # download, optionally extract
 chatgpt-ctl history [CHAT|current] [--all] [--follow] [--json]
+chatgpt-ctl retry <CHAT> enable|disable      # auto-click the final Retry button per chat
 chatgpt-ctl history                          # interactive; TAB completes titles/UUIDs from DB
 chatgpt-ctl message <uuid>
 chatgpt-ctl hook set|list|show|enable|disable|remove ...
@@ -136,7 +138,7 @@ _chatgpt_ctl() {
   local cur prev words cword
   _init_completion || return
   case "${words[1]}" in
-    open|history)
+    open|history|retry|close)
       if (( cword == 2 )); then
         mapfile -t COMPREPLY < <(chatgpt-ctl __complete-chat "$cur" 2>/dev/null | cut -f1)
         (( ${#COMPREPLY[@]} )) && return
@@ -171,35 +173,72 @@ chatgpt-ctl send "Review these files" -f ./notes.md -f ./src/main.rs
 The watcher performs a full sidebar synchronization at startup and refreshes visible titles on every
 watch tick, so renamed chats are updated in PostgreSQL. `chats --refresh` forces another full scan.
 
-While `bun run watch` is running, it also exposes a localhost control endpoint
-(default `127.0.0.1:17381`). `chatgpt-ctl open <CHAT>` sends the selected UUID to that
-server and navigates the watcher's existing ChatGPT tab/pane instead of launching a
-second Chromium window. `chatgpt-ctl send` submits into that same page without launching another
-browser context. `chatgpt-ctl new-chat` navigates that same pane to the ChatGPT
-root URL (`/`), opening a blank composer without a conversation UUID in the address.
-Set `CHATGPT_CTL_ADDR` for the CLI or `CHATGPT_CTL_HOST` /
-`CHATGPT_CTL_PORT` for the watcher to override the address. The interactive `open`
-prompt uses the cached PostgreSQL chat titles and UUIDs for TAB completion. `chatgpt-ctl chats`
-marks the browser's currently open conversation with a cyan `●` while the watcher is running.
+While `bun run watch` is running, it exposes a localhost control endpoint
+(default `127.0.0.1:17381`). Each conversation is kept in its own Chromium tab/page:
+`chatgpt-ctl open <CHAT>` focuses the existing page when that chat is already open,
+or creates a new page and opens it otherwise. The watcher polls and persists messages,
+Retry settings, and ZIP/build hooks independently in every open conversation page.
+`chatgpt-ctl chats` marks every opened conversation with a cyan `●` and its 0-based
+pane index. `chatgpt-ctl close <CHAT>` closes a pane by UUID or unique title substring;
+`chatgpt-ctl close 0` closes the first currently opened conversation pane (indices follow
+the order shown by `chats`). Closing the active pane focuses another open conversation,
+or creates a blank ChatGPT page if none remain. `chatgpt-ctl send` submits into the currently focused browser tab by default. Use `--chat CHAT` to
+send to a specific chat by UUID or title substring; if it is not already open, the watcher creates
+a new pane for it. Sending focuses the destination pane. Browser tab focus is tracked from page
+focus/visibility events, in addition to `open` and `send` commands.
+`chatgpt-ctl new-chat` opens a separate browser pane at ChatGPT's root URL (`/`), leaving
+existing conversation panes untouched. Set `CHATGPT_CTL_ADDR` for the CLI
+or `CHATGPT_CTL_HOST` / `CHATGPT_CTL_PORT` for the watcher to override the address.
+The interactive `open` prompt uses cached PostgreSQL chat titles and UUIDs for TAB completion.
 
 `chatgpt-ctl download-last-zip [DIRECTORY]` asks the watcher to download the newest ZIP attachment
 from the currently open conversation. With no directory it uses `[downloads].directory` from
 `config.toml` (default `./var/downloads`). Add `--extract-to DIR` (alias `--unzip-to`) to
-extract the downloaded archive into `DIR`; the original ZIP is kept. Relative paths are resolved
-from the directory where you run `chatgpt-ctl`. Example:
+extract the downloaded archive into `DIR`; the original ZIP is kept. If the archive contains
+exactly one top-level directory, its contents are moved directly into `DIR` (so no redundant
+wrapper directory is created). Relative paths are resolved from the directory where you run
+`chatgpt-ctl`; `--extract-to` is marked as a directory argument for shell path completion. Example:
 
 ```bash
 chatgpt-ctl download-last-zip ./var/downloads --extract-to ./work/latest-project
 ```
 
-`chatgpt-ctl send "message text" [-f PATH]...` sends through the watcher's existing browser page,
-so it targets the chat currently open in that pane rather than launching a separate browser
-context. It can also send file attachments without message text:
+`chatgpt-ctl send "message text" [--chat CHAT | --new-chat] [-f PATH]...` sends through the watcher's browser
+context. Without `--chat`, it sends to the currently focused pane. With `--chat`, it resolves a
+UUID or title substring and sends to that conversation, opening a new pane if necessary. Use
+`--new-chat` (alias `--new`) to create a separate blank pane, send the first message, wait for
+ChatGPT to assign the conversation UUID, and print that acquired UUID. The watcher immediately persists the acquired UUID and first visible messages to PostgreSQL,
+so the new conversation is available to `chats`, `open`, and `history` without waiting for the
+next poll. The `--chat` and `--new-chat` options are mutually exclusive. It can also send file
+attachments without message text:
 
 ```bash
 chatgpt-ctl send "Review this" -f ./src/main.rs
+chatgpt-ctl send --chat "NixOS Wayland" "Check this fix"
+chatgpt-ctl send --chat 6ae4c5ad-6410-83ed-abf0-7944c8969abf -f ./archive.zip
 chatgpt-ctl send -f ./archive.zip
+chatgpt-ctl send --new-chat "Start a new project and inspect this archive" -f ./archive.zip
+chatgpt-ctl send --new "First message in a new chat"
 ```
+
+### Per-chat automatic Retry button
+
+Automatic retry clicking is configured independently from ZIP/build hooks and persisted in
+PostgreSQL. The watcher checks the currently open conversation on each poll and, when enabled,
+clicks the last visible button whose accessible name is exactly `Retry`. This targets the Retry
+action at the end of the conversation (including the delivery-timeout alert shown in the supplied
+ChatGPT page snapshot). A 30-second per-chat cooldown prevents repeated clicks if the UI keeps the
+button visible after a click.
+
+```bash
+chatgpt-ctl retry "My project chat" enable
+chatgpt-ctl retry "My project chat" disable
+```
+
+The command accepts a chat UUID or unique title substring. It can be used without configuring a
+ZIP/build hook. The setting is stored in `chat_retry_settings` and takes effect on the next watcher
+poll; no watcher restart is required. Automatic clicking only applies while the watcher is on that
+conversation and a visible, enabled exact-name `Retry` button is present.
 
 ### Per-chat ZIP automation hooks
 
@@ -209,29 +248,51 @@ needed in `config.toml`, and changes are picked up by the running watcher on its
 ```bash
 chatgpt-ctl hook set "My project chat" --folder ~/src/my-project
 chatgpt-ctl hook set "My Rust chat" --folder ~/src/my-project --child-folder rust-edge-gui --nix-flake
+chatgpt-ctl hook set "Docs chat" --folder ~/src/docs --child-folder website --build-command "bun run build"
+chatgpt-ctl hook set "No build chat" --folder ~/src/docs --child-folder website --build-command none
 chatgpt-ctl hook list
 chatgpt-ctl hook show "My project chat"
+chatgpt-ctl hook run "My project chat"      # manually use the newest ZIP already in that chat
 chatgpt-ctl hook disable "My project chat"  # keep configuration, pause automation
 chatgpt-ctl hook enable "My project chat"
 chatgpt-ctl hook remove "My project chat"
 ```
 
-`--folder` is resolved and stored as an absolute path. `--child-folder` defaults to `.`;
-`--nix-flake` runs `nix develop <build-dir> -c wcc build`. The clipboard command defaults to
+`--folder` is resolved and stored as an absolute path. `--child-folder` defaults to `.`.
+`--build-command` is a shell command executed with the child folder as its working directory;
+it defaults to `wcc build`. Set it to `none` to skip the build step entirely. With
+`--nix-flake`, the command runs inside `nix develop <build-dir> -c sh -lc <build-command>`.
+The clipboard command defaults to
 `wl-paste -n`; override it with `--clipboard-command xclip --clipboard-arg -selection
 --clipboard-arg clipboard --clipboard-arg -o` (repeat `--clipboard-arg` for each argument).
 
-While that conversation is open, the watcher records existing ZIP links as a baseline and processes
-only subsequently-arriving ZIP attachments. Each new ZIP is saved under
+When a conversation pane is opened or navigated to, the watcher scrolls to the bottom, waits for
+the composer and conversation UI to hydrate, and requires several consecutive stable message-list
+snapshots with no active generation. It then persists the existing history and records the latest
+assistant turn, latest user turn/message, and all existing ZIP controls as a baseline; this
+initialization never runs a hook. Automatic hooks additionally require a newly completed latest
+assistant message and a genuinely new user turn beyond that baseline. Before clicking, the watcher
+re-resolves the ZIP target by its message identity; if the target is no longer uniquely present or
+Playwright does not report a download, it refuses to click a fallback button and skips the hook.
+This is deliberately fail-closed to avoid accidental clicks while switching chats or editing old turns.
+After initialization, automatic processing is restricted to a ZIP control whose stable message UUID
+belongs to the latest assistant message, whose turn number is newer than the baseline, and whose
+message has just completed. Historical ZIP links revealed by scrolling, revisiting, or editing older
+turns are therefore ignored. ZIP controls without stable message/turn metadata fail closed rather
+than triggering automation. Run `chatgpt-ctl hook run <chat>` (also available as `hook trigger`) to
+manually download the newest ZIP attachment in that conversation and run the same extraction, Git
+commit, and build pipeline immediately. The command opens the specified chat in the active watcher
+pane if needed. Manual runs also work while a hook is disabled; disabling only pauses automatic
+processing of new attachments. Each new ZIP is saved under
 `<folder>/.chatgpt-ctl-downloads/`, checked for path-traversal entries, and extracted into
 `folder`. The hook stages only archive paths, commits the archive's Markdown diff as the commit
-message (or `Auto update` if no Markdown changes are present), then runs `wcc build` from
-`child_folder` (or `.`). Set `nix_flake = true` to run the build inside that directory's Nix
-flake dev shell. On build failure it reads the configured clipboard command (default
+message (or `Auto update` if no Markdown changes are present), then runs the configured `build_command` from `child_folder` (or `.`). The default is
+`wcc build`; set `--build-command none` to skip building. `--nix-flake` runs the configured
+command inside that directory's Nix flake dev shell. On build failure it reads the configured clipboard command (default
 `wl-paste -n`) and sends that diagnostic to the hooked conversation.
 
-The hook requires `unzip`, `git`, `wcc`, and, when `--nix-flake` is used, `nix` on the watcher's
-`PATH`. The target folder must already be a Git repository with commit identity configured.
+The hook requires `unzip` and `git`; the configured build executable and, when `--nix-flake` is
+used, `nix` must be on the watcher's `PATH`. The target folder must already be a Git repository with commit identity configured.
 
 ```bash
 # static shell completion (also installed by the Nix package)
@@ -298,3 +359,13 @@ The automatic ZIP hook now shares the same `findZipTargets` and
 `downloadZipTarget` helpers as the manual `download-last-zip` command. ZIP
 attachments are de-duplicated using their containing message ID and filename,
 and existing attachments are marked as the initial baseline when a hook starts.
+
+
+## Conversation loading and hook safety (2026-10-31)
+
+Every pane now has an initialization barrier: navigate, scroll to the bottom, wait for the composer
+and message list to hydrate, then wait for three consecutive stable snapshots while generation is
+idle. The watcher persists this snapshot and establishes the per-chat hook baseline before processing
+any automation. Hook candidates must be the newest completed assistant message and have a stable
+turn number greater than the initialization baseline. This prevents historical ZIP links that appear
+when scrolling through or editing older messages from being clicked by automatic hooks.

@@ -8,4 +8,5 @@ ctl/target/
 .env
 .DS_Store
 *.bkp
+.chatgpt-ctl-downloads
 

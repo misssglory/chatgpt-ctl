@@ -12,7 +12,7 @@
 import { TOML } from "bun";
 import { chromium, type BrowserContext, type Download, type Page } from "playwright-core";
 import { Logger } from "tslog";
-import { access, constants, mkdir, readFile } from "node:fs/promises";
+import { access, constants, mkdir, mkdtemp, readdir, rename, rm, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import postgres from "postgres";
@@ -67,6 +67,8 @@ interface ScrapedMessage {
   role: "user" | "assistant" | "system" | "tool";
   content: string;
   sequence: number;
+  /** Stable ChatGPT turn number when exposed by the DOM; absent means order is unknown. */
+  turnOrder?: number;
   /** true when the UI no longer shows a streaming / "stop generating" state */
   completed: boolean;
 }
@@ -76,6 +78,7 @@ interface ScrapedChat {
   title: string;
   url: string;
   messages: ScrapedMessage[];
+  isStreaming: boolean;
 }
 
 interface SidebarChat {
@@ -186,8 +189,42 @@ type ChatHook = {
   child_folder: string;
   nix_flake: boolean;
   clipboard_command: string[];
+  build_command: string | null;
   enabled: boolean;
 };
+
+async function ensureRetrySchema(sql: Sql): Promise<void> {
+  await sql.unsafe(`
+    CREATE TABLE IF NOT EXISTS chat_retry_settings (
+      chat_id uuid PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+      enabled boolean NOT NULL DEFAULT false,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+}
+
+async function isAutoRetryEnabled(sql: Sql, chatId: string): Promise<boolean> {
+  const rows = await sql`
+    SELECT enabled FROM chat_retry_settings WHERE chat_id = ${chatId}::uuid
+  `;
+  return rows.length > 0 && Boolean(rows[0]!.enabled);
+}
+
+/** Click only the last visible exact-name Retry button, which is the end-of-thread action. */
+async function clickRetryAtConversationEnd(page: Page, chatId: string): Promise<boolean> {
+  if (normalizeUuid(page.url()) !== chatId) return false;
+  const buttons = page.getByRole("button", { name: "Retry", exact: true });
+  const count = await buttons.count();
+  for (let index = count - 1; index >= 0; index--) {
+    const button = buttons.nth(index);
+    if (!(await button.isVisible().catch(() => false))) continue;
+    if (!(await button.isEnabled().catch(() => false))) continue;
+    await button.click({ timeout: 3000 });
+    log.info(`[retry] clicked end-of-conversation Retry button for chat=${chatId}`);
+    return true;
+  }
+  return false;
+}
 
 async function ensureHookSchema(sql: Sql): Promise<void> {
   await sql.unsafe(`
@@ -197,15 +234,18 @@ async function ensureHookSchema(sql: Sql): Promise<void> {
       child_folder text NOT NULL DEFAULT '.',
       nix_flake boolean NOT NULL DEFAULT false,
       clipboard_command jsonb NOT NULL DEFAULT '["wl-paste", "-n"]'::jsonb,
+      build_command text DEFAULT 'wcc build',
       enabled boolean NOT NULL DEFAULT true,
       updated_at timestamptz NOT NULL DEFAULT now()
     )
   `);
+  // Keep existing installations compatible; this is a non-destructive additive migration.
+  await sql.unsafe("ALTER TABLE chat_hooks ADD COLUMN IF NOT EXISTS build_command text DEFAULT 'wcc build'");
 }
 
 async function loadChatHook(sql: Sql, chatId: string): Promise<ChatHook | null> {
   const rows = await sql`
-    SELECT folder, child_folder, nix_flake, clipboard_command, enabled
+    SELECT folder, child_folder, nix_flake, clipboard_command, enabled, build_command
     FROM chat_hooks WHERE chat_id = ${chatId}::uuid
   `;
   if (!rows.length) return null;
@@ -218,6 +258,7 @@ async function loadChatHook(sql: Sql, chatId: string): Promise<ChatHook | null> 
     child_folder: row.child_folder || ".",
     nix_flake: Boolean(row.nix_flake),
     clipboard_command: Array.isArray(command) && command.length ? command : ["wl-paste", "-n"],
+    build_command: row.build_command == null ? null : String(row.build_command),
     enabled: Boolean(row.enabled),
   };
 }
@@ -575,7 +616,12 @@ async function scrapeCurrentChat(page: Page): Promise<ScrapedChat | null> {
       if (!id || seenIds.has(id)) continue;
       seenIds.add(id);
 
-      const unitKey = node.getAttribute("data-chatgpt-search-unit-key") || "";
+      const unitKey =
+        node.getAttribute("data-content-search-unit-key") ||
+        node.getAttribute("data-chatgpt-search-unit-key") ||
+        node.closest("[data-content-search-unit-key], [data-chatgpt-search-unit-key]")?.getAttribute("data-content-search-unit-key") ||
+        node.closest("[data-chatgpt-search-unit-key]")?.getAttribute("data-chatgpt-search-unit-key") ||
+        "";
       let role: "user" | "assistant" | "system" | "tool" = "assistant";
       if (
         /:user$/i.test(unitKey) ||
@@ -610,11 +656,13 @@ async function scrapeCurrentChat(page: Page): Promise<ScrapedChat | null> {
       content = content.replace(/^ChatGPT said:\s*/i, "").trim();
       if (!content) continue;
 
+      const turnMatch = unitKey.match(/(?:fallback-)?turn[-_](\d+)/i);
       messages.push({
         id,
         role,
         content,
         sequence: seq++,
+        ...(turnMatch ? { turnOrder: Number(turnMatch[1]) } : {}),
         completed: !isStreaming,
       });
     }
@@ -633,8 +681,62 @@ async function scrapeCurrentChat(page: Page): Promise<ScrapedChat | null> {
       title: title || chatId,
       url: location.href,
       messages,
+      isStreaming,
     };
   });
+}
+
+/**
+ * Bring a newly opened conversation to its end and wait for React hydration,
+ * message history and any initial generation to settle. Hooks must not inspect
+ * a pane until this has completed.
+ */
+async function waitForConversationReady(
+  page: Page,
+  chatId: string,
+  timeoutMs = 45_000
+): Promise<ScrapedChat> {
+  const deadline = Date.now() + timeoutMs;
+  await page.waitForLoadState("domcontentloaded", { timeout: Math.min(timeoutMs, 15_000) }).catch(() => undefined);
+  await page.locator("main").first().waitFor({ state: "visible", timeout: Math.min(timeoutMs, 20_000) });
+  await page.locator('#prompt-textarea, [data-composer-markdown][contenteditable="true"], [contenteditable="true"][role="textbox"], textarea').first()
+    .waitFor({ state: "visible", timeout: Math.min(timeoutMs, 20_000) });
+
+  let previousSignature = "";
+  let stableSamples = 0;
+  while (Date.now() < deadline) {
+    // ChatGPT's scrollable thread container differs between UI revisions.
+    // Move every scrollable descendant of main to its end, plus the document.
+    await page.evaluate(() => {
+      const roots = Array.from(document.querySelectorAll<HTMLElement>("main, main *"));
+      for (const element of roots) {
+        if (element.scrollHeight > element.clientHeight + 80) {
+          element.scrollTop = element.scrollHeight;
+        }
+      }
+      const scrolling = document.scrollingElement;
+      if (scrolling) scrolling.scrollTop = scrolling.scrollHeight;
+      window.scrollTo(0, document.body.scrollHeight);
+    }).catch(() => undefined);
+    await page.waitForTimeout(500);
+
+    const snapshot = await scrapeCurrentChat(page).catch(() => null);
+    if (!snapshot || snapshot.id !== chatId || snapshot.messages.length === 0 || snapshot.isStreaming) {
+      previousSignature = "";
+      stableSamples = 0;
+      continue;
+    }
+    const signature = JSON.stringify(snapshot.messages.map((message) => [
+      message.id, message.role, message.content.length, message.completed, message.turnOrder ?? null,
+    ]));
+    if (signature === previousSignature) stableSamples++;
+    else stableSamples = 0;
+    previousSignature = signature;
+    // Three equal snapshots over ~1.5s avoids treating an early partial render
+    // as the baseline while older turns or attachment controls are still mounting.
+    if (stableSamples >= 3) return snapshot;
+  }
+  throw new Error(`conversation ${chatId} did not finish loading within ${timeoutMs}ms`);
 }
 
 function configurePage(page: Page, cfg: Config) {
@@ -871,8 +973,9 @@ async function dump(cfg: Config, configPath: string) {
   }
 }
 
-async function persistChat(sql: Sql, chat: ScrapedChat, settleMs: number, prevIncomplete: Map<string, number>) {
+async function persistChat(sql: Sql, chat: ScrapedChat, settleMs: number, prevIncomplete: Map<string, number>): Promise<Set<string>> {
   await upsertChat(sql, chat);
+  const newlyCompletedAssistantMessages = new Set<string>();
   for (const msg of chat.messages) {
     // Debounce completion: if just flipped to completed, wait settleMs
     if (msg.completed && prevIncomplete.has(msg.id)) {
@@ -889,6 +992,9 @@ async function persistChat(sql: Sql, chat: ScrapedChat, settleMs: number, prevIn
     }
 
     const status = await upsertMessage(sql, chat.id, msg);
+    if (msg.role === "assistant" && msg.completed && (status === "inserted" || status === "completed")) {
+      newlyCompletedAssistantMessages.add(msg.id);
+    }
     if (status === "inserted" || status === "completed") {
       log.info(
         `[persist] ${status} chat=${chat.id.slice(0, 8)} ${msg.role} ` +
@@ -896,6 +1002,7 @@ async function persistChat(sql: Sql, chat: ScrapedChat, settleMs: number, prevIn
       );
     }
   }
+  return newlyCompletedAssistantMessages;
 }
 
 async function once(cfg: Config, configPath: string) {
@@ -928,7 +1035,7 @@ function safeFilename(raw: string): string {
   return leaf && leaf.toLowerCase().endsWith(".zip") ? leaf : `${leaf || "chatgpt-download"}.zip`;
 }
 
-type ZipTarget = { index: number; label: string; selector: string; kind: "link" | "card"; messageOrder: number | null; identity: string };
+type ZipTarget = { index: number; label: string; selector: string; kind: "link" | "card"; messageOrder: number | null; messageId: string | null; identity: string };
 
 /**
  * ChatGPT renders assistant-generated files as DIL pressables (`role=link`),
@@ -962,14 +1069,22 @@ async function findZipTargets(page: Page): Promise<ZipTarget[]> {
       // for either of the conversation search-unit attributes.
       let ancestor: HTMLElement | null = el;
       let messageOrder: number | null = null;
-      let messageId = "";
+      // Prefer the same message UUID used by the history scraper. This makes
+      // attachment identity independent of DOM order and repeated scans.
+      const messageUnit = el.closest("[data-chatgpt-search-message-ids]");
+      const rawMessageIds = messageUnit?.getAttribute("data-chatgpt-search-message-ids") || "";
+      let messageId = rawMessageIds.split(/\s+/).map((value) =>
+        value.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)?.[0] || ""
+      ).find(Boolean) || "";
       while (ancestor) {
+        // Older ChatGPT DOM variants may not expose the search-message id.
+        // Fall back to stable message metadata, never to a volatile element index.
         if (!messageId) {
-          messageId =
+          const fallbackId =
             ancestor.getAttribute("data-dil-message-id") ||
             ancestor.getAttribute("data-dil-source-message-id") ||
-            ancestor.getAttribute("data-chatgpt-selection-message-id") ||
-            "";
+            ancestor.getAttribute("data-chatgpt-selection-message-id") || "";
+          messageId = fallbackId.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)?.[0] || "";
         }
         if (messageOrder === null) {
           const keys = [
@@ -987,48 +1102,56 @@ async function findZipTargets(page: Page): Promise<ZipTarget[]> {
         ancestor = ancestor.parentElement;
       }
       const cleanLabel = label.replace(/^Open\s+Download\s+/i, "").trim();
+      const stableMessageId = messageId.toLowerCase();
       result.push({
         index,
         label: cleanLabel,
         selector,
         kind: isLink ? "link" : "card",
         messageOrder,
-        identity: `${messageId || `turn-${messageOrder ?? "unknown"}-index-${index}`}|${cleanLabel}`,
+        messageId: stableMessageId || null,
+        identity: `${stableMessageId || `turn-${messageOrder ?? "unknown"}`}|${cleanLabel}`,
       });
     });
     return result;
   });
 }
 
-async function waitForDownload(click: () => Promise<unknown>, page: Page): Promise<Download> {
-  const downloadPromise = page.waitForEvent("download", { timeout: 12_000 });
-  try {
-    await click();
-    return await downloadPromise;
-  } catch (error) {
-    // Avoid an unhandled timeout rejection if the click itself failed first.
-    void downloadPromise.catch(() => undefined);
-    throw error;
-  }
+async function waitForDownload(click: () => Promise<unknown>, page: Page): Promise<Download | null> {
+  // Attach the listener before clicking. A timeout is a recoverable UI race,
+  // not a fatal watcher error; importantly, it must never cause a second,
+  // unscoped click on an arbitrary button elsewhere in the page.
+  const downloadPromise = page.waitForEvent("download", { timeout: 12_000 }).then(
+    (download) => download,
+    () => null,
+  );
+  await click();
+  return await downloadPromise;
 }
 
-async function downloadZipTarget(page: Page, targetInfo: ZipTarget, directory: string): Promise<string> {
+async function downloadZipTarget(page: Page, targetInfo: ZipTarget, directory: string): Promise<string | null> {
   await mkdir(directory, { recursive: true });
-  const targetLocator = page.locator(targetInfo.selector).nth(targetInfo.index);
-  let download: Download;
+  // Re-resolve the attachment immediately before interaction. A DOM index
+  // captured during an earlier poll can point at an unrelated button after
+  // streaming/layout changes, so only click a currently matching identity.
+  const currentTargets = await findZipTargets(page);
+  const currentMatches = currentTargets.filter((candidate) => candidate.identity === targetInfo.identity);
+  if (currentMatches.length !== 1) {
+    log.warn(`[download] target '${targetInfo.label}' is no longer uniquely present; refusing to click`);
+    return null;
+  }
+  const currentTarget = currentMatches[0]!;
+  const targetLocator = page.locator(currentTarget.selector).nth(currentTarget.index);
+  let download: Download | null;
   try {
-    download = await waitForDownload(() => targetLocator.click(), page);
-  } catch (firstError) {
-    // Resource-card buttons open a preview in some ChatGPT builds. In that
-    // preview the actual download action is a separate button.
-    const downloadButton = page.getByRole("button", { name: /^download(?:\s|$)/i }).last();
-    if (!(await downloadButton.isVisible().catch(() => false))) {
-      throw new Error(
-        `Could not trigger download for '${targetInfo.label}'. ` +
-        `ChatGPT may have changed its attachment UI. Initial error: ${String(firstError)}`,
-      );
-    }
-    download = await waitForDownload(() => downloadButton.click(), page);
+    download = await waitForDownload(() => targetLocator.click({ timeout: 5_000 }), page);
+  } catch (error) {
+    log.warn(`[download] click failed for '${targetInfo.label}': ${formatError(error)}`);
+    return null;
+  }
+  if (!download) {
+    log.warn(`[download] no Playwright download event for '${targetInfo.label}'; skipping hook instead of clicking another page button`);
+    return null;
   }
 
   const suggested = download.suggestedFilename() || targetInfo.label || "chatgpt-download.zip";
@@ -1069,7 +1192,9 @@ async function downloadLastZip(page: Page, directory: string): Promise<string> {
   });
 
   log.info(`[download] selected ${newest.label} (message turn ${newest.messageOrder ?? "unknown"})`);
-  return downloadZipTarget(page, newest, directory);
+  const downloaded = await downloadZipTarget(page, newest, directory);
+  if (!downloaded) throw new Error(`no download event for ${newest.label}; ZIP was not captured`);
+  return downloaded;
 }
 
 async function sendInPage(page: Page, text: string, chatId?: string, files: string[] = []) {
@@ -1141,49 +1266,263 @@ async function runHookForZip(
   }
 
   const buildDir = path.resolve(projectDir, hook.child_folder || ".");
-  const buildCommand = hook.nix_flake
-    ? ["nix", "develop", buildDir, "-c", "wcc", "build"]
-    : ["wcc", "build"];
-  const build = await commandOutput(buildCommand, buildDir);
-  log.info(`[hook] build exit=${build.code}${build.stdout ? ` stdout=${build.stdout.slice(-1000)}` : ""}${build.stderr ? ` stderr=${build.stderr.slice(-1000)}` : ""}`);
-  if (build.code !== 0) {
-    const clipboardCommand = hook.clipboard_command?.length ? hook.clipboard_command : ["wl-paste", "-n"];
-    const clipboard = await commandOutput(clipboardCommand);
-    const diagnostic = clipboard.stdout || clipboard.stderr || build.stderr || build.stdout || `wcc build failed with exit code ${build.code}; clipboard was empty`;
-    await sendInPage(page, `Build failed (exit code ${build.code}). Latest build output from clipboard:\n\n${diagnostic}`, chatId);
+  if (hook.build_command !== null && hook.build_command.trim() !== "") {
+    const buildCommand = hook.nix_flake
+      ? ["nix", "develop", buildDir, "-c", "sh", "-lc", hook.build_command]
+      : ["sh", "-lc", hook.build_command];
+    const build = await commandOutput(buildCommand, buildDir);
+    log.info(`[hook] build exit=${build.code}${build.stdout ? ` stdout=${build.stdout.slice(-1000)}` : ""}${build.stderr ? ` stderr=${build.stderr.slice(-1000)}` : ""}`);
+    if (build.code !== 0) {
+      const clipboardCommand = hook.clipboard_command?.length ? hook.clipboard_command : ["wl-paste", "-n"];
+      const clipboard = await commandOutput(clipboardCommand);
+      const diagnostic = clipboard.stdout || clipboard.stderr || build.stderr || build.stdout || `build command failed with exit code ${build.code}; clipboard was empty`;
+      await sendInPage(page, `Build failed (exit code ${build.code}). Latest build output from clipboard:\n\n${diagnostic}`, chatId);
+    }
+  } else {
+    log.info(`[hook] build command disabled for ${chatId}; skipping build`);
   }
 }
 
-function startControlServer(page: Page, cfg: Config, configPath: string) {
+async function runHookWithLastZip(
+  page: Page,
+  chatId: string,
+  hook: ChatHook,
+  cfg: Config,
+  configPath: string
+): Promise<string> {
+  const targetUrl = new URL(`/c/${chatId}`, cfg.chatgpt.url).toString();
+  if (normalizeUuid(page.url()) !== chatId) {
+    await page.goto(targetUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: cfg.browser?.navigation_timeout_ms ?? 45_000,
+    });
+  }
+  await waitForConversationReady(page, chatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
+  const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
+  const archive = await downloadLastZip(page, archiveDir);
+  await runHookForZip(page, chatId, hook, archive, configPath);
+  return archive;
+}
+
+function openConversationPages(context: BrowserContext): Array<{ page: Page; chatId: string }> {
+  const seen = new Set<string>();
+  const result: Array<{ page: Page; chatId: string }> = [];
+  for (const page of context.pages()) {
+    if (page.isClosed()) continue;
+    const chatId = normalizeUuid(page.url());
+    if (!chatId || seen.has(chatId)) continue;
+    seen.add(chatId);
+    result.push({ page, chatId });
+  }
+  return result;
+}
+
+async function installFocusTracking(
+  context: BrowserContext,
+  setActivePage: (page: Page) => void,
+) {
+  await context.exposeBinding("__chatgptCtlPageFocused", (source) => {
+    if (!source.page.isClosed()) setActivePage(source.page);
+  });
+  const installListeners = () => {
+    const notify = () => {
+      if (document.visibilityState !== "visible") return;
+      const callback = (window as any).__chatgptCtlPageFocused;
+      if (typeof callback === "function") void callback();
+    };
+    window.addEventListener("focus", notify);
+    document.addEventListener("visibilitychange", notify);
+  };
+  await context.addInitScript(installListeners);
+  // The initial page may already have loaded before the watcher installs the
+  // binding, so attach the same listeners to all existing pages as well.
+  for (const page of context.pages()) {
+    await page.evaluate(installListeners).catch(() => undefined);
+    const visibility = await page.evaluate(() => document.visibilityState).catch(() => "hidden");
+    if (visibility === "visible") setActivePage(page);
+  }
+}
+
+function startControlServer(
+  context: BrowserContext,
+  getActivePage: () => Page,
+  setActivePage: (page: Page) => void,
+  cfg: Config,
+  configPath: string,
+  sql: Sql
+) {
   const server = Bun.serve({
     hostname: CONTROL_HOST,
     port: CONTROL_PORT,
     async fetch(request) {
       const url = new URL(request.url);
+      const opened = openConversationPages(context);
       if (request.method === "GET" && url.pathname === "/status") {
-        return Response.json({ chat_id: normalizeUuid(page.url()), url: page.url() });
+        const active = getActivePage();
+        return Response.json({
+          chat_id: normalizeUuid(active.url()),
+          chat_ids: opened.map((item) => item.chatId),
+          url: active.url(),
+        });
       }
       if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
       try {
-        const body = await request.json().catch(() => ({})) as { chat_id?: string; directory?: string; extract_to?: string; text?: string; files?: string[] };
+        const body = await request.json().catch(() => ({})) as {
+          chat_id?: string; chat?: string; directory?: string; extract_to?: string;
+          text?: string; files?: string[]; new_chat?: boolean;
+        };
         if (url.pathname === "/open") {
           const chatId = normalizeUuid(body.chat_id || "");
           if (!chatId) return Response.json({ error: "invalid chat_id" }, { status: 400 });
+          let page = opened.find((item) => item.chatId === chatId)?.page;
+          const alreadyOpen = Boolean(page);
+          if (!page) {
+            page = await context.newPage();
+            attachNetworkDebug(page, cfg);
+          }
+          setActivePage(page);
           const target = new URL(`/c/${chatId}`, cfg.chatgpt.url).toString();
-          await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
-          return Response.json({ ok: true, chat_id: chatId, url: target });
+          if (normalizeUuid(page.url()) !== chatId) {
+            await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
+          }
+          await waitForConversationReady(page, chatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
+          await page.bringToFront();
+          return Response.json({ ok: true, chat_id: chatId, url: target, already_open: alreadyOpen, pane_index: openConversationPages(context).findIndex((item) => item.chatId === chatId) });
+        }
+        if (url.pathname === "/close") {
+          const selector = (body.chat || body.chat_id || "").trim();
+          if (!selector) return Response.json({ error: "close requires a chat UUID, title, or 0-based pane index" }, { status: 400 });
+          const panes = openConversationPages(context);
+          let target = panes.find((item) => item.chatId === normalizeUuid(selector));
+          if (!target && /^[0-9a-f-]{4,}$/i.test(selector)) {
+            const prefix = selector.toLowerCase();
+            const prefixMatches = panes.filter((item) => item.chatId.startsWith(prefix));
+            if (prefixMatches.length === 1) target = prefixMatches[0];
+            else if (prefixMatches.length > 1) {
+              return Response.json({ error: `id prefix matches multiple opened chats: ${prefixMatches.map((item) => item.chatId).join(", ")}` }, { status: 409 });
+            }
+          }
+          if (!target && /^\d+$/.test(selector)) target = panes[Number(selector)];
+          if (!target) {
+            const matches = await sql`
+              SELECT id FROM chats WHERE title ILIKE ${`%${selector}%`}
+              ORDER BY updated_at DESC NULLS LAST LIMIT 10
+            `;
+            const ids = new Set(matches.map((row: any) => String(row.id).toLowerCase()));
+            const matchingPanes = panes.filter((item) => ids.has(item.chatId));
+            if (matchingPanes.length > 1) {
+              return Response.json({ error: `title matches multiple opened chats: ${matchingPanes.map((item) => item.chatId).join(", ")}` }, { status: 409 });
+            }
+            target = matchingPanes[0];
+          }
+          if (!target) return Response.json({ error: `no opened chat matches '${selector}'` }, { status: 404 });
+          const closedId = target.chatId;
+          const wasActive = target.page === getActivePage();
+          await target.page.close();
+          const remaining = openConversationPages(context);
+          if (wasActive || getActivePage().isClosed()) {
+            let next = remaining[0]?.page ?? context.pages().find((candidate) => !candidate.isClosed() && !normalizeUuid(candidate.url()));
+            if (!next) {
+              next = await context.newPage();
+              await openChatGPT(next, cfg);
+            }
+            setActivePage(next);
+            await next.bringToFront();
+          }
+          return Response.json({ ok: true, closed_chat_id: closedId, chat_ids: openConversationPages(context).map((item) => item.chatId) });
         }
         if (url.pathname === "/new-chat") {
-          // ChatGPT's root route opens the blank composer; unlike /c/<uuid>,
-          // it does not bind the browser to an existing conversation.
+          const page = await context.newPage();
+          attachNetworkDebug(page, cfg);
           const target = new URL("/", cfg.chatgpt.url).toString();
           await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
-          await page.waitForTimeout(1000);
+          await page.locator('#prompt-textarea, [data-composer-markdown][contenteditable="true"], [contenteditable="true"][role="textbox"], textarea').first()
+            .waitFor({ state: "visible", timeout: 30_000 });
           const finalUrl = page.url();
           if (normalizeUuid(finalUrl)) {
+            await page.close();
             return Response.json({ error: `ChatGPT redirected away from the new-chat URL: ${finalUrl}`, url: finalUrl }, { status: 409 });
           }
+          setActivePage(page);
+          await page.bringToFront();
           return Response.json({ ok: true, url: finalUrl });
+        }
+        if (url.pathname === "/send") {
+          const text = body.text || "";
+          const files = Array.isArray(body.files) ? body.files.map((file) => path.resolve(file)) : [];
+          if (!text.trim() && files.length === 0) return Response.json({ error: "text or at least one file is required" }, { status: 400 });
+          for (const file of files) await access(file, constants.R_OK);
+          const requestedChatId = normalizeUuid(body.chat_id || "");
+          let page: Page;
+          if (body.new_chat) {
+            if (requestedChatId) return Response.json({ error: "new_chat cannot be combined with chat_id" }, { status: 400 });
+            // A new chat always gets its own pane; do not disturb existing chats.
+            page = await context.newPage();
+            attachNetworkDebug(page, cfg);
+            await page.goto(new URL("/", cfg.chatgpt.url).toString(), {
+              waitUntil: "domcontentloaded",
+              timeout: cfg.browser?.navigation_timeout_ms ?? 45_000,
+            });
+            await page.locator('#prompt-textarea, [data-composer-markdown][contenteditable="true"], [contenteditable="true"][role="textbox"], textarea').first()
+              .waitFor({ state: "visible", timeout: 30_000 });
+          } else if (requestedChatId) {
+            page = openConversationPages(context).find((item) => item.chatId === requestedChatId)?.page
+              ?? await context.newPage();
+            attachNetworkDebug(page, cfg);
+            if (normalizeUuid(page.url()) !== requestedChatId) {
+              const target = new URL(`/c/${requestedChatId}`, cfg.chatgpt.url).toString();
+              await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
+            }
+            await waitForConversationReady(page, requestedChatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
+          } else {
+            page = getActivePage();
+            if (page.isClosed()) {
+              page = await context.newPage();
+              attachNetworkDebug(page, cfg);
+              await openChatGPT(page, cfg);
+            }
+          }
+          await sendInPage(page, text, undefined, files);
+          if (body.new_chat) {
+            // ChatGPT assigns the conversation UUID after the first message is
+            // submitted. Wait for that route before reporting success to ctl.
+            await page.waitForFunction(() =>
+              /\/c\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(location.pathname),
+              null,
+              { timeout: 45_000 },
+            );
+          }
+          setActivePage(page);
+          await page.bringToFront();
+          const acquiredChatId = normalizeUuid(page.url());
+          if (body.new_chat && !acquiredChatId) {
+            return Response.json({ error: "message was sent but ChatGPT did not expose a conversation UUID yet", url: page.url() }, { status: 504 });
+          }
+          if (body.new_chat && acquiredChatId) {
+            // Persist the newly assigned ID and first user message immediately,
+            // rather than making the CLI wait for the next background poll.
+            await page.waitForTimeout(300);
+            const firstSnapshot = await scrapeCurrentChat(page).catch(() => null);
+            if (firstSnapshot?.id === acquiredChatId) {
+              await upsertChat(sql, firstSnapshot);
+              for (const message of firstSnapshot.messages) await upsertMessage(sql, acquiredChatId, message);
+            }
+          }
+          return Response.json({ ok: true, chat_id: acquiredChatId, url: page.url(), new_chat: Boolean(body.new_chat) });
+        }
+
+        const requestedChatId = normalizeUuid(body.chat_id || "");
+        const page = requestedChatId
+          ? openConversationPages(context).find((item) => item.chatId === requestedChatId)?.page
+          : getActivePage();
+        if (!page) return Response.json({ error: `chat ${requestedChatId} is not open in a watcher pane` }, { status: 404 });
+        if (url.pathname === "/hook/run") {
+          const chatId = requestedChatId;
+          if (!chatId) return Response.json({ error: "valid chat_id is required" }, { status: 400 });
+          const hook = await loadChatHook(sql, chatId);
+          if (!hook) return Response.json({ error: `no hook configured for ${chatId}` }, { status: 404 });
+          const archive = await runHookWithLastZip(page, chatId, hook, cfg, configPath);
+          return Response.json({ ok: true, chat_id: chatId, archive, url: page.url() });
         }
         if (url.pathname === "/download-last-zip") {
           const directory = body.directory
@@ -1202,21 +1541,33 @@ function startControlServer(page: Page, cfg: Config, configPath: string) {
               }
             }
             await mkdir(extractTo, { recursive: true });
-            const extracted = await commandOutput(["unzip", "-o", "-q", saved, "-d", extractTo]);
-            if (extracted.code !== 0) throw new Error(`ZIP extraction failed: ${extracted.stderr}`);
+            const topLevel = new Set(entries.map((entry) => entry.replace(/\\/g, "/").split("/")[0]).filter(Boolean));
+            const singleRoot = topLevel.size === 1 ? [...topLevel][0]! : null;
+            const flattenRoot = Boolean(singleRoot && entries.some((entry) => entry.replace(/\\/g, "/").startsWith(`${singleRoot}/`)));
+            if (flattenRoot && singleRoot) {
+              // Extract to a temporary sibling first, then move the sole root
+              // folder's contents into the requested destination.
+              const staging = await mkdtemp(path.join(extractTo, ".chatgpt-ctl-unzip-"));
+              try {
+                const extracted = await commandOutput(["unzip", "-o", "-q", saved, "-d", staging]);
+                if (extracted.code !== 0) throw new Error(`ZIP extraction failed: ${extracted.stderr}`);
+                const rootDir = path.join(staging, singleRoot);
+                const children = await readdir(rootDir, { withFileTypes: true });
+                for (const child of children) {
+                  await rename(path.join(rootDir, child.name), path.join(extractTo, child.name));
+                }
+                log.info(`[download] flattened single root folder '${singleRoot}' from ${saved} into ${extractTo}`);
+              } finally {
+                await rm(staging, { recursive: true, force: true });
+              }
+            } else {
+              const extracted = await commandOutput(["unzip", "-o", "-q", saved, "-d", extractTo]);
+              if (extracted.code !== 0) throw new Error(`ZIP extraction failed: ${extracted.stderr}`);
+            }
             log.info(`[download] extracted ${saved} to ${extractTo}`);
-            return Response.json({ ok: true, path: saved, extracted_to: extractTo });
+            return Response.json({ ok: true, path: saved, extracted_to: extractTo, flattened: flattenRoot });
           }
           return Response.json({ ok: true, path: saved });
-        }
-        if (url.pathname === "/send") {
-          const chatId = normalizeUuid(body.chat_id || "");
-          const text = body.text || "";
-          const files = Array.isArray(body.files) ? body.files.map((file) => path.resolve(file)) : [];
-          if (!text.trim() && files.length === 0) return Response.json({ error: "text or at least one file is required" }, { status: 400 });
-          for (const file of files) await access(file, constants.R_OK);
-          await sendInPage(page, text, chatId || undefined, files);
-          return Response.json({ ok: true, chat_id: chatId, url: page.url() });
         }
         return new Response("not found", { status: 404 });
       } catch (error) {
@@ -1232,15 +1583,25 @@ function startControlServer(page: Page, cfg: Config, configPath: string) {
 async function watch(cfg: Config, configPath: string) {
   const sql = openDb(cfg);
   await ensureHookSchema(sql);
+  await ensureRetrySchema(sql);
   const pollMs = Math.max(500, cfg.chatgpt.poll_ms ?? 1500);
   const settleMs = cfg.chatgpt.complete_settle_ms ?? 800;
   const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false);
-  // Track when we first saw a message as incomplete (for settle debounce)
   const prevIncomplete = new Map<string, number>();
-  let lastChatId = "";
+  const lastSeenChatByPage = new WeakMap<Page, string>();
+  const readyChatByPage = new WeakMap<Page, string>();
+  const baselineAssistantTurnByChat = new Map<string, number | null>();
+  const baselineUserTurnByChat = new Map<string, number | null>();
+  const baselineUserMessageByChat = new Map<string, string | null>();
+  const baselineUserSequenceByChat = new Map<string, number | null>();
+  let activePage: Page;
   let controlServer: ReturnType<typeof Bun.serve> | undefined;
   const handledHookDownloads = new Set<string>();
   const initializedHookChats = new Set<string>();
+  // Newly completed assistant message ids are retained briefly because the
+  // downloadable ZIP control can render a poll or two after its message.
+  const pendingHookMessages = new Map<string, Map<string, number>>();
+  const retryClickCooldowns = new Map<string, number>();
 
   const stop = async () => {
     log.info("\n[watch] stopping...");
@@ -1253,64 +1614,147 @@ async function watch(cfg: Config, configPath: string) {
   process.on("SIGTERM", stop);
 
   try {
-    const page = await getPage(context);
-    attachNetworkDebug(page, cfg);
-    await openChatGPT(page, cfg);
-    controlServer = startControlServer(page, cfg, configPath);
-    const sidebarChats = await syncSidebarChats(page, sql, true);
+    activePage = await getPage(context);
+    await installFocusTracking(context, (page) => { activePage = page; });
+    attachNetworkDebug(activePage, cfg);
+    await openChatGPT(activePage, cfg);
+    controlServer = startControlServer(context, () => activePage, (page) => { activePage = page; }, cfg, configPath, sql);
+    const sidebarChats = await syncSidebarChats(activePage, sql, true);
     log.info(`[watch] synchronized ${sidebarChats.length} sidebar chats`);
-    log.info(
-      `[watch] poll=${pollMs}ms settle=${settleMs}ms ` +
-        `conversation=${cfg.chatgpt.conversation_id || "(follow current)"}`
-    );
+    log.info(`[watch] poll=${pollMs}ms settle=${settleMs}ms multi-pane enabled`);
 
     while (true) {
       try {
-        // Refresh visible rows on every tick so renamed titles reach the DB.
-        await syncSidebarChats(page, sql, false);
-        // If user navigated to another chat, pick it up
-        const chat = await scrapeCurrentChat(page);
-        if (!chat) {
-          log.debug("[watch] no chat visible (login wall or empty home?)");
-        } else {
-          if (chat.id !== lastChatId) {
-            log.info(`[watch] active chat=${chat.id} title="${chat.title}"`);
-            lastChatId = chat.id;
-            prevIncomplete.clear();
-          }
-          await persistChat(sql, chat, settleMs, prevIncomplete);
-          // Read hook configuration from PostgreSQL every poll so ctl changes
-          // take effect without editing config.toml or restarting the watcher.
-          const hook = await loadChatHook(sql, chat.id);
-          if (hook && hook.enabled) {
-            const targets = await findZipTargets(page);
-            if (!initializedHookChats.has(chat.id)) {
-              // Existing attachments are history, not newly arrived ZIPs.
-              for (const target of targets) {
-                handledHookDownloads.add(`${chat.id}:${target.identity}`);
-              }
-              initializedHookChats.add(chat.id);
-              log.info(`[hook] initialized ZIP baseline for chat=${chat.id} (${targets.length} existing attachments)`);
-            }
-            for (const target of targets) {
-              const hookKey = `${chat.id}:${target.identity}`;
-              if (handledHookDownloads.has(hookKey)) continue;
-              // Mark before running: a failed automation must not repeatedly process each poll.
-              handledHookDownloads.add(hookKey);
-              try {
-                const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
-                const archive = await downloadZipTarget(page, target, archiveDir);
-                await runHookForZip(page, chat.id, hook, archive, configPath);
-              } catch (hookError) {
-                log.error(`[hook] chat=${chat.id} failed: ${formatError(hookError)}`);
-              }
-            }
-          }
+        let pages = context.pages().filter((page) => !page.isClosed());
+        if (!pages.includes(activePage)) {
+          activePage = pages[0] ?? await context.newPage();
+          if (pages.length === 0) await openChatGPT(activePage, cfg);
+          pages = context.pages().filter((page) => !page.isClosed());
         }
+        // Refresh sidebar metadata once per tick; any live pane can expose it.
+        if (pages.length) await syncSidebarChats(activePage, sql, false);
+
+        await Promise.all(pages.map(async (page) => {
+          try {
+            const chat = await scrapeCurrentChat(page);
+            if (!chat) return;
+            const previousId = lastSeenChatByPage.get(page);
+            if (chat.id !== previousId) {
+              log.info(`[watch] pane chat=${chat.id} title="${chat.title}"`);
+              lastSeenChatByPage.set(page, chat.id);
+            }
+            if (readyChatByPage.get(page) !== chat.id) {
+              // First observation of this route (including in-page navigation):
+              // scroll to the actual end and wait for a stable, completed history
+              // before persisting or considering any automation.
+              const readySnapshot = await waitForConversationReady(
+                page, chat.id, cfg.browser?.navigation_timeout_ms ?? 45_000
+              );
+              await persistChat(sql, readySnapshot, settleMs, prevIncomplete);
+              const lastAssistant = [...readySnapshot.messages].reverse().find((message) => message.role === "assistant");
+              const lastUser = [...readySnapshot.messages].reverse().find((message) => message.role === "user");
+              baselineAssistantTurnByChat.set(chat.id, lastAssistant?.turnOrder ?? null);
+              baselineUserTurnByChat.set(chat.id, lastUser?.turnOrder ?? null);
+              baselineUserMessageByChat.set(chat.id, lastUser?.id ?? null);
+              baselineUserSequenceByChat.set(chat.id, lastUser?.sequence ?? null);
+              readyChatByPage.set(page, chat.id);
+              lastSeenChatByPage.set(page, chat.id);
+
+              const initialHook = await loadChatHook(sql, chat.id);
+              if (initialHook?.enabled) {
+                const initialTargets = await findZipTargets(page);
+                for (const target of initialTargets) handledHookDownloads.add(`${chat.id}:${target.identity}`);
+                initializedHookChats.add(chat.id);
+                pendingHookMessages.delete(chat.id);
+                log.info(`[hook] ready baseline chat=${chat.id}; ${readySnapshot.messages.length} messages, ${initialTargets.length} ZIP controls; no hook run`);
+              } else {
+                initializedHookChats.delete(chat.id);
+                pendingHookMessages.delete(chat.id);
+              }
+              return;
+            }
+
+            const hook = await loadChatHook(sql, chat.id);
+            const hookWasInitialized = initializedHookChats.has(chat.id);
+            const newAssistantMessages = await persistChat(sql, chat, settleMs, prevIncomplete);
+
+            if (await isAutoRetryEnabled(sql, chat.id)) {
+              const now = Date.now();
+              const lastClick = retryClickCooldowns.get(chat.id) ?? 0;
+              if (now - lastClick >= 30_000) {
+                try {
+                  const clicked = await clickRetryAtConversationEnd(page, chat.id);
+                  if (clicked) retryClickCooldowns.set(chat.id, now);
+                  else retryClickCooldowns.delete(chat.id);
+                } catch (retryError) {
+                  retryClickCooldowns.set(chat.id, now);
+                  log.warn(`[retry] chat=${chat.id} click failed: ${formatError(retryError)}`);
+                }
+              }
+            } else {
+              retryClickCooldowns.delete(chat.id);
+            }
+
+            if (hook && hook.enabled) {
+              const targets = await findZipTargets(page);
+              if (!hookWasInitialized) {
+                // Opening/navigating to an existing chat is not a hook event.
+                // Establish a baseline before accepting any new message IDs.
+                for (const target of targets) handledHookDownloads.add(`${chat.id}:${target.identity}`);
+                initializedHookChats.add(chat.id);
+                pendingHookMessages.delete(chat.id);
+                log.info(`[hook] initialized ZIP baseline for chat=${chat.id} (${targets.length} existing attachments; no hook run)`);
+              } else {
+                const now = Date.now();
+                let pending = pendingHookMessages.get(chat.id);
+                if (!pending) { pending = new Map<string, number>(); pendingHookMessages.set(chat.id, pending); }
+                for (const messageId of newAssistantMessages) pending.set(messageId, now + 5 * 60_000);
+                for (const [messageId, expiresAt] of pending) if (expiresAt < now) pending.delete(messageId);
+                const latestAssistant = [...chat.messages].reverse().find((message) => message.role === "assistant");
+                const latestUser = [...chat.messages].reverse().find((message) => message.role === "user");
+                const baselineTurn = baselineAssistantTurnByChat.get(chat.id);
+                const baselineUserTurn = baselineUserTurnByChat.get(chat.id);
+                const baselineUserMessage = baselineUserMessageByChat.get(chat.id);
+                // A new assistant node alone is insufficient: editing/regenerating
+                // an older turn can create a fresh message id. Require a genuinely
+                // new user turn beyond the settled history baseline as well.
+                const hasNewUserTurn = Boolean(latestUser && latestUser.id !== baselineUserMessage &&
+                  latestUser.turnOrder !== undefined && baselineUserTurn !== null &&
+                  baselineUserTurn !== undefined && latestUser.turnOrder > baselineUserTurn);
+                for (const target of targets) {
+                  // Fail closed unless the ZIP belongs to the *latest* assistant
+                  // message, that message completed after the baseline, and its
+                  // stable global turn number proves it is newer. This excludes
+                  // historical attachments revealed by scrolling/editing older turns.
+                  if (!hasNewUserTurn || !latestAssistant || !target.messageId || target.messageId !== latestAssistant.id) continue;
+                  if (!pending.has(latestAssistant.id) || !newAssistantMessages.has(latestAssistant.id)) continue;
+                  if (baselineTurn === null || baselineTurn === undefined ||
+                      latestAssistant.turnOrder === undefined || target.messageOrder === null ||
+                      target.messageOrder !== latestAssistant.turnOrder || latestAssistant.turnOrder <= baselineTurn) continue;
+                  const hookKey = `${chat.id}:${target.identity}`;
+                  if (handledHookDownloads.has(hookKey)) continue;
+                  handledHookDownloads.add(hookKey);
+                  try {
+                    const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
+                    const archive = await downloadZipTarget(page, target, archiveDir);
+                    if (archive) await runHookForZip(page, chat.id, hook, archive, configPath);
+                  } catch (hookError) {
+                    log.error(`[hook] chat=${chat.id} failed: ${formatError(hookError)}`);
+                  }
+                }
+              }
+            } else {
+              initializedHookChats.delete(chat.id);
+              pendingHookMessages.delete(chat.id);
+            }
+          } catch (pageError) {
+            log.error(`[watch] pane scan failed url=${page.url()}: ${formatError(pageError)}`);
+          }
+        }));
       } catch (error) {
         log.error(`[watch] scan failed:\n${formatError(error)}`);
       }
-      await page.waitForTimeout(pollMs);
+      await activePage.waitForTimeout(pollMs).catch(() => new Promise((resolve) => setTimeout(resolve, pollMs)));
     }
   } catch (error) {
     log.error(`[watch] fatal:\n${formatError(error)}`);
