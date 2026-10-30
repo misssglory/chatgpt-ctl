@@ -645,27 +645,23 @@ async function syncChatsCommand(cfg: Config, configPath: string, quiet = false) 
   }
 }
 
-/** Open a chat in a normal browser window and leave it running after the CLI exits. */
-async function openChatCommand(cfg: Config, configPath: string, rawId: string) {
+/** Legacy one-shot open is intentionally routed through the watch control server. */
+async function openChatCommand(_cfg: Config, _configPath: string, rawId: string) {
   const chatId = normalizeUuid(rawId);
   if (!chatId) throw new Error(`open: invalid chat id "${rawId}"`);
-  const executablePath = await resolveBrowserExecutable(cfg, configPath);
-  const profileDir = resolveFromConfig(configPath, cfg.chatgpt.profile_dir);
-  await mkdir(profileDir, { recursive: true });
-  const target = new URL(`/c/${chatId}`, cfg.chatgpt.url).toString();
-  const proc = Bun.spawn(
-    [
-      executablePath,
-      `--user-data-dir=${profileDir}`,
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--new-window",
-      target,
-    ],
-    { stdin: "ignore", stdout: "ignore", stderr: "ignore", env: process.env }
+  const response = await fetch(
+    `http://${CONTROL_HOST}:${CONTROL_PORT}/open`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId }),
+    }
   );
-  proc.unref();
-  console.log(target);
+  const result = await response.json().catch(() => ({})) as { error?: string; url?: string };
+  if (!response.ok) {
+    throw new Error(result.error || `watch control server returned ${response.status}; start \`bun run watch\` first`);
+  }
+  console.log(result.url || `opened ${chatId}`);
 }
 
 async function sendMessageCommand(
@@ -881,6 +877,39 @@ async function once(cfg: Config, configPath: string) {
   }
 }
 
+
+const CONTROL_HOST = process.env.CHATGPT_CTL_HOST || "127.0.0.1";
+const CONTROL_PORT = Number(process.env.CHATGPT_CTL_PORT || 17381);
+
+function startControlServer(page: Page, cfg: Config) {
+  const server = Bun.serve({
+    hostname: CONTROL_HOST,
+    port: CONTROL_PORT,
+    async fetch(request) {
+      const url = new URL(request.url);
+      if (request.method !== "POST" || url.pathname !== "/open") {
+        return new Response("not found", { status: 404 });
+      }
+      try {
+        const body = (await request.json()) as { chat_id?: string };
+        const chatId = normalizeUuid(body.chat_id || "");
+        if (!chatId) return Response.json({ error: "invalid chat_id" }, { status: 400 });
+        const target = new URL(`/c/${chatId}`, cfg.chatgpt.url).toString();
+        await page.goto(target, {
+          waitUntil: "domcontentloaded",
+          timeout: cfg.browser?.navigation_timeout_ms ?? 45_000,
+        });
+        return Response.json({ ok: true, chat_id: chatId, url: target });
+      } catch (error) {
+        log.error(`[ctl] open failed: ${formatError(error)}`);
+        return Response.json({ error: String(error) }, { status: 500 });
+      }
+    },
+  });
+  log.info(`[ctl] listening on http://${CONTROL_HOST}:${server.port}`);
+  return server;
+}
+
 async function watch(cfg: Config, configPath: string) {
   const sql = openDb(cfg);
   const pollMs = Math.max(500, cfg.chatgpt.poll_ms ?? 1500);
@@ -889,9 +918,11 @@ async function watch(cfg: Config, configPath: string) {
   // Track when we first saw a message as incomplete (for settle debounce)
   const prevIncomplete = new Map<string, number>();
   let lastChatId = "";
+  let controlServer: ReturnType<typeof Bun.serve> | undefined;
 
   const stop = async () => {
     log.info("\n[watch] stopping...");
+    controlServer?.stop(true);
     await context.close();
     await sql.end();
     process.exit(0);
@@ -903,6 +934,7 @@ async function watch(cfg: Config, configPath: string) {
     const page = await getPage(context);
     attachNetworkDebug(page, cfg);
     await openChatGPT(page, cfg);
+    controlServer = startControlServer(page, cfg);
     const sidebarChats = await syncSidebarChats(page, sql, true);
     log.info(`[watch] synchronized ${sidebarChats.length} sidebar chats`);
     log.info(
@@ -933,6 +965,7 @@ async function watch(cfg: Config, configPath: string) {
     }
   } catch (error) {
     log.error(`[watch] fatal:\n${formatError(error)}`);
+    controlServer?.stop(true);
     await context.close();
     await sql.end();
     throw error;

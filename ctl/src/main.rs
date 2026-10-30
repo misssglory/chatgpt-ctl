@@ -16,7 +16,8 @@ use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{CompletionType, Config, Context as RlContext, Editor, Helper};
 use std::borrow::Cow;
-use std::io;
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::Command;
 use tokio_postgres::{Client, NoTls};
@@ -57,7 +58,7 @@ enum Commands {
         files: Vec<PathBuf>,
     },
 
-    /// Open a chat in the browser by UUID or title.
+    /// Open a chat in the active watcher browser pane by UUID or title.
     ///
     /// With no CHAT argument, enters an interactive prompt with DB-backed
     /// autocomplete on chat titles and UUIDs.
@@ -430,7 +431,7 @@ impl Validator for ChatHelper {}
 impl Helper for ChatHelper {}
 
 async fn interactive_history(client: &Client, completed_only: bool, limit: i64, json: bool) -> Result<()> {
-    let chats = list_chats(client, 200, None).await?;
+    let chats = list_chats(client, 1000, None).await?;
     if chats.is_empty() {
         anyhow::bail!("no chats in database — run `bun run watch` first");
     }
@@ -466,7 +467,7 @@ async fn interactive_history(client: &Client, completed_only: bool, limit: i64, 
 }
 
 async fn interactive_open(client: &Client) -> Result<Uuid> {
-    let chats = list_chats(client, 200, None).await?;
+    let chats = list_chats(client, 1000, None).await?;
     if chats.is_empty() {
         anyhow::bail!("no chats in database — run `chatgpt-ctl chats --refresh` first");
     }
@@ -521,6 +522,32 @@ async fn follow_history(
     }
 }
 
+
+/// Ask the long-running Bun watcher to navigate its existing browser pane.
+fn request_active_pane_open(chat_id: Uuid) -> Result<()> {
+    let address = std::env::var("CHATGPT_CTL_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:17381".to_string());
+    let mut stream = TcpStream::connect(&address)
+        .with_context(|| format!("connect to watcher control server at {address}; start `bun run watch` from the repository root"))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(50)))?;
+    let body = serde_json::json!({ "chat_id": chat_id }).to_string();
+    write!(
+        stream,
+        "POST /open HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let status = response.lines().next().unwrap_or_default();
+    if !status.contains(" 200 ") {
+        let message = response.split("\r\n\r\n").nth(1).unwrap_or("watcher rejected open request");
+        anyhow::bail!("watcher open failed ({status}): {message}");
+    }
+    println!("opened {chat_id} in the active ChatGPT pane");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -570,10 +597,7 @@ async fn main() -> Result<()> {
                 Some(spec) => resolve_chat_id(&client, &spec).await?,
                 None => interactive_open(&client).await?,
             };
-            run_watcher(&watcher_args(
-                "open",
-                &[chat_id.to_string()],
-            ))?;
+            request_active_pane_open(chat_id)?;
         }
         Commands::History {
             chat,

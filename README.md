@@ -136,6 +136,13 @@ chatgpt-ctl send "Review these files" -f ./notes.md -f ./src/main.rs
 The watcher performs a full sidebar synchronization at startup and refreshes visible titles on every
 watch tick, so renamed chats are updated in PostgreSQL. `chats --refresh` forces another full scan.
 
+While `bun run watch` is running, it also exposes a localhost control endpoint
+(default `127.0.0.1:17381`). `chatgpt-ctl open <CHAT>` sends the selected UUID to that
+server and navigates the watcher's existing ChatGPT tab/pane instead of launching a
+second Chromium window. Set `CHATGPT_CTL_ADDR` for the CLI or `CHATGPT_CTL_HOST` /
+`CHATGPT_CTL_PORT` for the watcher to override the address. The interactive `open`
+prompt uses the cached PostgreSQL chat titles and UUIDs for TAB completion.
+
 ```bash
 # static shell completion (also installed by the Nix package)
 chatgpt-ctl completions zsh > ~/.zfunc/_chatgpt-ctl
