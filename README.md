@@ -3,7 +3,7 @@
 CLI (+ optional Bun scraper) for **ChatGPT conversation history** stored in **PostgreSQL**.
 
 - **`chatgpt-ctl`** — minimal Rust binary (no Bun, Chromium, rustc, or PostgreSQL client in the runtime closure)
-- Shell **completions** installed with the package (bash / zsh / fish)
+- Shell **completions** installed with the package (bash / zsh / fish), plus DB-backed chat suggestions
 - **NixOS module** for global install + optional local DB/schema
 - Optional **watcher** (`bun run watch`) that scrapes chatgpt.com using a persistent Chromium profile
 
@@ -114,15 +114,45 @@ chatgpt-ctl chats [--limit N] [-q substring] [--refresh]
 chatgpt-ctl send "message text" [-f PATH]...  # current chat; repeatable file uploads
 chatgpt-ctl open [CHAT|current]              # UUID/title; no arg = TAB completion
 chatgpt-ctl new-chat                         # blank chat at / (no conversation UUID in URL)
-chatgpt-ctl download-last-zip [DIRECTORY]   # save newest ZIP from current browser chat
+chatgpt-ctl download-last-zip [DIRECTORY] [--extract-to DIR]  # download, optionally extract
 chatgpt-ctl history [CHAT|current] [--all] [--follow] [--json]
 chatgpt-ctl history                          # interactive; TAB completes titles/UUIDs from DB
 chatgpt-ctl message <uuid>
+chatgpt-ctl hook set|list|show|enable|disable|remove ...
 chatgpt-ctl completions bash|zsh|fish|elvish|powershell
 ```
 
-The generated shell completions include all CLI subcommands, including `new-chat` and `download-last-zip`.
-After updating the binary, regenerate your shell completion file or rebuild/reinstall the Nix package.
+The generated shell completions include all CLI subcommands and options. Chat arguments also have
+DB-backed suggestions available through the hidden `__complete-chat` helper; `open` and `history`
+retain their interactive TAB-completion prompts when invoked without a chat argument. For Bash,
+add this after sourcing the generated completion file to enable dynamic chat UUID suggestions:
+
+```bash
+# Preserve the generated clap completion function, then augment chat arguments.
+if declare -f _chatgpt_ctl >/dev/null; then
+  eval "$(declare -f _chatgpt_ctl | sed '1s/_chatgpt_ctl/_chatgpt_ctl_static/')"
+fi
+_chatgpt_ctl() {
+  local cur prev words cword
+  _init_completion || return
+  case "${words[1]}" in
+    open|history)
+      if (( cword == 2 )); then
+        mapfile -t COMPREPLY < <(chatgpt-ctl __complete-chat "$cur" 2>/dev/null | cut -f1)
+        (( ${#COMPREPLY[@]} )) && return
+      fi ;;
+    hook)
+      if [[ "${words[2]}" =~ ^(set|show|enable|disable|remove)$ ]] && (( cword == 3 )); then
+        mapfile -t COMPREPLY < <(chatgpt-ctl __complete-chat "$cur" 2>/dev/null | cut -f1)
+        (( ${#COMPREPLY[@]} )) && return
+      fi ;;
+  esac
+  _chatgpt_ctl_static "$@"
+}
+complete -o default -F _chatgpt_ctl chatgpt-ctl
+```
+
+After updating the binary, regenerate shell completion files or rebuild/reinstall the Nix package.
 
 `CHAT` may be a UUID, a title substring, or `current` (most recently updated chat).
 `open` without an argument and `history` without an argument provide interactive title/UUID autocomplete.
@@ -144,7 +174,8 @@ watch tick, so renamed chats are updated in PostgreSQL. `chats --refresh` forces
 While `bun run watch` is running, it also exposes a localhost control endpoint
 (default `127.0.0.1:17381`). `chatgpt-ctl open <CHAT>` sends the selected UUID to that
 server and navigates the watcher's existing ChatGPT tab/pane instead of launching a
-second Chromium window. `chatgpt-ctl new-chat` navigates that same pane to the ChatGPT
+second Chromium window. `chatgpt-ctl send` submits into that same page without launching another
+browser context. `chatgpt-ctl new-chat` navigates that same pane to the ChatGPT
 root URL (`/`), opening a blank composer without a conversation UUID in the address.
 Set `CHATGPT_CTL_ADDR` for the CLI or `CHATGPT_CTL_HOST` /
 `CHATGPT_CTL_PORT` for the watcher to override the address. The interactive `open`
@@ -153,23 +184,44 @@ marks the browser's currently open conversation with a cyan `●` while the watc
 
 `chatgpt-ctl download-last-zip [DIRECTORY]` asks the watcher to download the newest ZIP attachment
 from the currently open conversation. With no directory it uses `[downloads].directory` from
-`config.toml` (default `./var/downloads`).
+`config.toml` (default `./var/downloads`). Add `--extract-to DIR` (alias `--unzip-to`) to
+extract the downloaded archive into `DIR`; the original ZIP is kept. Relative paths are resolved
+from the directory where you run `chatgpt-ctl`. Example:
+
+```bash
+chatgpt-ctl download-last-zip ./var/downloads --extract-to ./work/latest-project
+```
+
+`chatgpt-ctl send "message text" [-f PATH]...` sends through the watcher's existing browser page,
+so it targets the chat currently open in that pane rather than launching a separate browser
+context. It can also send file attachments without message text:
+
+```bash
+chatgpt-ctl send "Review this" -f ./src/main.rs
+chatgpt-ctl send -f ./archive.zip
+```
 
 ### Per-chat ZIP automation hooks
 
-Add a TOML table keyed by the conversation UUID from `chatgpt-ctl chats`:
+Hooks are managed dynamically by `chatgpt-ctl` and stored in PostgreSQL; no hook entries are
+needed in `config.toml`, and changes are picked up by the running watcher on its next poll.
 
-```toml
-[hooks."YOUR-CHAT-UUID"]
-enabled = true
-folder = "/home/YOU/src/my-project" # extraction root and Git working tree
-child_folder = "rust-edge-gui"      # optional; defaults to "."
-nix_flake = false                   # true runs `nix develop <build-dir> -c wcc build`
-clipboard_command = ["wl-paste", "-n"] # optional; this is the default on Wayland
+```bash
+chatgpt-ctl hook set "My project chat" --folder ~/src/my-project
+chatgpt-ctl hook set "My Rust chat" --folder ~/src/my-project --child-folder rust-edge-gui --nix-flake
+chatgpt-ctl hook list
+chatgpt-ctl hook show "My project chat"
+chatgpt-ctl hook disable "My project chat"  # keep configuration, pause automation
+chatgpt-ctl hook enable "My project chat"
+chatgpt-ctl hook remove "My project chat"
 ```
 
-Paths in hook configuration are relative to the `config.toml` directory unless absolute. While
-that conversation is open, the watcher records existing ZIP links as a baseline and processes
+`--folder` is resolved and stored as an absolute path. `--child-folder` defaults to `.`;
+`--nix-flake` runs `nix develop <build-dir> -c wcc build`. The clipboard command defaults to
+`wl-paste -n`; override it with `--clipboard-command xclip --clipboard-arg -selection
+--clipboard-arg clipboard --clipboard-arg -o` (repeat `--clipboard-arg` for each argument).
+
+While that conversation is open, the watcher records existing ZIP links as a baseline and processes
 only subsequently-arriving ZIP attachments. Each new ZIP is saved under
 `<folder>/.chatgpt-ctl-downloads/`, checked for path-traversal entries, and extracted into
 `folder`. The hook stages only archive paths, commits the archive's Markdown diff as the commit
@@ -178,7 +230,7 @@ message (or `Auto update` if no Markdown changes are present), then runs `wcc bu
 flake dev shell. On build failure it reads the configured clipboard command (default
 `wl-paste -n`) and sends that diagnostic to the hooked conversation.
 
-The hook requires `unzip`, `git`, `wcc`, and, when `nix_flake = true`, `nix` on the watcher's
+The hook requires `unzip`, `git`, `wcc`, and, when `--nix-flake` is used, `nix` on the watcher's
 `PATH`. The target folder must already be a Git repository with commit identity configured.
 
 ```bash

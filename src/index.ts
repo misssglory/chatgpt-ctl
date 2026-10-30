@@ -60,13 +60,6 @@ interface Config {
   };
   debug?: { network?: boolean };
   downloads?: { directory?: string };
-  hooks?: Record<string, {
-    folder: string;
-    child_folder?: string;
-    nix_flake?: boolean;
-    clipboard_command?: string[];
-    enabled?: boolean;
-  }>;
 }
 
 interface ScrapedMessage {
@@ -186,6 +179,47 @@ function openDb(cfg: Config): Sql {
   const url = databaseUrl(cfg);
   log.info(`[db] connecting ${url.replace(/:[^:@]+@/, ":***@")}`);
   return postgres(url, { max: 4, idle_timeout: 20 });
+}
+
+type ChatHook = {
+  folder: string;
+  child_folder: string;
+  nix_flake: boolean;
+  clipboard_command: string[];
+  enabled: boolean;
+};
+
+async function ensureHookSchema(sql: Sql): Promise<void> {
+  await sql.unsafe(`
+    CREATE TABLE IF NOT EXISTS chat_hooks (
+      chat_id uuid PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+      folder text NOT NULL,
+      child_folder text NOT NULL DEFAULT '.',
+      nix_flake boolean NOT NULL DEFAULT false,
+      clipboard_command jsonb NOT NULL DEFAULT '["wl-paste", "-n"]'::jsonb,
+      enabled boolean NOT NULL DEFAULT true,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+}
+
+async function loadChatHook(sql: Sql, chatId: string): Promise<ChatHook | null> {
+  const rows = await sql`
+    SELECT folder, child_folder, nix_flake, clipboard_command, enabled
+    FROM chat_hooks WHERE chat_id = ${chatId}::uuid
+  `;
+  if (!rows.length) return null;
+  const row = rows[0] as any;
+  const command = typeof row.clipboard_command === "string"
+    ? JSON.parse(row.clipboard_command)
+    : row.clipboard_command;
+  return {
+    folder: row.folder,
+    child_folder: row.child_folder || ".",
+    nix_flake: Boolean(row.nix_flake),
+    clipboard_command: Array.isArray(command) && command.length ? command : ["wl-paste", "-n"],
+    enabled: Boolean(row.enabled),
+  };
 }
 
 async function migrate(cfg: Config) {
@@ -1038,24 +1072,36 @@ async function downloadLastZip(page: Page, directory: string): Promise<string> {
   return downloadZipTarget(page, newest, directory);
 }
 
-async function sendInPage(page: Page, text: string, chatId?: string) {
+async function sendInPage(page: Page, text: string, chatId?: string, files: string[] = []) {
+  // This function operates on the watcher's existing page. Do not launch a
+  // second browser context: `chatgpt-ctl send` must target the visible chat.
   if (chatId && normalizeUuid(page.url()) !== chatId) {
     await page.goto(new URL(`/c/${chatId}`, "https://chatgpt.com").toString(), { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(900);
   }
   const composer = page.locator('#prompt-textarea, [data-composer-markdown][contenteditable="true"], [contenteditable="true"][role="textbox"], textarea').first();
   await composer.waitFor({ state: "visible" });
-  await composer.fill(text);
+  if (files.length > 0) {
+    const fileInput = page.locator(
+      'input[type="file"][aria-label="Attach files" i], ' +
+      'input[type="file"]:not([capture]):not([accept*="image" i]):not([accept*="video" i])'
+    ).first();
+    if (!(await fileInput.count())) throw new Error("send: could not find ChatGPT's file upload input");
+    await fileInput.setInputFiles(files);
+    await page.waitForTimeout(1000);
+  }
+  if (text.trim()) await composer.fill(text);
   const sendButton = page.locator('button[data-testid="send-button"], button[aria-label="Send message" i], button[aria-label="Send" i], button[data-composer-navigation-target="send"]').first();
   await sendButton.waitFor({ state: "visible", timeout: 8000 });
   await sendButton.click();
   await page.waitForTimeout(700);
+  log.info(`[send] submitted text_chars=${text.length} files=${files.length} url=${page.url()}`);
 }
 
 async function runHookForZip(
   page: Page,
   chatId: string,
-  hook: NonNullable<Config["hooks"]>[string],
+  hook: ChatHook,
   archive: string,
   configPath: string
 ) {
@@ -1119,7 +1165,7 @@ function startControlServer(page: Page, cfg: Config, configPath: string) {
       }
       if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
       try {
-        const body = await request.json().catch(() => ({})) as { chat_id?: string; directory?: string; text?: string };
+        const body = await request.json().catch(() => ({})) as { chat_id?: string; directory?: string; extract_to?: string; text?: string; files?: string[] };
         if (url.pathname === "/open") {
           const chatId = normalizeUuid(body.chat_id || "");
           if (!chatId) return Response.json({ error: "invalid chat_id" }, { status: 400 });
@@ -1144,13 +1190,33 @@ function startControlServer(page: Page, cfg: Config, configPath: string) {
             ? path.resolve(body.directory)
             : resolveFromConfig(configPath, cfg.downloads?.directory || "./var/downloads");
           const saved = await downloadLastZip(page, directory);
+          if (body.extract_to) {
+            const extractTo = path.resolve(body.extract_to);
+            const listing = await commandOutput(["unzip", "-Z1", saved]);
+            if (listing.code !== 0) throw new Error(`cannot list downloaded ZIP entries: ${listing.stderr}`);
+            const entries = listing.stdout.split(/\r?\n/).filter(Boolean);
+            for (const entry of entries) {
+              const normalized = entry.replace(/\\/g, "/");
+              if (normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized) || normalized.split("/").some((part) => part === "..")) {
+                throw new Error(`unsafe ZIP entry path: ${entry}`);
+              }
+            }
+            await mkdir(extractTo, { recursive: true });
+            const extracted = await commandOutput(["unzip", "-o", "-q", saved, "-d", extractTo]);
+            if (extracted.code !== 0) throw new Error(`ZIP extraction failed: ${extracted.stderr}`);
+            log.info(`[download] extracted ${saved} to ${extractTo}`);
+            return Response.json({ ok: true, path: saved, extracted_to: extractTo });
+          }
           return Response.json({ ok: true, path: saved });
         }
         if (url.pathname === "/send") {
           const chatId = normalizeUuid(body.chat_id || "");
-          if (!body.text?.trim()) return Response.json({ error: "text is required" }, { status: 400 });
-          await sendInPage(page, body.text, chatId || undefined);
-          return Response.json({ ok: true, chat_id: chatId });
+          const text = body.text || "";
+          const files = Array.isArray(body.files) ? body.files.map((file) => path.resolve(file)) : [];
+          if (!text.trim() && files.length === 0) return Response.json({ error: "text or at least one file is required" }, { status: 400 });
+          for (const file of files) await access(file, constants.R_OK);
+          await sendInPage(page, text, chatId || undefined, files);
+          return Response.json({ ok: true, chat_id: chatId, url: page.url() });
         }
         return new Response("not found", { status: 404 });
       } catch (error) {
@@ -1165,6 +1231,7 @@ function startControlServer(page: Page, cfg: Config, configPath: string) {
 
 async function watch(cfg: Config, configPath: string) {
   const sql = openDb(cfg);
+  await ensureHookSchema(sql);
   const pollMs = Math.max(500, cfg.chatgpt.poll_ms ?? 1500);
   const settleMs = cfg.chatgpt.complete_settle_ms ?? 800;
   const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false);
@@ -1212,8 +1279,10 @@ async function watch(cfg: Config, configPath: string) {
             prevIncomplete.clear();
           }
           await persistChat(sql, chat, settleMs, prevIncomplete);
-          const hook = cfg.hooks?.[chat.id];
-          if (hook && hook.enabled !== false) {
+          // Read hook configuration from PostgreSQL every poll so ctl changes
+          // take effect without editing config.toml or restarting the watcher.
+          const hook = await loadChatHook(sql, chat.id);
+          if (hook && hook.enabled) {
             const targets = await findZipTargets(page);
             if (!initializedHookChats.has(chat.id)) {
               // Existing attachments are history, not newly arrived ZIPs.

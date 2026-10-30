@@ -1,9 +1,9 @@
 //! chatgpt-ctl — browse ChatGPT history persisted by chatgpt-history-watcher.
 //!
 //! Autocompletion:
-//!   - Shell: `chatgpt-ctl completions bash|zsh|fish`  (static clap completions)
-//!   - Interactive: `chatgpt-ctl history` with no args opens a rustyline prompt
-//!     that completes chat titles / UUIDs loaded from PostgreSQL.
+//!   - Shell: `chatgpt-ctl completions bash|zsh|fish` (clap command/option completions)
+//!   - Dynamic chat candidates: hidden `__complete-chat` helper for shell integrations
+//!   - Interactive: `open` / `history` without an argument complete DB chat titles / UUIDs.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -15,7 +15,6 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{CompletionType, Config, Context as RlContext, Editor, Helper};
-use std::borrow::Cow;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -51,8 +50,8 @@ enum Commands {
 
     /// Send text to the currently open chat, optionally with file attachments
     Send {
-        /// Message text (quote text containing spaces)
-        text: String,
+        /// Optional message text (quote text containing spaces); may be omitted when attaching files
+        text: Option<String>,
         /// File to upload; repeat for multiple attachments
         #[arg(short = 'f', long = "file", value_name = "PATH")]
         files: Vec<PathBuf>,
@@ -72,8 +71,11 @@ enum Commands {
 
     /// Download the newest ZIP attachment from the currently open conversation.
     DownloadLastZip {
-        /// Destination directory (default: ./var/downloads)
+        /// Destination directory for the ZIP file (default: ./var/downloads)
         directory: Option<PathBuf>,
+        /// Extract the downloaded ZIP into this directory (keeps the ZIP file)
+        #[arg(long = "extract-to", alias = "unzip-to", value_name = "DIR")]
+        extract_to: Option<PathBuf>,
     },
 
     /// Show message history for a chat.
@@ -110,10 +112,57 @@ enum Commands {
         json: bool,
     },
 
+    /// Manage per-conversation ZIP/build automation hooks (stored in PostgreSQL)
+    Hook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
+
+    /// Internal helper used by shell completion snippets to suggest chat titles and UUIDs
+    #[command(name = "__complete-chat", hide = true)]
+    CompleteChat {
+        /// Current word prefix
+        prefix: Option<String>,
+    },
+
     /// Emit shell completions for bash / zsh / fish / elvish / powershell
     Completions {
         shell: ShellKind,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum HookAction {
+    /// Create or replace a hook for a chat
+    Set {
+        /// Chat UUID or unique title substring
+        chat: String,
+        /// Project root / Git working tree (stored as an absolute path)
+        #[arg(long)]
+        folder: PathBuf,
+        /// Build directory below --folder (default: .)
+        #[arg(long, default_value = ".")]
+        child_folder: String,
+        /// Run `nix develop <build-dir> -c wcc build`
+        #[arg(long)]
+        nix_flake: bool,
+        /// Clipboard executable (default: wl-paste)
+        #[arg(long, default_value = "wl-paste")]
+        clipboard_command: String,
+        /// Extra argument to the clipboard executable (repeatable; default: -n)
+        #[arg(long = "clipboard-arg")]
+        clipboard_args: Vec<String>,
+    },
+    /// List configured hooks
+    List,
+    /// Show one chat's hook
+    Show { chat: String },
+    /// Enable a hook
+    Enable { chat: String },
+    /// Disable a hook without deleting it
+    Disable { chat: String },
+    /// Remove a hook
+    Remove { chat: String },
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -277,6 +326,104 @@ async fn resolve_chat_id(client: &Client, spec: &str) -> Result<Uuid> {
         anyhow::bail!("refine the query (or pass a full UUID)");
     }
     Ok(rows[0].get(0))
+}
+
+async fn ensure_hook_table(client: &Client) -> Result<()> {
+    client.execute(
+        r#"
+        CREATE TABLE IF NOT EXISTS chat_hooks (
+          chat_id uuid PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+          folder text NOT NULL,
+          child_folder text NOT NULL DEFAULT '.',
+          nix_flake boolean NOT NULL DEFAULT false,
+          clipboard_command jsonb NOT NULL DEFAULT '["wl-paste", "-n"]'::jsonb,
+          enabled boolean NOT NULL DEFAULT true,
+          updated_at timestamptz NOT NULL DEFAULT now()
+        )
+        "#,
+        &[],
+    ).await?;
+    Ok(())
+}
+
+async fn complete_chat_values(client: &Client, prefix: &str) -> Result<()> {
+    let pattern = format!("%{}%", prefix);
+    let rows = client.query(
+        "SELECT id, title FROM chats WHERE title ILIKE $1 OR id::text ILIKE $1 ORDER BY updated_at DESC NULLS LAST LIMIT 30",
+        &[&pattern],
+    ).await?;
+    for row in rows {
+        let id: Uuid = row.get(0);
+        let title: String = row.get(1);
+        println!("{}\t{}", id, title.replace('\n', " " ).replace('\r', " " ).replace('\t', " " ));
+    }
+    Ok(())
+}
+
+async fn run_hook_action(client: &Client, action: HookAction) -> Result<()> {
+    ensure_hook_table(client).await?;
+    match action {
+        HookAction::Set { chat, folder, child_folder, nix_flake, clipboard_command, clipboard_args } => {
+            let id = resolve_chat_id(client, &chat).await?;
+            let folder = folder.canonicalize().with_context(|| format!("resolve hook folder {}", folder.display()))?;
+            if !folder.is_dir() { anyhow::bail!("hook folder is not a directory: {}", folder.display()); }
+            let mut command = vec![clipboard_command];
+            if clipboard_args.is_empty() {
+                if command[0] == "wl-paste" { command.push("-n".into()); }
+            } else {
+                command.extend(clipboard_args);
+            }
+            let command_json = serde_json::to_value(command)?;
+            let folder_text = folder.to_string_lossy().to_string();
+            client.execute(
+                r#"INSERT INTO chat_hooks (chat_id, folder, child_folder, nix_flake, clipboard_command, enabled, updated_at)
+                   VALUES ($1, $2, $3, $4, $5::jsonb, true, now())
+                   ON CONFLICT (chat_id) DO UPDATE SET folder=EXCLUDED.folder,
+                     child_folder=EXCLUDED.child_folder, nix_flake=EXCLUDED.nix_flake,
+                     clipboard_command=EXCLUDED.clipboard_command, enabled=true, updated_at=now()"#,
+                &[&id, &folder_text, &child_folder, &nix_flake, &command_json],
+            ).await?;
+            println!("hook configured for {id} ({})", chat);
+        }
+        HookAction::List => {
+            let rows = client.query(
+                "SELECT h.chat_id, c.title, h.folder, h.child_folder, h.nix_flake, h.enabled FROM chat_hooks h JOIN chats c ON c.id=h.chat_id ORDER BY c.updated_at DESC NULLS LAST",
+                &[],
+            ).await?;
+            if rows.is_empty() { println!("no hooks configured"); }
+            for row in rows {
+                let id: Uuid = row.get(0); let title: String = row.get(1);
+                let folder: String = row.get(2); let child: String = row.get(3);
+                let nix: bool = row.get(4); let enabled: bool = row.get(5);
+                println!("{} [{}] {} -> {}{}", id, if enabled { "enabled" } else { "disabled" }, title, folder, if nix { format!(" (nix develop, build dir: {child})") } else { format!(" (build dir: {child})") });
+            }
+        }
+        HookAction::Show { chat } => {
+            let id = resolve_chat_id(client, &chat).await?;
+            let row = client.query_opt("SELECT folder, child_folder, nix_flake, clipboard_command, enabled FROM chat_hooks WHERE chat_id=$1", &[&id]).await?.context("no hook configured for this chat")?;
+            let command: serde_json::Value = row.get(3);
+            println!("chat: {id}\nfolder: {}\nchild_folder: {}\nnix_flake: {}\nenabled: {}\nclipboard_command: {}", row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, bool>(2), row.get::<_, bool>(4), command);
+        }
+        HookAction::Enable { chat } => {
+            let id = resolve_chat_id(client, &chat).await?;
+            let changed = client.execute("UPDATE chat_hooks SET enabled=true, updated_at=now() WHERE chat_id=$1", &[&id]).await?;
+            if changed == 0 { anyhow::bail!("no hook configured for {id}"); }
+            println!("hook enabled for {id}");
+        }
+        HookAction::Disable { chat } => {
+            let id = resolve_chat_id(client, &chat).await?;
+            let changed = client.execute("UPDATE chat_hooks SET enabled=false, updated_at=now() WHERE chat_id=$1", &[&id]).await?;
+            if changed == 0 { anyhow::bail!("no hook configured for {id}"); }
+            println!("hook disabled for {id}");
+        }
+        HookAction::Remove { chat } => {
+            let id = resolve_chat_id(client, &chat).await?;
+            let changed = client.execute("DELETE FROM chat_hooks WHERE chat_id=$1", &[&id]).await?;
+            if changed == 0 { anyhow::bail!("no hook configured for {id}"); }
+            println!("removed hook for {id}");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -597,6 +744,14 @@ async fn main() -> Result<()> {
         .unwrap_or_else(default_database_url);
 
     match cli.command {
+        Commands::Hook { action } => {
+            let client = connect(&url).await?;
+            run_hook_action(&client, action).await?;
+        }
+        Commands::CompleteChat { prefix } => {
+            let client = connect(&url).await?;
+            complete_chat_values(&client, prefix.as_deref().unwrap_or("")).await?;
+        }
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             let shell: Shell = shell.into();
@@ -623,15 +778,24 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Send { text, files } => {
-            let mut values = vec![text];
+            let text = text.unwrap_or_default();
+            if text.trim().is_empty() && files.is_empty() {
+                anyhow::bail!("send: provide message text or at least one --file attachment");
+            }
+            let mut resolved_files = Vec::with_capacity(files.len());
             for file in files {
                 let file = file
                     .canonicalize()
                     .with_context(|| format!("access attachment {}", file.display()))?;
-                values.push("--file".to_string());
-                values.push(file.to_string_lossy().into_owned());
+                resolved_files.push(file);
             }
-            run_watcher(&watcher_args("send", &values))?;
+            let body = serde_json::json!({
+                "text": text,
+                "files": resolved_files,
+            }).to_string();
+            let response = watcher_request("POST", "/send", Some(&body))?;
+            let value: serde_json::Value = serde_json::from_str(&response)?;
+            println!("{}", value.get("url").and_then(|v| v.as_str()).unwrap_or("message sent in the active ChatGPT pane"));
         }
         Commands::Open { chat } => {
             let client = connect(&url).await?;
@@ -649,14 +813,21 @@ async fn main() -> Result<()> {
                 value.get("url").and_then(|v| v.as_str()).unwrap_or("opened a new chat")
             );
         }
-        Commands::DownloadLastZip { directory } => {
-            let body = match directory {
-                Some(directory) => serde_json::json!({ "directory": directory }).to_string(),
-                None => "{}".to_string(),
+        Commands::DownloadLastZip { directory, extract_to } => {
+            let cwd = std::env::current_dir()?;
+            let absolute = |value: Option<PathBuf>| -> Option<PathBuf> {
+                value.map(|path| if path.is_absolute() { path } else { cwd.join(path) })
             };
+            let body = serde_json::json!({
+                "directory": absolute(directory),
+                "extract_to": absolute(extract_to),
+            }).to_string();
             let response = watcher_request("POST", "/download-last-zip", Some(&body))?;
             let value: serde_json::Value = serde_json::from_str(&response)?;
             println!("{}", value.get("path").and_then(|v| v.as_str()).unwrap_or("download complete"));
+            if let Some(destination) = value.get("extracted_to").and_then(|v| v.as_str()) {
+                println!("extracted to {destination}");
+            }
         }
         Commands::History {
             chat,
@@ -722,5 +893,14 @@ mod cli_completion_tests {
     fn download_last_zip_is_exposed_to_clap_shell_completions() {
         let command = Cli::command();
         assert!(command.find_subcommand("download-last-zip").is_some());
+    }
+
+    #[test]
+    fn hook_management_is_exposed_to_clap_shell_completions() {
+        let command = Cli::command();
+        let hook = command.find_subcommand("hook").expect("hook command");
+        assert!(hook.find_subcommand("set").is_some());
+        assert!(hook.find_subcommand("list").is_some());
+        assert!(hook.find_subcommand("remove").is_some());
     }
 }
