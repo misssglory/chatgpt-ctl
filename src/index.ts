@@ -189,6 +189,39 @@ type ChatHook = {
   enabled: boolean;
 };
 
+async function ensureRetrySchema(sql: Sql): Promise<void> {
+  await sql.unsafe(`
+    CREATE TABLE IF NOT EXISTS chat_retry_settings (
+      chat_id uuid PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+      enabled boolean NOT NULL DEFAULT false,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+}
+
+async function isAutoRetryEnabled(sql: Sql, chatId: string): Promise<boolean> {
+  const rows = await sql`
+    SELECT enabled FROM chat_retry_settings WHERE chat_id = ${chatId}::uuid
+  `;
+  return rows.length > 0 && Boolean(rows[0]!.enabled);
+}
+
+/** Click only the last visible exact-name Retry button, which is the end-of-thread action. */
+async function clickRetryAtConversationEnd(page: Page, chatId: string): Promise<boolean> {
+  if (normalizeUuid(page.url()) !== chatId) return false;
+  const buttons = page.getByRole("button", { name: "Retry", exact: true });
+  const count = await buttons.count();
+  for (let index = count - 1; index >= 0; index--) {
+    const button = buttons.nth(index);
+    if (!(await button.isVisible().catch(() => false))) continue;
+    if (!(await button.isEnabled().catch(() => false))) continue;
+    await button.click({ timeout: 3000 });
+    log.info(`[retry] clicked end-of-conversation Retry button for chat=${chatId}`);
+    return true;
+  }
+  return false;
+}
+
 async function ensureHookSchema(sql: Sql): Promise<void> {
   await sql.unsafe(`
     CREATE TABLE IF NOT EXISTS chat_hooks (
@@ -1154,28 +1187,129 @@ async function runHookForZip(
   }
 }
 
-function startControlServer(page: Page, cfg: Config, configPath: string) {
+async function runHookWithLastZip(
+  page: Page,
+  chatId: string,
+  hook: ChatHook,
+  cfg: Config,
+  configPath: string
+): Promise<string> {
+  const targetUrl = new URL(`/c/${chatId}`, cfg.chatgpt.url).toString();
+  if (normalizeUuid(page.url()) !== chatId) {
+    await page.goto(targetUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: cfg.browser?.navigation_timeout_ms ?? 45_000,
+    });
+    await page.waitForTimeout(1200);
+  }
+  const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
+  const archive = await downloadLastZip(page, archiveDir);
+  await runHookForZip(page, chatId, hook, archive, configPath);
+  return archive;
+}
+
+function openConversationPages(context: BrowserContext): Array<{ page: Page; chatId: string }> {
+  const seen = new Set<string>();
+  const result: Array<{ page: Page; chatId: string }> = [];
+  for (const page of context.pages()) {
+    if (page.isClosed()) continue;
+    const chatId = normalizeUuid(page.url());
+    if (!chatId || seen.has(chatId)) continue;
+    seen.add(chatId);
+    result.push({ page, chatId });
+  }
+  return result;
+}
+
+function startControlServer(
+  context: BrowserContext,
+  getActivePage: () => Page,
+  setActivePage: (page: Page) => void,
+  cfg: Config,
+  configPath: string,
+  sql: Sql
+) {
   const server = Bun.serve({
     hostname: CONTROL_HOST,
     port: CONTROL_PORT,
     async fetch(request) {
       const url = new URL(request.url);
+      const opened = openConversationPages(context);
       if (request.method === "GET" && url.pathname === "/status") {
-        return Response.json({ chat_id: normalizeUuid(page.url()), url: page.url() });
+        const active = getActivePage();
+        return Response.json({
+          chat_id: normalizeUuid(active.url()),
+          chat_ids: opened.map((item) => item.chatId),
+          url: active.url(),
+        });
       }
       if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
       try {
-        const body = await request.json().catch(() => ({})) as { chat_id?: string; directory?: string; extract_to?: string; text?: string; files?: string[] };
+        const body = await request.json().catch(() => ({})) as {
+          chat_id?: string; chat?: string; directory?: string; extract_to?: string;
+          text?: string; files?: string[];
+        };
         if (url.pathname === "/open") {
           const chatId = normalizeUuid(body.chat_id || "");
           if (!chatId) return Response.json({ error: "invalid chat_id" }, { status: 400 });
+          let page = opened.find((item) => item.chatId === chatId)?.page;
+          const alreadyOpen = Boolean(page);
+          if (!page) {
+            page = await context.newPage();
+            attachNetworkDebug(page, cfg);
+          }
+          setActivePage(page);
           const target = new URL(`/c/${chatId}`, cfg.chatgpt.url).toString();
-          await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
-          return Response.json({ ok: true, chat_id: chatId, url: target });
+          if (normalizeUuid(page.url()) !== chatId) {
+            await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
+          }
+          await page.bringToFront();
+          return Response.json({ ok: true, chat_id: chatId, url: target, already_open: alreadyOpen, pane_index: openConversationPages(context).findIndex((item) => item.chatId === chatId) });
+        }
+        if (url.pathname === "/close") {
+          const selector = (body.chat || body.chat_id || "").trim();
+          if (!selector) return Response.json({ error: "close requires a chat UUID, title, or 0-based pane index" }, { status: 400 });
+          const panes = openConversationPages(context);
+          let target = panes.find((item) => item.chatId === normalizeUuid(selector));
+          if (!target && /^[0-9a-f-]{4,}$/i.test(selector)) {
+            const prefix = selector.toLowerCase();
+            const prefixMatches = panes.filter((item) => item.chatId.startsWith(prefix));
+            if (prefixMatches.length === 1) target = prefixMatches[0];
+            else if (prefixMatches.length > 1) {
+              return Response.json({ error: `id prefix matches multiple opened chats: ${prefixMatches.map((item) => item.chatId).join(", ")}` }, { status: 409 });
+            }
+          }
+          if (!target && /^\d+$/.test(selector)) target = panes[Number(selector)];
+          if (!target) {
+            const matches = await sql`
+              SELECT id FROM chats WHERE title ILIKE ${`%${selector}%`}
+              ORDER BY updated_at DESC NULLS LAST LIMIT 10
+            `;
+            const ids = new Set(matches.map((row: any) => String(row.id).toLowerCase()));
+            const matchingPanes = panes.filter((item) => ids.has(item.chatId));
+            if (matchingPanes.length > 1) {
+              return Response.json({ error: `title matches multiple opened chats: ${matchingPanes.map((item) => item.chatId).join(", ")}` }, { status: 409 });
+            }
+            target = matchingPanes[0];
+          }
+          if (!target) return Response.json({ error: `no opened chat matches '${selector}'` }, { status: 404 });
+          const closedId = target.chatId;
+          const wasActive = target.page === getActivePage();
+          await target.page.close();
+          const remaining = openConversationPages(context);
+          if (wasActive || getActivePage().isClosed()) {
+            let next = remaining[0]?.page ?? context.pages().find((candidate) => !candidate.isClosed() && !normalizeUuid(candidate.url()));
+            if (!next) {
+              next = await context.newPage();
+              await openChatGPT(next, cfg);
+            }
+            setActivePage(next);
+            await next.bringToFront();
+          }
+          return Response.json({ ok: true, closed_chat_id: closedId, chat_ids: openConversationPages(context).map((item) => item.chatId) });
         }
         if (url.pathname === "/new-chat") {
-          // ChatGPT's root route opens the blank composer; unlike /c/<uuid>,
-          // it does not bind the browser to an existing conversation.
+          const page = getActivePage();
           const target = new URL("/", cfg.chatgpt.url).toString();
           await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
           await page.waitForTimeout(1000);
@@ -1184,6 +1318,19 @@ function startControlServer(page: Page, cfg: Config, configPath: string) {
             return Response.json({ error: `ChatGPT redirected away from the new-chat URL: ${finalUrl}`, url: finalUrl }, { status: 409 });
           }
           return Response.json({ ok: true, url: finalUrl });
+        }
+        const requestedChatId = normalizeUuid(body.chat_id || "");
+        const page = requestedChatId
+          ? openConversationPages(context).find((item) => item.chatId === requestedChatId)?.page
+          : getActivePage();
+        if (!page) return Response.json({ error: `chat ${requestedChatId} is not open in a watcher pane` }, { status: 404 });
+        if (url.pathname === "/hook/run") {
+          const chatId = requestedChatId;
+          if (!chatId) return Response.json({ error: "valid chat_id is required" }, { status: 400 });
+          const hook = await loadChatHook(sql, chatId);
+          if (!hook) return Response.json({ error: `no hook configured for ${chatId}` }, { status: 404 });
+          const archive = await runHookWithLastZip(page, chatId, hook, cfg, configPath);
+          return Response.json({ ok: true, chat_id: chatId, archive, url: page.url() });
         }
         if (url.pathname === "/download-last-zip") {
           const directory = body.directory
@@ -1210,13 +1357,14 @@ function startControlServer(page: Page, cfg: Config, configPath: string) {
           return Response.json({ ok: true, path: saved });
         }
         if (url.pathname === "/send") {
-          const chatId = normalizeUuid(body.chat_id || "");
           const text = body.text || "";
           const files = Array.isArray(body.files) ? body.files.map((file) => path.resolve(file)) : [];
           if (!text.trim() && files.length === 0) return Response.json({ error: "text or at least one file is required" }, { status: 400 });
           for (const file of files) await access(file, constants.R_OK);
-          await sendInPage(page, text, chatId || undefined, files);
-          return Response.json({ ok: true, chat_id: chatId, url: page.url() });
+          await sendInPage(page, text, requestedChatId || undefined, files);
+          setActivePage(page);
+          await page.bringToFront();
+          return Response.json({ ok: true, chat_id: normalizeUuid(page.url()), url: page.url() });
         }
         return new Response("not found", { status: 404 });
       } catch (error) {
@@ -1232,15 +1380,17 @@ function startControlServer(page: Page, cfg: Config, configPath: string) {
 async function watch(cfg: Config, configPath: string) {
   const sql = openDb(cfg);
   await ensureHookSchema(sql);
+  await ensureRetrySchema(sql);
   const pollMs = Math.max(500, cfg.chatgpt.poll_ms ?? 1500);
   const settleMs = cfg.chatgpt.complete_settle_ms ?? 800;
   const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false);
-  // Track when we first saw a message as incomplete (for settle debounce)
   const prevIncomplete = new Map<string, number>();
-  let lastChatId = "";
+  const lastSeenChatByPage = new WeakMap<Page, string>();
+  let activePage: Page;
   let controlServer: ReturnType<typeof Bun.serve> | undefined;
   const handledHookDownloads = new Set<string>();
   const initializedHookChats = new Set<string>();
+  const retryClickCooldowns = new Map<string, number>();
 
   const stop = async () => {
     log.info("\n[watch] stopping...");
@@ -1253,64 +1403,82 @@ async function watch(cfg: Config, configPath: string) {
   process.on("SIGTERM", stop);
 
   try {
-    const page = await getPage(context);
-    attachNetworkDebug(page, cfg);
-    await openChatGPT(page, cfg);
-    controlServer = startControlServer(page, cfg, configPath);
-    const sidebarChats = await syncSidebarChats(page, sql, true);
+    activePage = await getPage(context);
+    attachNetworkDebug(activePage, cfg);
+    await openChatGPT(activePage, cfg);
+    controlServer = startControlServer(context, () => activePage, (page) => { activePage = page; }, cfg, configPath, sql);
+    const sidebarChats = await syncSidebarChats(activePage, sql, true);
     log.info(`[watch] synchronized ${sidebarChats.length} sidebar chats`);
-    log.info(
-      `[watch] poll=${pollMs}ms settle=${settleMs}ms ` +
-        `conversation=${cfg.chatgpt.conversation_id || "(follow current)"}`
-    );
+    log.info(`[watch] poll=${pollMs}ms settle=${settleMs}ms multi-pane enabled`);
 
     while (true) {
       try {
-        // Refresh visible rows on every tick so renamed titles reach the DB.
-        await syncSidebarChats(page, sql, false);
-        // If user navigated to another chat, pick it up
-        const chat = await scrapeCurrentChat(page);
-        if (!chat) {
-          log.debug("[watch] no chat visible (login wall or empty home?)");
-        } else {
-          if (chat.id !== lastChatId) {
-            log.info(`[watch] active chat=${chat.id} title="${chat.title}"`);
-            lastChatId = chat.id;
-            prevIncomplete.clear();
-          }
-          await persistChat(sql, chat, settleMs, prevIncomplete);
-          // Read hook configuration from PostgreSQL every poll so ctl changes
-          // take effect without editing config.toml or restarting the watcher.
-          const hook = await loadChatHook(sql, chat.id);
-          if (hook && hook.enabled) {
-            const targets = await findZipTargets(page);
-            if (!initializedHookChats.has(chat.id)) {
-              // Existing attachments are history, not newly arrived ZIPs.
-              for (const target of targets) {
-                handledHookDownloads.add(`${chat.id}:${target.identity}`);
-              }
-              initializedHookChats.add(chat.id);
-              log.info(`[hook] initialized ZIP baseline for chat=${chat.id} (${targets.length} existing attachments)`);
-            }
-            for (const target of targets) {
-              const hookKey = `${chat.id}:${target.identity}`;
-              if (handledHookDownloads.has(hookKey)) continue;
-              // Mark before running: a failed automation must not repeatedly process each poll.
-              handledHookDownloads.add(hookKey);
-              try {
-                const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
-                const archive = await downloadZipTarget(page, target, archiveDir);
-                await runHookForZip(page, chat.id, hook, archive, configPath);
-              } catch (hookError) {
-                log.error(`[hook] chat=${chat.id} failed: ${formatError(hookError)}`);
-              }
-            }
-          }
+        let pages = context.pages().filter((page) => !page.isClosed());
+        if (!pages.includes(activePage)) {
+          activePage = pages[0] ?? await context.newPage();
+          if (pages.length === 0) await openChatGPT(activePage, cfg);
+          pages = context.pages().filter((page) => !page.isClosed());
         }
+        // Refresh sidebar metadata once per tick; any live pane can expose it.
+        if (pages.length) await syncSidebarChats(activePage, sql, false);
+
+        await Promise.all(pages.map(async (page) => {
+          try {
+            const chat = await scrapeCurrentChat(page);
+            if (!chat) return;
+            const previousId = lastSeenChatByPage.get(page);
+            if (chat.id !== previousId) {
+              log.info(`[watch] pane chat=${chat.id} title="${chat.title}"`);
+              lastSeenChatByPage.set(page, chat.id);
+            }
+            await persistChat(sql, chat, settleMs, prevIncomplete);
+
+            if (await isAutoRetryEnabled(sql, chat.id)) {
+              const now = Date.now();
+              const lastClick = retryClickCooldowns.get(chat.id) ?? 0;
+              if (now - lastClick >= 30_000) {
+                try {
+                  const clicked = await clickRetryAtConversationEnd(page, chat.id);
+                  if (clicked) retryClickCooldowns.set(chat.id, now);
+                  else retryClickCooldowns.delete(chat.id);
+                } catch (retryError) {
+                  retryClickCooldowns.set(chat.id, now);
+                  log.warn(`[retry] chat=${chat.id} click failed: ${formatError(retryError)}`);
+                }
+              }
+            } else {
+              retryClickCooldowns.delete(chat.id);
+            }
+
+            const hook = await loadChatHook(sql, chat.id);
+            if (hook && hook.enabled) {
+              const targets = await findZipTargets(page);
+              if (!initializedHookChats.has(chat.id)) {
+                for (const target of targets) handledHookDownloads.add(`${chat.id}:${target.identity}`);
+                initializedHookChats.add(chat.id);
+                log.info(`[hook] initialized ZIP baseline for chat=${chat.id} (${targets.length} existing attachments)`);
+              }
+              for (const target of targets) {
+                const hookKey = `${chat.id}:${target.identity}`;
+                if (handledHookDownloads.has(hookKey)) continue;
+                handledHookDownloads.add(hookKey);
+                try {
+                  const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
+                  const archive = await downloadZipTarget(page, target, archiveDir);
+                  await runHookForZip(page, chat.id, hook, archive, configPath);
+                } catch (hookError) {
+                  log.error(`[hook] chat=${chat.id} failed: ${formatError(hookError)}`);
+                }
+              }
+            }
+          } catch (pageError) {
+            log.error(`[watch] pane scan failed url=${page.url()}: ${formatError(pageError)}`);
+          }
+        }));
       } catch (error) {
         log.error(`[watch] scan failed:\n${formatError(error)}`);
       }
-      await page.waitForTimeout(pollMs);
+      await activePage.waitForTimeout(pollMs).catch(() => new Promise((resolve) => setTimeout(resolve, pollMs)));
     }
   } catch (error) {
     log.error(`[watch] fatal:\n${formatError(error)}`);

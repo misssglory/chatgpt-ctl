@@ -57,13 +57,18 @@ enum Commands {
         files: Vec<PathBuf>,
     },
 
-    /// Open a chat in the active watcher browser pane by UUID or title.
+    /// Open a chat in its own watcher browser pane (reuse its pane if already open).
     ///
-    /// With no CHAT argument, enters an interactive prompt with DB-backed
-    /// autocomplete on chat titles and UUIDs.
+    /// With no CHAT argument, enters an interactive prompt with DB-backed autocomplete.
     Open {
         /// Chat UUID, title substring, or "current"
         chat: Option<String>,
+    },
+
+    /// Close an opened chat pane by UUID, unique title substring, or 0-based pane index.
+    Close {
+        /// Chat UUID, title substring, or 0-based index from `chatgpt-ctl chats`
+        chat: String,
     },
 
     /// Navigate the active ChatGPT pane to a blank new chat (URL has no conversation UUID).
@@ -112,6 +117,14 @@ enum Commands {
         json: bool,
     },
 
+    /// Enable or disable automatic clicking of a Retry button at the end of a chat
+    Retry {
+        /// Chat UUID or unique title substring
+        chat: String,
+        /// Whether automatic retry clicking is enabled
+        mode: RetryMode,
+    },
+
     /// Manage per-conversation ZIP/build automation hooks (stored in PostgreSQL)
     Hook {
         #[command(subcommand)]
@@ -157,12 +170,21 @@ enum HookAction {
     List,
     /// Show one chat's hook
     Show { chat: String },
+    /// Manually run a hook using the newest ZIP attachment in that conversation
+    #[command(alias = "trigger")]
+    Run { chat: String },
     /// Enable a hook
     Enable { chat: String },
     /// Disable a hook without deleting it
     Disable { chat: String },
     /// Remove a hook
     Remove { chat: String },
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum RetryMode {
+    Enable,
+    Disable,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -328,6 +350,32 @@ async fn resolve_chat_id(client: &Client, spec: &str) -> Result<Uuid> {
     Ok(rows[0].get(0))
 }
 
+async fn ensure_retry_table(client: &Client) -> Result<()> {
+    client.execute(
+        r#"CREATE TABLE IF NOT EXISTS chat_retry_settings (
+             chat_id uuid PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+             enabled boolean NOT NULL DEFAULT false,
+             updated_at timestamptz NOT NULL DEFAULT now()
+           )"#,
+        &[],
+    ).await?;
+    Ok(())
+}
+
+async fn set_retry_setting(client: &Client, chat: &str, mode: RetryMode) -> Result<()> {
+    ensure_retry_table(client).await?;
+    let id = resolve_chat_id(client, chat).await?;
+    let enabled = matches!(mode, RetryMode::Enable);
+    client.execute(
+        r#"INSERT INTO chat_retry_settings (chat_id, enabled, updated_at)
+           VALUES ($1, $2, now())
+           ON CONFLICT (chat_id) DO UPDATE SET enabled=EXCLUDED.enabled, updated_at=now()"#,
+        &[&id, &enabled],
+    ).await?;
+    println!("automatic Retry clicking {} for {id}", if enabled { "enabled" } else { "disabled" });
+    Ok(())
+}
+
 async fn ensure_hook_table(client: &Client) -> Result<()> {
     client.execute(
         r#"
@@ -403,6 +451,18 @@ async fn run_hook_action(client: &Client, action: HookAction) -> Result<()> {
             let row = client.query_opt("SELECT folder, child_folder, nix_flake, clipboard_command, enabled FROM chat_hooks WHERE chat_id=$1", &[&id]).await?.context("no hook configured for this chat")?;
             let command: serde_json::Value = row.get(3);
             println!("chat: {id}\nfolder: {}\nchild_folder: {}\nnix_flake: {}\nenabled: {}\nclipboard_command: {}", row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, bool>(2), row.get::<_, bool>(4), command);
+        }
+        HookAction::Run { chat } => {
+            let id = resolve_chat_id(client, &chat).await?;
+            let body = serde_json::json!({ "chat_id": id }).to_string();
+            let response = watcher_request("POST", "/hook/run", Some(&body))
+                .context("could not trigger hook; is `bun run watch` running?")?;
+            let value: serde_json::Value = serde_json::from_str(&response)?;
+            if let Some(path) = value.get("archive").and_then(|v| v.as_str()) {
+                println!("hook completed for {id}: {path}");
+            } else {
+                println!("hook completed for {id}");
+            }
         }
         HookAction::Enable { chat } => {
             let id = resolve_chat_id(client, &chat).await?;
@@ -679,29 +739,13 @@ async fn follow_history(
 }
 
 
-/// Ask the long-running Bun watcher to navigate its existing browser pane.
-fn request_active_pane_open(chat_id: Uuid) -> Result<()> {
-    let address = std::env::var("CHATGPT_CTL_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:17381".to_string());
-    let mut stream = TcpStream::connect(&address)
-        .with_context(|| format!("connect to watcher control server at {address}; start `bun run watch` from the repository root"))?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(50)))?;
-    let body = serde_json::json!({ "chat_id": chat_id }).to_string();
-    write!(
-        stream,
-        "POST /open HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    )?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    let status = response.lines().next().unwrap_or_default();
-    if !status.contains(" 200 ") {
-        let message = response.split("\r\n\r\n").nth(1).unwrap_or("watcher rejected open request");
-        anyhow::bail!("watcher open failed ({status}): {message}");
-    }
-    println!("opened {chat_id} in the active ChatGPT pane");
-    Ok(())
+/// Return every conversation UUID currently open in a watcher browser pane.
+fn watcher_open_chats() -> Vec<Uuid> {
+    let Ok(response) = watcher_request("GET", "/status", None) else { return Vec::new() };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&response) else { return Vec::new() };
+    value.get("chat_ids").and_then(|v| v.as_array()).into_iter().flatten()
+        .filter_map(|item| item.as_str()?.parse().ok())
+        .collect()
 }
 
 fn watcher_request(method: &str, path: &str, body: Option<&str>) -> Result<String> {
@@ -723,17 +767,6 @@ fn watcher_request(method: &str, path: &str, body: Option<&str>) -> Result<Strin
     Ok(body.to_string())
 }
 
-fn watcher_active_chat() -> Option<Uuid> {
-    let address = std::env::var("CHATGPT_CTL_ADDR").unwrap_or_else(|_| "127.0.0.1:17381".into());
-    let mut stream = TcpStream::connect(address).ok()?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok()?;
-    stream.write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").ok()?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response).ok()?;
-    let body = response.split_once("\r\n\r\n")?.1;
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    value.get("chat_id")?.as_str()?.parse().ok()
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -744,6 +777,10 @@ async fn main() -> Result<()> {
         .unwrap_or_else(default_database_url);
 
     match cli.command {
+        Commands::Retry { chat, mode } => {
+            let client = connect(&url).await?;
+            set_retry_setting(&client, &chat, mode).await?;
+        }
         Commands::Hook { action } => {
             let client = connect(&url).await?;
             run_hook_action(&client, action).await?;
@@ -763,15 +800,30 @@ async fn main() -> Result<()> {
                 run_watcher(&watcher_args("sync-chats", &["--quiet".to_string()]))?;
             }
             let client = connect(&url).await?;
-            let chats = list_chats(&client, limit, query.as_deref()).await?;
-            let active_chat = watcher_active_chat();
+            let mut chats = list_chats(&client, limit, query.as_deref()).await?;
+            let open_chats = watcher_open_chats();
+            // Include open panes even when their conversations fall outside --limit.
+            if query.is_none() {
+                for id in &open_chats {
+                    if chats.iter().any(|chat| chat.id == *id) { continue; }
+                    if let Some(row) = client.query_opt(
+                        r#"SELECT c.id, c.title, c.updated_at,
+                                  (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id)
+                           FROM chats c WHERE c.id = $1"#,
+                        &[id],
+                    ).await? {
+                        chats.push(ChatRow { id: row.get(0), title: row.get(1), updated_at: row.get(2), message_count: row.get(3) });
+                    }
+                }
+            }
             for c in chats {
                 let ts = c
                     .updated_at
                     .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or_else(|| "-".into());
-                if active_chat == Some(c.id) {
-                    println!("\x1b[1;36m● {}\t{:>4} msgs\t{}\t{}\x1b[0m", c.id, c.message_count, ts, c.title);
+                let pane_index = open_chats.iter().position(|id| *id == c.id);
+                if let Some(pane_index) = pane_index {
+                    println!("\x1b[1;36m● [{pane_index}] {}\t{:>4} msgs\t{}\t{}\x1b[0m", c.id, c.message_count, ts, c.title);
                 } else {
                     println!("  {}\t{:>4} msgs\t{}\t{}", c.id, c.message_count, ts, c.title);
                 }
@@ -803,7 +855,22 @@ async fn main() -> Result<()> {
                 Some(spec) => resolve_chat_id(&client, &spec).await?,
                 None => interactive_open(&client).await?,
             };
-            request_active_pane_open(chat_id)?;
+            let body = serde_json::json!({ "chat_id": chat_id }).to_string();
+            let response = watcher_request("POST", "/open", Some(&body))?;
+            let value: serde_json::Value = serde_json::from_str(&response)?;
+            let already_open = value.get("already_open").and_then(|v| v.as_bool()).unwrap_or(false);
+            let pane_index = value.get("pane_index").and_then(|v| v.as_i64());
+            if already_open {
+                println!("focused existing pane{} for {chat_id}", pane_index.map(|i| format!(" [{i}] ")).unwrap_or_else(|| " ".into()));
+            } else {
+                println!("opened {chat_id} in a new pane{}", pane_index.map(|i| format!(" [{i}] ")).unwrap_or_default());
+            }
+        }
+        Commands::Close { chat } => {
+            let body = serde_json::json!({ "chat": &chat }).to_string();
+            let response = watcher_request("POST", "/close", Some(&body))?;
+            let value: serde_json::Value = serde_json::from_str(&response)?;
+            println!("closed {}", value.get("closed_chat_id").and_then(|v| v.as_str()).unwrap_or(&chat));
         }
         Commands::NewChat => {
             let response = watcher_request("POST", "/new-chat", Some("{}"))?;
@@ -902,5 +969,18 @@ mod cli_completion_tests {
         assert!(hook.find_subcommand("set").is_some());
         assert!(hook.find_subcommand("list").is_some());
         assert!(hook.find_subcommand("remove").is_some());
+    }
+
+    #[test]
+    fn automatic_retry_command_is_exposed_to_clap_shell_completions() {
+        assert!(Cli::command().find_subcommand("retry").is_some());
+    }
+
+    #[test]
+    fn multi_pane_commands_are_exposed_to_clap_shell_completions() {
+        let command = Cli::command();
+        assert!(command.find_subcommand("open").is_some());
+        assert!(command.find_subcommand("close").is_some());
+        assert!(command.find_subcommand("chats").is_some());
     }
 }
