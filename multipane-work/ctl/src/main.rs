@@ -53,8 +53,11 @@ enum Commands {
         /// Optional message text (quote text containing spaces); may be omitted when attaching files
         text: Option<String>,
         /// Target chat UUID or title substring (opens a pane if necessary)
-        #[arg(short = 'c', long = "chat", value_name = "CHAT")]
+        #[arg(short = 'c', long = "chat", value_name = "CHAT", conflicts_with = "new_chat")]
         chat: Option<String>,
+        /// Create a separate blank chat, send the first message, and return its new conversation UUID
+        #[arg(long = "new-chat", alias = "new", conflicts_with = "chat")]
+        new_chat: bool,
         /// File to upload; repeat for multiple attachments
         #[arg(short = 'f', long = "file", value_name = "PATH")]
         files: Vec<PathBuf>,
@@ -832,7 +835,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Send { text, chat, files } => {
+        Commands::Send { text, chat, files, new_chat } => {
             let text = text.unwrap_or_default();
             if text.trim().is_empty() && files.is_empty() {
                 anyhow::bail!("send: provide message text or at least one --file attachment");
@@ -852,13 +855,18 @@ async fn main() -> Result<()> {
             }
             let body = serde_json::json!({
                 "chat_id": chat_id,
+                "new_chat": new_chat,
                 "text": text,
                 "files": resolved_files,
             }).to_string();
             let response = watcher_request("POST", "/send", Some(&body))?;
             let value: serde_json::Value = serde_json::from_str(&response)?;
             let destination = value.get("chat_id").and_then(|v| v.as_str()).unwrap_or("focused chat");
-            println!("message sent to {destination} ({})", value.get("url").and_then(|v| v.as_str()).unwrap_or("ChatGPT pane"));
+            if new_chat {
+                println!("message sent to new chat {destination} ({})", value.get("url").and_then(|v| v.as_str()).unwrap_or("ChatGPT pane"));
+            } else {
+                println!("message sent to {destination} ({})", value.get("url").and_then(|v| v.as_str()).unwrap_or("ChatGPT pane"));
+            }
         }
         Commands::Open { chat } => {
             let client = connect(&url).await?;
@@ -1001,9 +1009,24 @@ mod cli_completion_tests {
             "chatgpt-ctl", "send", "hello", "--chat", "NixOS Wayland",
         ]).expect("send with --chat should parse");
         match cli.command {
-            Commands::Send { text, chat, .. } => {
+            Commands::Send { text, chat, new_chat, .. } => {
                 assert_eq!(text.as_deref(), Some("hello"));
                 assert_eq!(chat.as_deref(), Some("NixOS Wayland"));
+                assert!(!new_chat);
+            }
+            _ => panic!("expected send command"),
+        }
+    }
+
+    #[test]
+    fn send_can_create_a_new_chat() {
+        let cli = Cli::try_parse_from(["chatgpt-ctl", "send", "--new-chat", "first prompt"])
+            .expect("send --new-chat should parse");
+        match cli.command {
+            Commands::Send { text, chat, new_chat, .. } => {
+                assert_eq!(text.as_deref(), Some("first prompt"));
+                assert!(chat.is_none());
+                assert!(new_chat);
             }
             _ => panic!("expected send command"),
         }

@@ -904,8 +904,9 @@ async function dump(cfg: Config, configPath: string) {
   }
 }
 
-async function persistChat(sql: Sql, chat: ScrapedChat, settleMs: number, prevIncomplete: Map<string, number>) {
+async function persistChat(sql: Sql, chat: ScrapedChat, settleMs: number, prevIncomplete: Map<string, number>): Promise<Set<string>> {
   await upsertChat(sql, chat);
+  const newlyCompletedAssistantMessages = new Set<string>();
   for (const msg of chat.messages) {
     // Debounce completion: if just flipped to completed, wait settleMs
     if (msg.completed && prevIncomplete.has(msg.id)) {
@@ -922,6 +923,9 @@ async function persistChat(sql: Sql, chat: ScrapedChat, settleMs: number, prevIn
     }
 
     const status = await upsertMessage(sql, chat.id, msg);
+    if (msg.role === "assistant" && msg.completed && (status === "inserted" || status === "completed")) {
+      newlyCompletedAssistantMessages.add(msg.id);
+    }
     if (status === "inserted" || status === "completed") {
       log.info(
         `[persist] ${status} chat=${chat.id.slice(0, 8)} ${msg.role} ` +
@@ -929,6 +933,7 @@ async function persistChat(sql: Sql, chat: ScrapedChat, settleMs: number, prevIn
       );
     }
   }
+  return newlyCompletedAssistantMessages;
 }
 
 async function once(cfg: Config, configPath: string) {
@@ -961,7 +966,7 @@ function safeFilename(raw: string): string {
   return leaf && leaf.toLowerCase().endsWith(".zip") ? leaf : `${leaf || "chatgpt-download"}.zip`;
 }
 
-type ZipTarget = { index: number; label: string; selector: string; kind: "link" | "card"; messageOrder: number | null; identity: string };
+type ZipTarget = { index: number; label: string; selector: string; kind: "link" | "card"; messageOrder: number | null; messageId: string | null; identity: string };
 
 /**
  * ChatGPT renders assistant-generated files as DIL pressables (`role=link`),
@@ -995,14 +1000,22 @@ async function findZipTargets(page: Page): Promise<ZipTarget[]> {
       // for either of the conversation search-unit attributes.
       let ancestor: HTMLElement | null = el;
       let messageOrder: number | null = null;
-      let messageId = "";
+      // Prefer the same message UUID used by the history scraper. This makes
+      // attachment identity independent of DOM order and repeated scans.
+      const messageUnit = el.closest("[data-chatgpt-search-message-ids]");
+      const rawMessageIds = messageUnit?.getAttribute("data-chatgpt-search-message-ids") || "";
+      let messageId = rawMessageIds.split(/\s+/).map((value) =>
+        value.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)?.[0] || ""
+      ).find(Boolean) || "";
       while (ancestor) {
+        // Older ChatGPT DOM variants may not expose the search-message id.
+        // Fall back to stable message metadata, never to a volatile element index.
         if (!messageId) {
-          messageId =
+          const fallbackId =
             ancestor.getAttribute("data-dil-message-id") ||
             ancestor.getAttribute("data-dil-source-message-id") ||
-            ancestor.getAttribute("data-chatgpt-selection-message-id") ||
-            "";
+            ancestor.getAttribute("data-chatgpt-selection-message-id") || "";
+          messageId = fallbackId.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)?.[0] || "";
         }
         if (messageOrder === null) {
           const keys = [
@@ -1020,13 +1033,15 @@ async function findZipTargets(page: Page): Promise<ZipTarget[]> {
         ancestor = ancestor.parentElement;
       }
       const cleanLabel = label.replace(/^Open\s+Download\s+/i, "").trim();
+      const stableMessageId = messageId.toLowerCase();
       result.push({
         index,
         label: cleanLabel,
         selector,
         kind: isLink ? "link" : "card",
         messageOrder,
-        identity: `${messageId || `turn-${messageOrder ?? "unknown"}-index-${index}`}|${cleanLabel}`,
+        messageId: stableMessageId || null,
+        identity: `${stableMessageId || `turn-${messageOrder ?? "unknown"}`}|${cleanLabel}`,
       });
     });
     return result;
@@ -1273,7 +1288,7 @@ function startControlServer(
       try {
         const body = await request.json().catch(() => ({})) as {
           chat_id?: string; chat?: string; directory?: string; extract_to?: string;
-          text?: string; files?: string[];
+          text?: string; files?: string[]; new_chat?: boolean;
         };
         if (url.pathname === "/open") {
           const chatId = normalizeUuid(body.chat_id || "");
@@ -1352,7 +1367,18 @@ function startControlServer(
           for (const file of files) await access(file, constants.R_OK);
           const requestedChatId = normalizeUuid(body.chat_id || "");
           let page: Page;
-          if (requestedChatId) {
+          if (body.new_chat) {
+            if (requestedChatId) return Response.json({ error: "new_chat cannot be combined with chat_id" }, { status: 400 });
+            // A new chat always gets its own pane; do not disturb existing chats.
+            page = await context.newPage();
+            attachNetworkDebug(page, cfg);
+            await page.goto(new URL("/", cfg.chatgpt.url).toString(), {
+              waitUntil: "domcontentloaded",
+              timeout: cfg.browser?.navigation_timeout_ms ?? 45_000,
+            });
+            await page.locator('#prompt-textarea, [data-composer-markdown][contenteditable="true"], [contenteditable="true"][role="textbox"], textarea').first()
+              .waitFor({ state: "visible", timeout: 30_000 });
+          } else if (requestedChatId) {
             page = openConversationPages(context).find((item) => item.chatId === requestedChatId)?.page
               ?? await context.newPage();
             attachNetworkDebug(page, cfg);
@@ -1370,9 +1396,32 @@ function startControlServer(
             }
           }
           await sendInPage(page, text, undefined, files);
+          if (body.new_chat) {
+            // ChatGPT assigns the conversation UUID after the first message is
+            // submitted. Wait for that route before reporting success to ctl.
+            await page.waitForFunction(() =>
+              /\/c\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(location.pathname),
+              null,
+              { timeout: 45_000 },
+            );
+          }
           setActivePage(page);
           await page.bringToFront();
-          return Response.json({ ok: true, chat_id: normalizeUuid(page.url()), url: page.url() });
+          const acquiredChatId = normalizeUuid(page.url());
+          if (body.new_chat && !acquiredChatId) {
+            return Response.json({ error: "message was sent but ChatGPT did not expose a conversation UUID yet", url: page.url() }, { status: 504 });
+          }
+          if (body.new_chat && acquiredChatId) {
+            // Persist the newly assigned ID and first user message immediately,
+            // rather than making the CLI wait for the next background poll.
+            await page.waitForTimeout(300);
+            const firstSnapshot = await scrapeCurrentChat(page).catch(() => null);
+            if (firstSnapshot?.id === acquiredChatId) {
+              await upsertChat(sql, firstSnapshot);
+              for (const message of firstSnapshot.messages) await upsertMessage(sql, acquiredChatId, message);
+            }
+          }
+          return Response.json({ ok: true, chat_id: acquiredChatId, url: page.url(), new_chat: Boolean(body.new_chat) });
         }
 
         const requestedChatId = normalizeUuid(body.chat_id || "");
@@ -1436,6 +1485,9 @@ async function watch(cfg: Config, configPath: string) {
   let controlServer: ReturnType<typeof Bun.serve> | undefined;
   const handledHookDownloads = new Set<string>();
   const initializedHookChats = new Set<string>();
+  // Newly completed assistant message ids are retained briefly because the
+  // downloadable ZIP control can render a poll or two after its message.
+  const pendingHookMessages = new Map<string, Map<string, number>>();
   const retryClickCooldowns = new Map<string, number>();
 
   const stop = async () => {
@@ -1478,7 +1530,9 @@ async function watch(cfg: Config, configPath: string) {
               log.info(`[watch] pane chat=${chat.id} title="${chat.title}"`);
               lastSeenChatByPage.set(page, chat.id);
             }
-            await persistChat(sql, chat, settleMs, prevIncomplete);
+            const hook = await loadChatHook(sql, chat.id);
+            const hookWasInitialized = initializedHookChats.has(chat.id);
+            const newAssistantMessages = await persistChat(sql, chat, settleMs, prevIncomplete);
 
             if (await isAutoRetryEnabled(sql, chat.id)) {
               const now = Date.now();
@@ -1497,26 +1551,41 @@ async function watch(cfg: Config, configPath: string) {
               retryClickCooldowns.delete(chat.id);
             }
 
-            const hook = await loadChatHook(sql, chat.id);
             if (hook && hook.enabled) {
               const targets = await findZipTargets(page);
-              if (!initializedHookChats.has(chat.id)) {
+              if (!hookWasInitialized) {
+                // Opening/navigating to an existing chat is not a hook event.
+                // Establish a baseline before accepting any new message IDs.
                 for (const target of targets) handledHookDownloads.add(`${chat.id}:${target.identity}`);
                 initializedHookChats.add(chat.id);
-                log.info(`[hook] initialized ZIP baseline for chat=${chat.id} (${targets.length} existing attachments)`);
-              }
-              for (const target of targets) {
-                const hookKey = `${chat.id}:${target.identity}`;
-                if (handledHookDownloads.has(hookKey)) continue;
-                handledHookDownloads.add(hookKey);
-                try {
-                  const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
-                  const archive = await downloadZipTarget(page, target, archiveDir);
-                  await runHookForZip(page, chat.id, hook, archive, configPath);
-                } catch (hookError) {
-                  log.error(`[hook] chat=${chat.id} failed: ${formatError(hookError)}`);
+                pendingHookMessages.delete(chat.id);
+                log.info(`[hook] initialized ZIP baseline for chat=${chat.id} (${targets.length} existing attachments; no hook run)`);
+              } else {
+                const now = Date.now();
+                let pending = pendingHookMessages.get(chat.id);
+                if (!pending) { pending = new Map<string, number>(); pendingHookMessages.set(chat.id, pending); }
+                for (const messageId of newAssistantMessages) pending.set(messageId, now + 5 * 60_000);
+                for (const [messageId, expiresAt] of pending) if (expiresAt < now) pending.delete(messageId);
+                for (const target of targets) {
+                  // A ZIP link only triggers a hook when it belongs to an
+                  // assistant message that was newly inserted/completed since
+                  // this chat's baseline. No UUID means fail closed.
+                  if (!target.messageId || !pending.has(target.messageId)) continue;
+                  const hookKey = `${chat.id}:${target.identity}`;
+                  if (handledHookDownloads.has(hookKey)) continue;
+                  handledHookDownloads.add(hookKey);
+                  try {
+                    const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
+                    const archive = await downloadZipTarget(page, target, archiveDir);
+                    await runHookForZip(page, chat.id, hook, archive, configPath);
+                  } catch (hookError) {
+                    log.error(`[hook] chat=${chat.id} failed: ${formatError(hookError)}`);
+                  }
                 }
               }
+            } else {
+              initializedHookChats.delete(chat.id);
+              pendingHookMessages.delete(chat.id);
             }
           } catch (pageError) {
             log.error(`[watch] pane scan failed url=${page.url()}: ${formatError(pageError)}`);

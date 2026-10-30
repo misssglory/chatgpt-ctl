@@ -111,7 +111,7 @@ nix build
 
 ```text
 chatgpt-ctl chats [--limit N] [-q substring] [--refresh]
-chatgpt-ctl send "message text" [--chat CHAT] [-f PATH]...  # focused chat by default; target by UUID/title
+chatgpt-ctl send "message text" [--chat CHAT | --new-chat] [-f PATH]...  # focused, targeted, or new chat
 chatgpt-ctl open [CHAT|current]              # UUID/title; new pane unless already open
 chatgpt-ctl close <CHAT|INDEX>               # close by UUID/title or 0-based open-pane index
 chatgpt-ctl new-chat                         # blank chat at / (no conversation UUID in URL)
@@ -200,16 +200,22 @@ from the directory where you run `chatgpt-ctl`. Example:
 chatgpt-ctl download-last-zip ./var/downloads --extract-to ./work/latest-project
 ```
 
-`chatgpt-ctl send "message text" [--chat CHAT] [-f PATH]...` sends through the watcher's browser
+`chatgpt-ctl send "message text" [--chat CHAT | --new-chat] [-f PATH]...` sends through the watcher's browser
 context. Without `--chat`, it sends to the currently focused pane. With `--chat`, it resolves a
-UUID or title substring and sends to that conversation, opening a new pane if necessary. It can
-also send file attachments without message text:
+UUID or title substring and sends to that conversation, opening a new pane if necessary. Use
+`--new-chat` (alias `--new`) to create a separate blank pane, send the first message, wait for
+ChatGPT to assign the conversation UUID, and print that acquired UUID. The watcher immediately persists the acquired UUID and first visible messages to PostgreSQL,
+so the new conversation is available to `chats`, `open`, and `history` without waiting for the
+next poll. The `--chat` and `--new-chat` options are mutually exclusive. It can also send file
+attachments without message text:
 
 ```bash
 chatgpt-ctl send "Review this" -f ./src/main.rs
 chatgpt-ctl send --chat "NixOS Wayland" "Check this fix"
 chatgpt-ctl send --chat 6ae4c5ad-6410-83ed-abf0-7944c8969abf -f ./archive.zip
 chatgpt-ctl send -f ./archive.zip
+chatgpt-ctl send --new-chat "Start a new project and inspect this archive" -f ./archive.zip
+chatgpt-ctl send --new "First message in a new chat"
 ```
 
 ### Per-chat automatic Retry button
@@ -252,8 +258,10 @@ chatgpt-ctl hook remove "My project chat"
 `wl-paste -n`; override it with `--clipboard-command xclip --clipboard-arg -selection
 --clipboard-arg clipboard --clipboard-arg -o` (repeat `--clipboard-arg` for each argument).
 
-While that conversation is open, the watcher records existing ZIP links as a baseline and processes
-only subsequently-arriving ZIP attachments. Run `chatgpt-ctl hook run <chat>` (also available as
+When a hook-enabled chat is first seen, the watcher records existing ZIP links as a baseline and
+never runs the hook just because the conversation was opened. Automatic processing is gated by a
+newly inserted or completed assistant message ID; ZIP links without a stable message UUID are
+ignored, and message/attachment identity is stable across polling scans. Run `chatgpt-ctl hook run <chat>` (also available as
 `hook trigger`) to manually download the newest ZIP attachment in that conversation and run the
 same extraction, Git commit, and build pipeline immediately. The command opens the specified chat
 in the active watcher pane if needed. Manual runs also work while a hook is disabled; disabling only
