@@ -16,6 +16,7 @@ import { access, constants, lstat, mkdir, mkdtemp, readdir, rename, rm, readFile
 import { existsSync } from "node:fs";
 import path from "node:path";
 import postgres from "postgres";
+import { zipTargetAssociation } from "./zip-target-selection.mjs";
 
 const log = new Logger({
   type: "pretty",
@@ -105,6 +106,8 @@ interface VirtualFocus {
   source: "manual" | "ctl";
   /** Per-page timestamps are needed when the previously focused page closes. */
   pageFocusAt: WeakMap<Page, number>;
+  /** Persist changes to the open-pane snapshot (debounced by the session store). */
+  onChange?: (reason: string) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -314,7 +317,7 @@ async function ensureBrowserSchema(sql: Sql): Promise<void> {
       updated_at timestamptz NOT NULL DEFAULT now()
     )
   `);
-  // The last cleanly-shut-down watch session is restored on the next launch.
+  // Continuously persisted watcher pane snapshot, restored on the next launch.
   // One row represents one open conversation pane; focused_at preserves the
   // virtual-focus choice across browser contexts.
   await sql.unsafe(`
@@ -428,6 +431,95 @@ async function persistOpenChatSession(
     }
   });
   return snapshot.length;
+}
+
+/**
+ * Persist pane/focus changes continuously instead of relying on SIGINT. The
+ * snapshot writer is serialized, debounced, and paused while startup restores
+ * the saved rows so intermediate restoration states cannot erase panes that
+ * have not been reopened yet.
+ */
+function createOpenChatSessionPersistence(
+  sql: Sql,
+  runtimes: BrowserRuntime[],
+  focus: VirtualFocus,
+) {
+  let paused = true;
+  let dirty = false;
+  let revision = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let inFlight: Promise<number> | undefined;
+  let lastSavedCount = 0;
+  let lastError: unknown;
+
+  const clearTimer = () => {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+  };
+
+  const drain = async (): Promise<void> => {
+    if (paused || !dirty) return;
+    if (inFlight) {
+      await inFlight.catch(() => undefined);
+      if (dirty && !paused) await drain();
+      return;
+    }
+
+    dirty = false;
+    const startedAtRevision = revision;
+    inFlight = persistOpenChatSession(sql, runtimes, focus);
+    try {
+      lastSavedCount = await inFlight;
+      lastError = undefined;
+      log.debug(`[watch] persisted ${lastSavedCount} open chat(s) (revision=${startedAtRevision})`);
+    } catch (error) {
+      lastError = error;
+      // Retry only when a newer change arrived during the failed write. A
+      // persistent DB failure must not create an endless log/retry loop.
+      if (revision > startedAtRevision) dirty = true;
+      log.error(`[watch] failed to persist open-chat changes: ${formatError(error)}`);
+      throw error;
+    } finally {
+      inFlight = undefined;
+    }
+
+    if (dirty && !paused) await drain();
+  };
+
+  const arm = () => {
+    if (paused || !dirty) return;
+    clearTimer();
+    timer = setTimeout(() => {
+      timer = undefined;
+      void drain().catch(() => undefined);
+    }, 200);
+  };
+
+  return {
+    schedule(_reason: string) {
+      revision++;
+      dirty = true;
+      arm();
+    },
+    resume() {
+      if (!paused) return;
+      paused = false;
+      arm();
+    },
+    async flush(): Promise<number> {
+      clearTimer();
+      paused = false;
+      if (!dirty) {
+        // A caller may request a final checkpoint even if no event was seen.
+        revision++;
+        dirty = true;
+      }
+      await drain();
+      if (inFlight) await inFlight.catch(() => undefined);
+      if (lastError) throw lastError;
+      return lastSavedCount;
+    },
+  };
 }
 
 async function restoreOpenChatSession(
@@ -1479,26 +1571,37 @@ async function downloadZipTarget(page: Page, targetInfo: ZipTarget, directory: s
   return target;
 }
 
-async function latestAssistantMessageId(page: Page, expectedChatId?: string): Promise<string> {
+type AssistantZipIdentity = Pick<ScrapedMessage, "id" | "turnOrder">;
+
+function latestAssistantFromMessages(messages: ScrapedMessage[]): ScrapedMessage | undefined {
+  const assistants = messages.filter((message) => message.role === "assistant");
+  const numberedAssistants = assistants.filter((message) => message.turnOrder !== undefined);
+  const candidates = numberedAssistants.length > 0 ? numberedAssistants : assistants;
+  return candidates.reduce<ScrapedMessage | undefined>((best, current) => {
+    if (!best) return current;
+    if (numberedAssistants.length > 0 && best.turnOrder !== current.turnOrder) {
+      return (current.turnOrder ?? -1) > (best.turnOrder ?? -1) ? current : best;
+    }
+    return current.sequence > best.sequence ? current : best;
+  }, undefined);
+}
+
+async function latestAssistantMessage(page: Page, expectedChatId?: string): Promise<AssistantZipIdentity> {
   const chat = await scrapeCurrentChat(page);
   if (!chat || (expectedChatId && chat.id !== expectedChatId)) {
     throw new Error(`cannot identify the current conversation before ZIP selection (expected ${expectedChatId || "current chat"})`);
   }
-  const assistants = chat.messages.filter((message) => message.role === "assistant");
-  const latestAssistant = assistants.reduce<ScrapedMessage | undefined>((best, current) => {
-    if (!best) return current;
-    if (best.turnOrder !== undefined && current.turnOrder !== undefined && best.turnOrder !== current.turnOrder) {
-      return current.turnOrder > best.turnOrder ? current : best;
-    }
-    return current.sequence > best.sequence ? current : best;
-  }, undefined);
+  // Prefer the greatest stable turn key whenever ChatGPT exposes one. Mixing
+  // known and unknown turn orders in one reduce can let a later sequence
+  // number override a newer, explicitly numbered turn.
+  const latestAssistant = latestAssistantFromMessages(chat.messages);
   if (!latestAssistant?.id) {
     throw new Error("cannot identify the latest assistant message; refusing to download an older ZIP");
   }
-  return latestAssistant.id.toLowerCase();
+  return { id: latestAssistant.id.toLowerCase(), ...(latestAssistant.turnOrder !== undefined ? { turnOrder: latestAssistant.turnOrder } : {}) };
 }
 
-async function downloadLastZip(page: Page, directory: string, expectedMessageId?: string): Promise<string> {
+async function downloadLastZip(page: Page, directory: string, expectedAssistant?: AssistantZipIdentity): Promise<string> {
   const targets = await findZipTargets(page);
   if (targets.length === 0) {
     throw new Error(
@@ -1507,21 +1610,31 @@ async function downloadLastZip(page: Page, directory: string, expectedMessageId?
     );
   }
   // Hook/manual ZIP downloads must belong to the latest assistant message.
-  // Choosing the highest turn number alone is unsafe: portal nodes and stale
-  // DIL attachment controls can remain mounted and advertise misleading labels.
-  const expectedId = expectedMessageId?.toLowerCase();
-  const relevantTargets = expectedId
-    ? targets.filter((target) => target.messageId === expectedId)
+  // Prefer the exact message UUID. DIL portal links can expose a different
+  // message-id wrapper than the history scraper, so allow the exact stable
+  // turn key as a fallback; never select a lower/older turn.
+  const relevantTargets = expectedAssistant
+    ? targets.filter((target) => zipTargetAssociation(target, expectedAssistant) !== null)
     : targets;
   log.info(`[download] candidates: ${JSON.stringify(targets.map(({ index, label, messageOrder, messageId, kind }) => ({
     index, label, messageOrder, messageId, kind,
   })))}`);
 
-  if (expectedId && relevantTargets.length === 0) {
+  if (expectedAssistant && relevantTargets.length === 0) {
     throw new Error(
-      `latest assistant message ${expectedId} has no identifiable ZIP attachment; refusing to fall back to an older message ` +
+      `latest assistant message ${expectedAssistant.id}` +
+      `${expectedAssistant.turnOrder === undefined ? "" : ` (turn ${expectedAssistant.turnOrder})`}` +
+      ` has no identifiable ZIP attachment; refusing to fall back to an older message ` +
       `(visible ZIP controls: ${targets.length})`,
     );
+  }
+  if (expectedAssistant) {
+    for (const target of relevantTargets) {
+      const association = zipTargetAssociation(target, expectedAssistant);
+      if (association === "turn-order" && target.messageId?.toLowerCase() !== expectedAssistant.id.toLowerCase()) {
+        log.warn(`[download] matching ZIP by exact turn order ${expectedAssistant.turnOrder}; portal message id ${target.messageId ?? "missing"} differs from scraper id ${expectedAssistant.id}`);
+      }
+    }
   }
   const knownTargets = relevantTargets.filter((target) => target.messageOrder !== null);
   const candidates = knownTargets.length > 0 ? knownTargets : relevantTargets;
@@ -1737,9 +1850,9 @@ async function runHookWithLastZip(
     });
   }
   await waitForConversationReady(page, chatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
-  const assistantMessageId = await latestAssistantMessageId(page, chatId);
+  const assistantMessage = await latestAssistantMessage(page, chatId);
   const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
-  const archive = await downloadLastZip(page, archiveDir, assistantMessageId);
+  const archive = await downloadLastZip(page, archiveDir, assistantMessage);
   await runHookForZip(page, chatId, hook, archive, configPath);
   return archive;
 }
@@ -1767,6 +1880,7 @@ function setVirtualFocus(focus: VirtualFocus, runtime: BrowserRuntime, page: Pag
   focus.at = runtime.lastFocusAt;
   focus.pageFocusAt.set(page, focus.at);
   focus.source = source;
+  focus.onChange?.("virtual-focus");
 }
 
 function getVirtualFocus(focus: VirtualFocus, runtimes: BrowserRuntime[]): { runtime: BrowserRuntime; page: Page } {
@@ -1835,19 +1949,29 @@ async function installFocusTracking(runtime: BrowserRuntime, focus: VirtualFocus
         setVirtualFocus(focus, runtime, page, "manual");
       }
     };
-    page.on("domcontentloaded", () => { void markWhenActuallyFocused(); });
+    page.on("domcontentloaded", () => {
+      void markWhenActuallyFocused();
+      focus.onChange?.("domcontentloaded");
+    });
     page.on("framenavigated", (frame) => {
-      if (frame === page.mainFrame()) void markWhenActuallyFocused();
+      if (frame === page.mainFrame()) {
+        void markWhenActuallyFocused();
+        focus.onChange?.("main-frame-navigation");
+      }
     });
     page.on("close", () => {
       if (focus.page === page) {
         focus.page = undefined;
         focus.runtime = undefined;
       }
+      focus.onChange?.("page-close");
     });
   };
 
-  runtime.context.on("page", attachPage);
+  runtime.context.on("page", (page) => {
+    attachPage(page);
+    focus.onChange?.("page-created");
+  });
   for (const page of runtime.context.pages()) {
     attachPage(page);
     const focused = await page.evaluate(() => document.visibilityState === "visible" && document.hasFocus()).catch(() => false);
@@ -2104,8 +2228,8 @@ function startControlServer(
             ? path.resolve(body.directory)
             : resolveFromConfig(configPath, cfg.downloads?.directory || "./var/downloads");
           const currentChatId = requestedChatId || normalizeUuid(page.url()) || undefined;
-          const assistantMessageId = await latestAssistantMessageId(page, currentChatId);
-          const saved = await downloadLastZip(page, directory, assistantMessageId);
+          const assistantMessage = await latestAssistantMessage(page, currentChatId);
+          const saved = await downloadLastZip(page, directory, assistantMessage);
           if (body.extract_to) {
             const extractTo = path.resolve(body.extract_to);
             const listing = await commandOutput(["unzip", "-Z1", saved]);
@@ -2173,6 +2297,9 @@ async function watch(cfg: Config, configPath: string) {
     await sql.end();
     throw error;
   }
+  const sessionPersistence = createOpenChatSessionPersistence(sql, runtimes, focus);
+  focus.onChange = (reason) => sessionPersistence.schedule(reason);
+
   const prevIncomplete = new Map<string, number>();
   const lastSeenChatByPage = new WeakMap<Page, string>();
   const readyChatByPage = new WeakMap<Page, string>();
@@ -2195,7 +2322,8 @@ async function watch(cfg: Config, configPath: string) {
     log.info("\n[watch] stopping...");
     controlServer?.stop(true);
     try {
-      const savedCount = await persistOpenChatSession(sql, runtimes, focus);
+      sessionPersistence.schedule("watch-shutdown");
+      const savedCount = await sessionPersistence.flush();
       log.info(`[watch] saved ${savedCount} open chat(s) for the next launch`);
     } catch (error) {
       log.error(`[watch] failed to save open-chat session: ${formatError(error)}`);
@@ -2229,6 +2357,11 @@ async function watch(cfg: Config, configPath: string) {
     }
     const initialFocus = runtimes.find((runtime) => runtime.name === "default") ?? runtimes[0]!;
     if (!focus.page && initialFocus?.activePage) setVirtualFocus(focus, initialFocus, initialFocus.activePage, "manual");
+    // Startup restore is complete: commit the authoritative post-restore
+    // snapshot now, then keep it current from browser page/focus events.
+    sessionPersistence.resume();
+    sessionPersistence.schedule("watch-startup");
+    await sessionPersistence.flush();
     log.info(`[watch] restored ${restoredCount} previously open chat pane(s)`);
     controlServer = startControlServer(runtimes, focus, cfg, configPath, sql);
     log.info(`[watch] synchronized ${initialTotal} sidebar chats across ${runtimes.length} browser profile(s)`);
@@ -2262,6 +2395,7 @@ async function watch(cfg: Config, configPath: string) {
             if (chat.id !== previousId) {
               log.info(`[watch] pane chat=${chat.id} title="${chat.title}"`);
               lastSeenChatByPage.set(page, chat.id);
+              sessionPersistence.schedule("poll-observed-route-change");
             }
             if (readyChatByPage.get(page) !== chat.id) {
               // First observation of this route (including in-page navigation):
@@ -2331,7 +2465,7 @@ async function watch(cfg: Config, configPath: string) {
                 if (!pending) { pending = new Map<string, number>(); pendingHookMessages.set(chat.id, pending); }
                 for (const messageId of newAssistantMessages) pending.set(messageId, now + 5 * 60_000);
                 for (const [messageId, expiresAt] of pending) if (expiresAt < now) pending.delete(messageId);
-                const latestAssistant = [...chat.messages].reverse().find((message) => message.role === "assistant");
+                const latestAssistant = latestAssistantFromMessages(chat.messages);
                 const latestUser = [...chat.messages].reverse().find((message) => message.role === "user");
                 const baselineTurn = baselineAssistantTurnByChat.get(chat.id);
                 const baselineUserTurn = baselineUserTurnByChat.get(chat.id);
@@ -2347,7 +2481,7 @@ async function watch(cfg: Config, configPath: string) {
                   // message, that message completed after the baseline, and its
                   // stable global turn number proves it is newer. This excludes
                   // historical attachments revealed by scrolling/editing older turns.
-                  if (!hasNewUserTurn || !latestAssistant || !target.messageId || target.messageId !== latestAssistant.id) continue;
+                  if (!hasNewUserTurn || !latestAssistant || !zipTargetAssociation(target, latestAssistant)) continue;
                   if (!pending.has(latestAssistant.id) || !newAssistantMessages.has(latestAssistant.id)) continue;
                   if (baselineTurn === null || baselineTurn === undefined ||
                       latestAssistant.turnOrder === undefined || target.messageOrder === null ||
@@ -2381,7 +2515,8 @@ async function watch(cfg: Config, configPath: string) {
     log.error(`[watch] fatal:\n${formatError(error)}`);
     controlServer?.stop(true);
     try {
-      const savedCount = await persistOpenChatSession(sql, runtimes, focus);
+      sessionPersistence.schedule("fatal-shutdown");
+      const savedCount = await sessionPersistence.flush();
       log.info(`[watch] saved ${savedCount} open chat(s) after fatal watcher error`);
     } catch (saveError) {
       log.error(`[watch] failed to save open-chat session: ${formatError(saveError)}`);

@@ -315,10 +315,11 @@ re-resolves the ZIP target by its message identity; if the target is no longer u
 Playwright does not report a download, it refuses to click a fallback button and skips the hook.
 This is deliberately fail-closed to avoid accidental clicks while switching chats or editing old turns.
 After initialization, automatic processing is restricted to a ZIP control whose stable message UUID
-belongs to the latest assistant message, whose turn number is newer than the baseline, and whose
-message has just completed. Historical ZIP links revealed by scrolling, revisiting, or editing older
-turns are therefore ignored. ZIP controls without stable message/turn metadata fail closed rather
-than triggering automation. Run `chatgpt-ctl hook run [chat]` (also available as `hook trigger`) to
+belongs to the latest assistant message, or whose stable turn number exactly matches that latest
+assistant message when a DIL portal exposes a different ancestor UUID. The turn must be newer than
+the baseline, and its assistant message must have just completed. Historical ZIP links revealed by
+scrolling, revisiting, or editing older turns are therefore ignored. ZIP controls without stable
+message/turn metadata fail closed rather than triggering automation. Run `chatgpt-ctl hook run [chat]` (also available as `hook trigger`) to
 manually download the ZIP attached to the latest assistant message in that conversation and run the same extraction,
 build, and Git commit pipeline immediately. It refuses to substitute an older attachment if the latest
 assistant message has no ZIP. An explicit chat argument opens that chat in its owning browser pane
@@ -473,11 +474,12 @@ virtual focus. `download-last-zip --chat CHAT` also accepts a UUID, title, or ch
 and opens/routs that target automatically. A chat-specific command (`open`, `send --chat`, `retry`, or `hook run`)
 is dispatched to the profile associated with that chat.
 
-The watcher also saves the open conversation panes when it exits cleanly with **Ctrl+C**
-(or receives SIGTERM). On the next `bun run watch`, it reopens those conversations in
-the same browser profiles, retains their per-browser tab order, and restores the last
-focused conversation as virtual focus. Blank tabs and transient new-chat pages are not
-saved. If a saved conversation is no longer accessible and ChatGPT redirects away from
+Open conversation panes and virtual focus are persisted continuously (debounced) whenever
+a tab is opened, navigated, focused, or closed—not only on **Ctrl+C**. The watcher also
+forces a final checkpoint on Ctrl+C/SIGTERM. On the next `bun run watch`, it reopens those
+conversations in the same browser profiles, retains their per-browser tab order, and
+restores the last focused conversation as virtual focus. Blank tabs and transient new-chat
+pages are not saved. If a saved conversation is no longer accessible and ChatGPT redirects away from
 that conversation, that entry is skipped rather than becoming the restored focus.
 The session is stored in the additive `chatgpt_watcher_open_chats` PostgreSQL table; no
 manual migration is needed because the watcher creates it automatically.

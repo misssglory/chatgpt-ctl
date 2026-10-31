@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS chatgpt_watcher_browsers (
 );
 
 
--- Last cleanly-shut-down watcher session; used to reopen conversation panes.
+-- Continuously persisted watcher pane snapshot; used to reopen conversation panes.
 CREATE TABLE IF NOT EXISTS chatgpt_watcher_open_chats (
     browser_name text NOT NULL,
     chat_id uuid NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
