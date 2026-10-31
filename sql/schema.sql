@@ -43,3 +43,17 @@ CREATE TABLE IF NOT EXISTS chatgpt_watcher_browsers (
     profile_dir text NOT NULL,
     updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+
+-- Last cleanly-shut-down watcher session; used to reopen conversation panes.
+CREATE TABLE IF NOT EXISTS chatgpt_watcher_open_chats (
+    browser_name text NOT NULL,
+    chat_id uuid NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    pane_order integer NOT NULL DEFAULT 0,
+    focused_at bigint NOT NULL DEFAULT 0,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (browser_name, chat_id)
+);
+
+CREATE INDEX IF NOT EXISTS chatgpt_watcher_open_chats_focus_idx
+    ON chatgpt_watcher_open_chats (focused_at DESC);

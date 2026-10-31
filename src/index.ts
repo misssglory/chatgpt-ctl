@@ -314,6 +314,23 @@ async function ensureBrowserSchema(sql: Sql): Promise<void> {
       updated_at timestamptz NOT NULL DEFAULT now()
     )
   `);
+  // The last cleanly-shut-down watch session is restored on the next launch.
+  // One row represents one open conversation pane; focused_at preserves the
+  // virtual-focus choice across browser contexts.
+  await sql.unsafe(`
+    CREATE TABLE IF NOT EXISTS chatgpt_watcher_open_chats (
+      browser_name text NOT NULL,
+      chat_id uuid NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+      pane_order integer NOT NULL DEFAULT 0,
+      focused_at bigint NOT NULL DEFAULT 0,
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (browser_name, chat_id)
+    )
+  `);
+  await sql.unsafe(`
+    CREATE INDEX IF NOT EXISTS chatgpt_watcher_open_chats_focus_idx
+    ON chatgpt_watcher_open_chats (focused_at DESC)
+  `);
 }
 
 async function registerBrowser(sql: Sql, profile: BrowserProfile): Promise<void> {
@@ -339,6 +356,155 @@ async function browserNameForChat(sql: Sql, chatId: string): Promise<string | nu
     SELECT browser_name FROM chatgpt_watcher_chat_browsers WHERE chat_id = ${chatId}::uuid
   `;
   return rows.length ? String(rows[0]!.browser_name) : null;
+}
+
+interface SavedOpenChat {
+  browser_name: string;
+  chat_id: string;
+  pane_order: number;
+  focused_at: number;
+}
+
+async function loadOpenChatSession(sql: Sql): Promise<SavedOpenChat[]> {
+  const rows = await sql`
+    SELECT browser_name, chat_id::text AS chat_id, pane_order, focused_at::bigint AS focused_at
+    FROM chatgpt_watcher_open_chats
+    ORDER BY browser_name, pane_order
+  `;
+  return rows.map((row: any) => ({
+    browser_name: String(row.browser_name),
+    chat_id: String(row.chat_id),
+    pane_order: Number(row.pane_order),
+    focused_at: Number(row.focused_at),
+  }));
+}
+
+async function persistOpenChatSession(
+  sql: Sql,
+  runtimes: BrowserRuntime[],
+  focus: VirtualFocus,
+): Promise<number> {
+  const snapshot: SavedOpenChat[] = [];
+  for (const runtime of runtimes) {
+    let paneOrder = 0;
+    for (const page of runtime.context.pages()) {
+      if (page.isClosed()) continue;
+      const chatId = normalizeUuid(page.url());
+      if (!chatId) continue; // Ignore blank tabs, ChatGPT home, and transient new chats.
+      let focusedAt = focus.pageFocusAt.get(page) ?? 0;
+      if (focus.page === page) focusedAt = Math.max(focusedAt, focus.at);
+      snapshot.push({
+        browser_name: runtime.name,
+        chat_id: chatId,
+        pane_order: paneOrder++,
+        focused_at: focusedAt,
+      });
+    }
+  }
+
+  await sql.begin(async (tx) => {
+    await tx`DELETE FROM chatgpt_watcher_open_chats`;
+    for (const item of snapshot) {
+      // A pane can be opened immediately before Ctrl+C, before the polling
+      // loop has persisted its chat row. Create a placeholder so the session
+      // foreign key cannot make shutdown lose the entire snapshot.
+      await tx`
+        INSERT INTO chats (id, title, url, created_at, updated_at)
+        VALUES (${item.chat_id}::uuid, '', ${`/c/${item.chat_id}`}, NOW(), NOW())
+        ON CONFLICT (id) DO NOTHING
+      `;
+      await tx`
+        INSERT INTO chatgpt_watcher_chat_browsers (chat_id, browser_name, updated_at)
+        VALUES (${item.chat_id}::uuid, ${item.browser_name}, NOW())
+        ON CONFLICT (chat_id) DO UPDATE
+          SET browser_name = EXCLUDED.browser_name, updated_at = NOW()
+      `;
+      await tx`
+        INSERT INTO chatgpt_watcher_open_chats
+          (browser_name, chat_id, pane_order, focused_at, updated_at)
+        VALUES
+          (${item.browser_name}, ${item.chat_id}::uuid, ${item.pane_order}, ${item.focused_at}, NOW())
+      `;
+    }
+  });
+  return snapshot.length;
+}
+
+async function restoreOpenChatSession(
+  sql: Sql,
+  runtimes: BrowserRuntime[],
+  focus: VirtualFocus,
+  cfg: Config,
+): Promise<number> {
+  const saved = await loadOpenChatSession(sql);
+  if (saved.length === 0) return 0;
+
+  let restoredCount = 0;
+  const focusCandidates: Array<{ runtime: BrowserRuntime; page: Page; focusedAt: number }> = [];
+  for (const runtime of runtimes) {
+    const rows = saved
+      .filter((item) => item.browser_name === runtime.name)
+      .sort((a, b) => a.pane_order - b.pane_order);
+    if (rows.length === 0) continue;
+
+    const existing = new Map<string, Page>();
+    for (const page of runtime.context.pages()) {
+      const id = page.isClosed() ? null : normalizeUuid(page.url());
+      if (id) existing.set(id, page);
+    }
+    // Reuse the launcher's blank/home page for the first restored conversation;
+    // create additional tabs only when all existing pages already hold chats.
+    let reusablePage = runtime.context.pages().find((page) =>
+      !page.isClosed() && !normalizeUuid(page.url())
+    );
+
+    for (const item of rows) {
+      let page = existing.get(item.chat_id);
+      if (!page) {
+        const reusedLauncherPage = Boolean(reusablePage);
+        page = reusablePage ?? await runtime.context.newPage();
+        reusablePage = undefined;
+        configurePage(page, cfg);
+        attachNetworkDebug(page, cfg);
+        const target = new URL(`/c/${item.chat_id}`, cfg.chatgpt.url).toString();
+        try {
+          await page.goto(target, {
+            waitUntil: "domcontentloaded",
+            timeout: cfg.browser?.navigation_timeout_ms ?? 45_000,
+          });
+          if (normalizeUuid(page.url()) !== item.chat_id) {
+            log.warn(`[watch] skipped stale saved chat=${item.chat_id} browser=${runtime.name}; redirected to ${page.url()}`);
+            if (!reusedLauncherPage) await page.close().catch(() => undefined);
+            continue;
+          }
+          existing.set(item.chat_id, page);
+          restoredCount++;
+          log.info(`[watch] restored chat=${item.chat_id} browser=${runtime.name} pane=${item.pane_order}`);
+        } catch (error) {
+          log.warn(`[watch] could not restore chat=${item.chat_id} browser=${runtime.name}: ${formatError(error)}`);
+          if (!reusedLauncherPage) await page.close().catch(() => undefined);
+          continue;
+        }
+      } else {
+        restoredCount++;
+        log.info(`[watch] retained existing chat=${item.chat_id} browser=${runtime.name} pane=${item.pane_order}`);
+      }
+
+      focus.pageFocusAt.set(page, item.focused_at);
+      focusCandidates.push({ runtime, page, focusedAt: item.focused_at });
+      runtime.activePage = page;
+      await recordChatBrowser(sql, item.chat_id, runtime.name);
+    }
+  }
+
+  // Restore focus after all contexts have been opened so page focus events from
+  // intermediate navigations cannot override the persisted cross-browser target.
+  const lastFocused = focusCandidates.sort((a, b) => b.focusedAt - a.focusedAt)[0];
+  if (lastFocused) {
+    setVirtualFocus(focus, lastFocused.runtime, lastFocused.page, "ctl");
+    log.info(`[watch] restored virtual focus chat=${normalizeUuid(lastFocused.page.url())} browser=${lastFocused.runtime.name}`);
+  }
+  return restoredCount;
 }
 
 async function ensureRetrySchema(sql: Sql): Promise<void> {
@@ -2003,9 +2169,18 @@ async function watch(cfg: Config, configPath: string) {
   const pendingHookMessages = new Map<string, Map<string, number>>();
   const retryClickCooldowns = new Map<string, number>();
 
+  let stopping = false;
   const stop = async () => {
+    if (stopping) return;
+    stopping = true;
     log.info("\n[watch] stopping...");
     controlServer?.stop(true);
+    try {
+      const savedCount = await persistOpenChatSession(sql, runtimes, focus);
+      log.info(`[watch] saved ${savedCount} open chat(s) for the next launch`);
+    } catch (error) {
+      log.error(`[watch] failed to save open-chat session: ${formatError(error)}`);
+    }
     await Promise.all(runtimes.map((runtime) => runtime.context.close().catch(() => undefined)));
     await sql.end();
     process.exit(0);
@@ -2014,11 +2189,20 @@ async function watch(cfg: Config, configPath: string) {
   process.on("SIGTERM", stop);
 
   try {
-    let initialTotal = 0;
+    // Attach focus tracking before navigating restored pages so manually focused
+    // tabs continue to update virtual focus across all browser profiles.
     for (const runtime of runtimes) {
       runtime.activePage = await getPage(runtime.context);
       await installFocusTracking(runtime, focus);
       attachNetworkDebug(runtime.activePage, cfg);
+    }
+
+    const restoredCount = await restoreOpenChatSession(sql, runtimes, focus, cfg);
+    let initialTotal = 0;
+    for (const runtime of runtimes) {
+      if (!runtime.activePage || runtime.activePage.isClosed()) {
+        runtime.activePage = await getPage(runtime.context);
+      }
       await ensureCurrentChatGPTPage(runtime.activePage, cfg);
       const sidebarChats = await syncSidebarChats(runtime.activePage, sql, true, runtime.name);
       initialTotal += sidebarChats.length;
@@ -2026,6 +2210,7 @@ async function watch(cfg: Config, configPath: string) {
     }
     const initialFocus = runtimes.find((runtime) => runtime.name === "default") ?? runtimes[0]!;
     if (!focus.page && initialFocus?.activePage) setVirtualFocus(focus, initialFocus, initialFocus.activePage, "manual");
+    log.info(`[watch] restored ${restoredCount} previously open chat pane(s)`);
     controlServer = startControlServer(runtimes, focus, cfg, configPath, sql);
     log.info(`[watch] synchronized ${initialTotal} sidebar chats across ${runtimes.length} browser profile(s)`);
     log.info(`[watch] poll=${pollMs}ms settle=${settleMs}ms multi-pane and multi-browser enabled`);
@@ -2176,6 +2361,12 @@ async function watch(cfg: Config, configPath: string) {
   } catch (error) {
     log.error(`[watch] fatal:\n${formatError(error)}`);
     controlServer?.stop(true);
+    try {
+      const savedCount = await persistOpenChatSession(sql, runtimes, focus);
+      log.info(`[watch] saved ${savedCount} open chat(s) after fatal watcher error`);
+    } catch (saveError) {
+      log.error(`[watch] failed to save open-chat session: ${formatError(saveError)}`);
+    }
     await Promise.all(runtimes.map((runtime) => runtime.context.close().catch(() => undefined)));
     await sql.end();
     throw error;

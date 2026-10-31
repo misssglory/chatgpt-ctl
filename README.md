@@ -467,6 +467,15 @@ virtual focus. `download-last-zip --chat CHAT` also accepts a UUID, title, or ch
 and opens/routs that target automatically. A chat-specific command (`open`, `send --chat`, `retry`, or `hook run`)
 is dispatched to the profile associated with that chat.
 
+The watcher also saves the open conversation panes when it exits cleanly with **Ctrl+C**
+(or receives SIGTERM). On the next `bun run watch`, it reopens those conversations in
+the same browser profiles, retains their per-browser tab order, and restores the last
+focused conversation as virtual focus. Blank tabs and transient new-chat pages are not
+saved. If a saved conversation is no longer accessible and ChatGPT redirects away from
+that conversation, that entry is skipped rather than becoming the restored focus.
+The session is stored in the additive `chatgpt_watcher_open_chats` PostgreSQL table; no
+manual migration is needed because the watcher creates it automatically.
+
 Focusing a chat that is already open no longer waits for the full conversation
 readiness scan or re-scrapes the message history. It focuses the existing page and
 returns immediately; the normal watcher scan continues to enforce conversation
