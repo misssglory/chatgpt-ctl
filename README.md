@@ -515,3 +515,7 @@ also removed. No attachments from older assistant messages are eligible.
 The last successful verified ZIP selection for each chat is saved in
 `<hook folder>/.chatgpt-ctl-downloads/last-successful-zips.json`. This record
 helps prioritize retries and re-runs; it does not bypass latest-message matching.
+
+### Automatic delivery-timeout recovery
+
+When the active conversation displays the exact error `Message delivery timed out. Please try again.`, the watcher automatically clicks the `Retry` button inside the matching visible alert. This works regardless of the optional per-chat generic Retry toggle. Retries are limited to three per error episode with at least 30 seconds between attempts. The counter resets once the alert is absent for two consecutive scans. Unrelated Retry buttons are not clicked by this recovery path.

@@ -634,6 +634,32 @@ async function clickRetryAtConversationEnd(page: Page, chatId: string): Promise<
   return false;
 }
 
+/** Recover the exact ChatGPT delivery-timeout alert, not unrelated Retry controls. */
+async function retryTimedOutDelivery(page: Page, chatId: string): Promise<boolean> {
+  if (normalizeUuid(page.url()) !== chatId) return false;
+  const alert = page.locator('main:visible [role="alert"]:visible')
+    .filter({ hasText: "Message delivery timed out. Please try again." });
+  const count = await alert.count();
+  for (let index = count - 1; index >= 0; index--) {
+    const candidate = alert.nth(index);
+    const body = (await candidate.innerText().catch(() => "")).trim();
+    if (!body.includes("Message delivery timed out. Please try again.")) continue;
+    const button = candidate.getByRole("button", { name: "Retry", exact: true });
+    if (await button.count() !== 1 || !(await button.isVisible()) || !(await button.isEnabled())) continue;
+    await button.click({ timeout: 3000 });
+    log.info(`[retry] clicked delivery-timeout Retry for chat=${chatId}`);
+    return true;
+  }
+  return false;
+}
+
+async function hasTimedOutDelivery(page: Page, chatId: string): Promise<boolean> {
+  if (normalizeUuid(page.url()) !== chatId) return false;
+  return page.locator('main:visible [role="alert"]:visible')
+    .filter({ hasText: "Message delivery timed out. Please try again." })
+    .count().then((count) => count > 0).catch(() => false);
+}
+
 async function ensureHookSchema(sql: Sql): Promise<void> {
   await sql.unsafe(`
     CREATE TABLE IF NOT EXISTS chat_hooks (
@@ -2429,6 +2455,7 @@ async function watch(cfg: Config, configPath: string) {
   // downloadable ZIP control can render a poll or two after its message.
   const pendingHookMessages = new Map<string, Map<string, number>>();
   const retryClickCooldowns = new Map<string, number>();
+  const deliveryRetryState = new Map<string, { attempts: number; lastAttempt: number; absentPolls: number }>();
 
   let stopping = false;
   const stop = async () => {
@@ -2548,7 +2575,35 @@ async function watch(cfg: Config, configPath: string) {
             await recordChatBrowser(sql, chat.id, runtime.name);
             const newAssistantMessages = await persistChat(sql, chat, settleMs, prevIncomplete, runtime.name);
 
-            if (await isAutoRetryEnabled(sql, chat.id)) {
+            // Delivery-timeout recovery is automatic, even when the optional
+            // generic per-chat Retry setting is off. Bound attempts per failure
+            // episode to avoid repeatedly submitting a permanently failing message.
+            const deliveryTimedOut = await hasTimedOutDelivery(page, chat.id);
+            const deliveryState = deliveryRetryState.get(chat.id);
+            if (deliveryTimedOut) {
+              const state = deliveryState ?? { attempts: 0, lastAttempt: 0, absentPolls: 0 };
+              state.absentPolls = 0;
+              const now = Date.now();
+              if (state.attempts < 3 && now - state.lastAttempt >= 30_000) {
+                state.lastAttempt = now;
+                state.attempts += 1;
+                try {
+                  await retryTimedOutDelivery(page, chat.id);
+                } catch (retryError) {
+                  log.warn(`[retry] chat=${chat.id} delivery-timeout Retry failed: ${formatError(retryError)}`);
+                }
+              } else if (state.attempts === 3 && now - state.lastAttempt >= 30_000) {
+                // Stop retrying this episode until the timeout alert has cleared.
+                state.lastAttempt = now;
+                log.warn(`[retry] chat=${chat.id} delivery-timeout retry limit reached (3)`);
+              }
+              deliveryRetryState.set(chat.id, state);
+            } else if (deliveryState) {
+              deliveryState.absentPolls += 1;
+              if (deliveryState.absentPolls >= 2) deliveryRetryState.delete(chat.id);
+            }
+
+            if (!deliveryTimedOut && await isAutoRetryEnabled(sql, chat.id)) {
               const now = Date.now();
               const lastClick = retryClickCooldowns.get(chat.id) ?? 0;
               if (now - lastClick >= 30_000) {
