@@ -68,7 +68,7 @@ enum Commands {
 
     /// Open a chat in its own watcher browser pane (reuse its pane if already open).
     ///
-    /// With no CHAT argument, enters an interactive prompt with DB-backed autocomplete.
+    /// With no CHAT argument, opens fzf to search chats by index, ID, or title.
     Open {
         /// Chat UUID, title substring, or "current"
         chat: Option<String>,
@@ -860,31 +860,46 @@ async fn interactive_history(client: &Client, completed_only: bool, limit: i64, 
     Ok(())
 }
 
-async fn interactive_open(client: &Client) -> Result<Uuid> {
-    let chats = list_chats(client, 1000, None).await?;
-    if chats.is_empty() {
+async fn interactive_open(client: &Client) -> Result<Option<Uuid>> {
+    // Avoid list_chats(): its per-chat message counts are unnecessary for selection
+    // and can be expensive on large history databases.
+    let rows = client.query(
+        r#"SELECT c.id, COALESCE(c.title, ''), COALESCE(b.browser_name, 'default'),
+                  row_number() OVER (ORDER BY c.updated_at DESC NULLS LAST, c.id DESC) - 1 AS chat_index
+           FROM chats c
+           LEFT JOIN chatgpt_watcher_chat_browsers b ON b.chat_id = c.id
+           ORDER BY chat_index"#,
+        &[],
+    ).await?;
+    if rows.is_empty() {
         anyhow::bail!("no chats in database — run `chatgpt-ctl chats --refresh` first");
     }
-    let candidates = chats
-        .iter()
-        .map(|c| (c.title.clone(), c.id.to_string()))
-        .collect();
-    let helper = ChatHelper { candidates };
-    let config = Config::builder()
-        .completion_type(CompletionType::List)
-        .build();
-    let mut rl = Editor::with_config(config)?;
-    rl.set_helper(Some(helper));
-
-    println!("Type a chat title or UUID (TAB to autocomplete), or 'current':");
-    match rl.readline("open> ") {
-        Ok(line) if !line.trim().is_empty() => resolve_chat_id(client, line.trim()).await,
-        Ok(_) => anyhow::bail!("no chat selected"),
-        Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
-            anyhow::bail!("no chat selected")
+    let mut child = Command::new("fzf")
+        .args(["--ansi", "--delimiter=\t", "--with-nth=2..", "--prompt=chat> ",
+               "--header=Search by index, chat UUID or title (Esc to cancel)",
+               "--layout=reverse", "--height=80%"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("start fzf; install fzf or pass an explicit chat UUID/title/index")?;
+    {
+        let mut input = child.stdin.take().context("fzf stdin unavailable")?;
+        for row in rows {
+            let id: Uuid = row.get(0);
+            let title: String = row.get(1);
+            let browser: String = row.get(2);
+            let index: i64 = row.get(3);
+            // First field is the selected ID; all remaining fields are searchable.
+            let line = format!("{id}\t{index}\t{id}\t{browser}\t{}\n",
+                               title.replace('\n', " ").replace('\r', " ").replace('\t', " "));
+            if input.write_all(line.as_bytes()).is_err() { break; } // Esc closes fzf early.
         }
-        Err(e) => Err(e.into()),
     }
+    let result = child.wait_with_output().context("wait for fzf")?;
+    if !result.status.success() { return Ok(None); } // Escape / Ctrl-C
+    let line = String::from_utf8(result.stdout).context("fzf returned invalid UTF-8")?;
+    let id = line.split('\t').next().unwrap_or("").trim();
+    Ok(Some(Uuid::parse_str(id).context("fzf returned an invalid chat ID")?))
 }
 
 async fn follow_history(
@@ -1063,11 +1078,31 @@ async fn main() -> Result<()> {
         }
         Commands::Open { chat } => {
             let command_started = std::time::Instant::now();
-            let client = connect(&url).await?;
+            // UUIDs require no DB lookup. All other selectors need a DB query;
+            // fzf is launched only when no argument is provided.
             let chat_id = match chat {
-                Some(spec) => resolve_chat_id(&client, &spec).await?,
-                None => interactive_open(&client).await?,
+                Some(spec) => match Uuid::parse_str(&spec) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        let client = connect(&url).await?;
+                        resolve_chat_id(&client, &spec).await?
+                    }
+                },
+                None => {
+                    let client = connect(&url).await?;
+                    match interactive_open(&client).await? {
+                        Some(id) => id,
+                        None => return Ok(()),
+                    }
+                }
             };
+            let (open_chats, focused_chat) = watcher_status();
+            if focused_chat == Some(chat_id) && open_chats.contains(&chat_id) {
+                // Do not call /open or bringToFront for an already focused chat.
+                println!("chat {chat_id} is already under virtual focus (no action; {} ms)",
+                    command_started.elapsed().as_millis());
+                return Ok(());
+            }
             let body = serde_json::json!({ "chat_id": chat_id }).to_string();
             let response = watcher_request("POST", "/open", Some(&body))?;
             let value: serde_json::Value = serde_json::from_str(&response)?;
