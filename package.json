@@ -14,7 +14,8 @@
     "send": "bun src/index.ts send",
     "migrate": "bun src/index.ts migrate",
     "flush": "bun src/index.ts flush",
-    "typecheck": "bunx tsc --noEmit"
+    "typecheck": "bunx tsc --noEmit",
+    "test:hook-transaction": "node tests/hook-transaction-order.mjs && bash tests/hook-git-filtering-smoke.sh"
   },
   "dependencies": {
     "playwright-core": "^1.55.0",

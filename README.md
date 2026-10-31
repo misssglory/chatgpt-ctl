@@ -318,16 +318,21 @@ belongs to the latest assistant message, whose turn number is newer than the bas
 message has just completed. Historical ZIP links revealed by scrolling, revisiting, or editing older
 turns are therefore ignored. ZIP controls without stable message/turn metadata fail closed rather
 than triggering automation. Run `chatgpt-ctl hook run <chat>` (also available as `hook trigger`) to
-manually download the ZIP attached to the latest assistant message in that conversation and run the same extraction, Git
-commit, and build pipeline immediately. It refuses to substitute an older attachment if the latest assistant message has no ZIP. The command opens the specified chat in the active watcher
+manually download the ZIP attached to the latest assistant message in that conversation and run the same extraction,
+build, and Git commit pipeline immediately. It refuses to substitute an older attachment if the latest
+assistant message has no ZIP. The command opens the specified chat in the active watcher
 pane if needed. Manual runs also work while a hook is disabled; disabling only pauses automatic
 processing of new attachments. Each new ZIP is saved under
 `<folder>/.chatgpt-ctl-downloads/`, checked for path-traversal entries, and extracted into
-`folder`. The hook stages only archive paths, commits the archive's Markdown diff as the commit
-message (or `Auto update` if no Markdown changes are present), then runs the configured `build_command` from `child_folder` (or `.`). The default is
-`wcc build`; set `--build-command none` to skip building. `--nix-flake` runs the configured
-command inside that directory's Nix flake dev shell. On build failure it reads the configured clipboard command (default
-`wl-paste -n`) and sends that diagnostic to the hooked conversation.
+`folder`. The configured `build_command` runs from `child_folder` (or `.`) before any Git staging
+or commit. The default is `wcc build`; set `--build-command none` to skip building explicitly.
+A nonzero build exit sends the diagnostic to the hooked conversation, keeps the extracted files for
+inspection, and stops without staging or committing anything. After a successful build (or when
+building is explicitly disabled), the hook stages only actual files supplied by the archive and
+skips paths matched by the repository's `.gitignore` rules. It commits the archive's Markdown diff
+as the commit message (or `Auto update` if no Markdown changes are present). `--nix-flake` runs
+the configured build command inside that directory's Nix flake dev shell. Build failures read the
+configured clipboard command (default `wl-paste -n`) and send that diagnostic to the hooked conversation.
 
 The hook requires `unzip` and `git`; the configured build executable and, when `--nix-flake` is
 used, `nix` must be on the watcher's `PATH`. The target folder must already be a Git repository with commit identity configured.

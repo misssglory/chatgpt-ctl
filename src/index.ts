@@ -221,14 +221,31 @@ async function isNixOS(): Promise<boolean> {
   }
 }
 
-async function commandOutput(cmd: string[], cwd?: string): Promise<{ code: number; stdout: string; stderr: string }> {
-  const proc = Bun.spawn(cmd, { cwd, stdout: "pipe", stderr: "pipe" });
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
+async function commandOutput(
+  cmd: string[],
+  cwd?: string,
+  stdinText?: string,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const proc = Bun.spawn(cmd, {
+    cwd,
+    stdin: stdinText === undefined ? "ignore" : "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  // Drain output concurrently with writes to avoid pipe-buffer deadlocks when
+  // check-ignore returns a large list while also consuming many input paths.
+  const stdoutPromise = new Response(proc.stdout).text();
+  const stderrPromise = new Response(proc.stderr).text();
+  if (stdinText !== undefined) {
+    if (!proc.stdin) throw new Error(`stdin pipe unavailable for command: ${cmd[0]}`);
+    await proc.stdin.write(stdinText);
+    proc.stdin.end();
+  }
+  const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
   const code = await proc.exited;
-  return { code, stdout: stdout.trim(), stderr: stderr.trim() };
+  // Preserve NUL-delimited output exactly for --stdin protocols such as
+  // `git check-ignore -z`; trimming can corrupt filenames that begin with space.
+  return { code, stdout: stdinText === undefined ? stdout.trim() : stdout, stderr: stderr.trim() };
 }
 
 async function resolveBrowserExecutable(cfg: Config, _configPath: string): Promise<string> {
@@ -1444,25 +1461,8 @@ async function runHookForZip(
     stagedPaths = normalizedEntries;
   }
 
-  // Stage only paths supplied by this archive, avoiding unrelated working-tree changes.
-  const add = await commandOutput(["git", "-C", projectDir, "add", "-A", "--", ...stagedPaths]);
-  if (add.code !== 0) throw new Error(`git add failed: ${add.stderr}`);
-  const staged = await commandOutput(["git", "-C", projectDir, "diff", "--cached", "--quiet", "--", ...stagedPaths]);
-  if (staged.code === 1) {
-    const mdPaths = stagedPaths.filter((entry) => entry.toLowerCase().endsWith(".md"));
-    const mdDiff = mdPaths.length
-      ? await commandOutput(["git", "-C", projectDir, "diff", "--cached", "--", ...mdPaths])
-      : { code: 0, stdout: "", stderr: "" };
-    const commitMessage = (mdDiff.stdout || "Auto update").slice(0, 18000);
-    const commit = await commandOutput(["git", "-C", projectDir, "commit", "--only", "-m", commitMessage, "--", ...stagedPaths]);
-    if (commit.code !== 0) throw new Error(`git commit failed: ${commit.stderr || commit.stdout}`);
-    log.info(`[hook] committed ZIP update in ${projectDir}`);
-  } else if (staged.code !== 0) {
-    throw new Error(`git diff failed: ${staged.stderr}`);
-  } else {
-    log.info(`[hook] archive produced no Git changes in ${projectDir}`);
-  }
-
+  // Build before touching the Git index. A failing build must never create a
+  // commit for an archive that does not build successfully.
   const buildDir = path.resolve(projectDir, hook.child_folder || ".");
   if (hook.build_command !== null && hook.build_command.trim() !== "") {
     const buildCommand = hook.nix_flake
@@ -1474,10 +1474,85 @@ async function runHookForZip(
       const clipboardCommand = hook.clipboard_command?.length ? hook.clipboard_command : ["wl-paste", "-n"];
       const clipboard = await commandOutput(clipboardCommand);
       const diagnostic = clipboard.stdout || clipboard.stderr || build.stderr || build.stdout || `build command failed with exit code ${build.code}; clipboard was empty`;
-      await sendInPage(page, `Build failed (exit code ${build.code}). Latest build output from clipboard:\n\n${diagnostic}`, chatId);
+      try {
+        await sendInPage(page, `Build failed (exit code ${build.code}). No Git commit was created. Latest build output from clipboard:\n\n${diagnostic}`, chatId);
+      } catch (sendError) {
+        log.error(`[hook] failed to send build diagnostic: ${String(sendError)}`);
+      }
+      throw new Error(`build failed with exit code ${build.code}; extracted files were kept, Git staging and commit were skipped`);
     }
   } else {
-    log.info(`[hook] build command disabled for ${chatId}; skipping build`);
+    log.info(`[hook] build command disabled for ${chatId}; skipping build (commit is allowed)`);
+  }
+
+  // Stage only actual files supplied by this archive, not directory entries.
+  // This avoids explicitly passing an ignored directory (e.g. src/bin) to
+  // `git add`, which makes Git exit non-zero even when other files are valid.
+  const archiveFiles: string[] = [];
+  for (const entry of [...new Set(stagedPaths)]) {
+    if (!entry || entry === "." || entry.endsWith("/")) continue; // ZIP directory marker
+    const absolute = path.resolve(projectDir, entry);
+    const relative = path.relative(projectDir, absolute);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      throw new Error(`unsafe staged archive path rejected: ${entry}`);
+    }
+    try {
+      const stat = await lstat(absolute);
+      if (!stat.isDirectory()) archiveFiles.push(relative.split(path.sep).join("/"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      // A non-directory ZIP entry removed by the build is still an archive
+      // path; keeping it lets `git add -A` stage the resulting deletion.
+      archiveFiles.push(relative.split(path.sep).join("/"));
+    }
+  }
+
+  if (archiveFiles.length === 0) {
+    log.info(`[hook] archive contains no stageable files in ${projectDir}`);
+    return;
+  }
+
+  // Ask Git which archive files are ignored. check-ignore exits 1 when none
+  // match, which is a normal result. Tracked files are not reported as ignored.
+  const ignoredResult = await commandOutput(
+    ["git", "-C", projectDir, "check-ignore", "-z", "--stdin"],
+    undefined,
+    `${archiveFiles.join("\0")}\0`,
+  );
+  if (ignoredResult.code !== 0 && ignoredResult.code !== 1) {
+    throw new Error(`git check-ignore failed: ${ignoredResult.stderr || ignoredResult.stdout}`);
+  }
+  const ignored = new Set(ignoredResult.stdout.split("\0").filter(Boolean));
+  const stageablePaths = archiveFiles.filter((entry) => !ignored.has(entry));
+  const ignoredPaths = archiveFiles.filter((entry) => ignored.has(entry));
+  if (ignoredPaths.length > 0) {
+    log.info(`[hook] skipping ${ignoredPaths.length} ignored archive path(s): ${ignoredPaths.join(", ")}`);
+  }
+  if (stageablePaths.length === 0) {
+    log.info(`[hook] all ${archiveFiles.length} archive file(s) are ignored; nothing to stage or commit`);
+    return;
+  }
+
+  // Use literal pathspecs so unusual filenames from an archive cannot be
+  // interpreted as Git pathspec magic.
+  const pathspecs = stageablePaths.map((entry) => `:(literal)${entry}`);
+  const add = await commandOutput(["git", "-C", projectDir, "add", "-A", "--", ...pathspecs]);
+  if (add.code !== 0) throw new Error(`git add failed: ${add.stderr}`);
+  const staged = await commandOutput(["git", "-C", projectDir, "diff", "--cached", "--quiet", "--", ...pathspecs]);
+  if (staged.code === 1) {
+    const mdPaths = stageablePaths.filter((entry) => entry.toLowerCase().endsWith(".md"));
+    const mdPathspecs = mdPaths.map((entry) => `:(literal)${entry}`);
+    const mdDiff = mdPathspecs.length
+      ? await commandOutput(["git", "-C", projectDir, "diff", "--cached", "--", ...mdPathspecs])
+      : { code: 0, stdout: "", stderr: "" };
+    const commitMessage = (mdDiff.stdout || "Auto update").slice(0, 18000);
+    const commit = await commandOutput(["git", "-C", projectDir, "commit", "--only", "-m", commitMessage, "--", ...pathspecs]);
+    if (commit.code !== 0) throw new Error(`git commit failed: ${commit.stderr || commit.stdout}`);
+    log.info(`[hook] committed ZIP update in ${projectDir}`);
+  } else if (staged.code !== 0) {
+    throw new Error(`git diff failed: ${staged.stderr}`);
+  } else {
+    log.info(`[hook] archive produced no Git changes in ${projectDir}`);
   }
 }
 
@@ -1650,7 +1725,7 @@ function startControlServer(
       try {
         const body = await request.json().catch(() => ({})) as {
           chat_id?: string; chat?: string; directory?: string; extract_to?: string;
-          text?: string; files?: string[]; new_chat?: boolean;
+          text?: string; files?: string[]; new_chat?: boolean; draft?: boolean;
         };
         if (url.pathname === "/sync-chats") {
           const counts: Array<{ browser_name: string; count: number }> = [];
