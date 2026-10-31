@@ -2065,28 +2065,45 @@ async function runtimeForChat(
 }
 
 async function installFocusTracking(runtime: BrowserRuntime, focus: VirtualFocus) {
+  // The browser itself is authoritative: no desktop/window-manager IPC or
+  // background reconciliation loop is needed. Do not clear virtual focus when
+  // the user switches to a terminal or another application.
   await runtime.context.exposeBinding("__chatgptCtlPageFocused", (source) => {
-    if (!source.page.isClosed() && normalizeUuid(source.page.url())) {
-      setVirtualFocus(focus, runtime, source.page, "manual");
+    const page = source.page;
+    if (!page.isClosed() && normalizeUuid(page.url())) {
+      if (focus.page !== page || focus.runtime !== runtime) {
+        setVirtualFocus(focus, runtime, page, "manual");
+        log.debug(`[focus] browser=${runtime.name} chat=${normalizeUuid(page.url())} selected`);
+      }
     }
   });
+
   const installListeners = () => {
     const notify = () => {
+      // A background tab's focus handler must not steal virtual focus.
       if (document.visibilityState !== "visible" || !document.hasFocus()) return;
       const callback = (window as any).__chatgptCtlPageFocused;
       if (typeof callback === "function") void callback();
     };
+    // Run once per document, including pages restored after navigation.
+    const key = "__chatgptCtlFocusListenersInstalled";
+    if ((window as any)[key]) return;
+    (window as any)[key] = true;
     window.addEventListener("focus", notify);
     document.addEventListener("visibilitychange", notify);
     window.addEventListener("pageshow", notify);
+    document.addEventListener("focusin", notify);
   };
   await runtime.context.addInitScript(installListeners);
 
   const attachPage = (page: Page) => {
     void page.evaluate(installListeners).catch(() => undefined);
     const markWhenActuallyFocused = async () => {
-      const focused = await page.evaluate(() => document.visibilityState === "visible" && document.hasFocus()).catch(() => false);
-      if (focused && !page.isClosed() && normalizeUuid(page.url())) {
+      const focused = await page.evaluate(() =>
+        document.visibilityState === "visible" && document.hasFocus()
+      ).catch(() => false);
+      if (focused && !page.isClosed() && normalizeUuid(page.url()) &&
+          (focus.page !== page || focus.runtime !== runtime)) {
         setVirtualFocus(focus, runtime, page, "manual");
       }
     };
@@ -2113,11 +2130,7 @@ async function installFocusTracking(runtime: BrowserRuntime, focus: VirtualFocus
     attachPage(page);
     focus.onChange?.("page-created");
   });
-  for (const page of runtime.context.pages()) {
-    attachPage(page);
-    const focused = await page.evaluate(() => document.visibilityState === "visible" && document.hasFocus()).catch(() => false);
-    if (focused && normalizeUuid(page.url())) setVirtualFocus(focus, runtime, page, "manual");
-  }
+  for (const page of runtime.context.pages()) attachPage(page);
 }
 
 function startControlServer(
