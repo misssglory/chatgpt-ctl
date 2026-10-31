@@ -12,7 +12,7 @@
 import { TOML } from "bun";
 import { chromium, type BrowserContext, type Download, type Page } from "playwright-core";
 import { Logger } from "tslog";
-import { access, constants, lstat, mkdir, mkdtemp, readdir, rename, rm, readFile } from "node:fs/promises";
+import { access, constants, lstat, mkdir, mkdtemp, readdir, rename, rm, readFile, open } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import postgres from "postgres";
@@ -974,7 +974,9 @@ async function scrapeCurrentChat(page: Page): Promise<ScrapedChat | null> {
 
     if (!chatId) {
       // Prefer the message thread area over floating/sidebar clones
-      const thread = document.querySelector("main") || document.body;
+      const thread = Array.from(document.querySelectorAll("main")).find((main) =>
+        main.getClientRects().length > 0 && getComputedStyle(main).visibility !== "hidden"
+      ) || document.body;
       const sel = thread.querySelector("[data-chatgpt-selection-conversation-id]");
       if (sel) {
         chatId = extractUuid(sel.getAttribute("data-chatgpt-selection-conversation-id"));
@@ -1015,9 +1017,18 @@ async function scrapeCurrentChat(page: Page): Promise<ScrapedChat | null> {
     let seq = 0;
 
     // Units that carry message ids. Filter by conversation when attribute present.
+    // The browser UI mounts previous/alternate conversation surfaces behind
+    // display:none. Only scrape the visible thread: hidden clones can contain
+    // incomplete message markup and can win UUID de-duplication otherwise.
+    const visibleMain = Array.from(document.querySelectorAll("main")).find((main) =>
+      main.getClientRects().length > 0 && getComputedStyle(main).visibility !== "hidden" &&
+      main.querySelector("[data-chatgpt-search-message-ids]")
+    );
+    const messageRoot = visibleMain || document;
     const messageNodes = Array.from(
-      document.querySelectorAll("[data-chatgpt-search-message-ids]")
+      messageRoot.querySelectorAll("[data-chatgpt-search-message-ids]")
     ).filter((node) => {
+      if (!node.getClientRects().length || getComputedStyle(node).visibility === "hidden") return false;
       const owner =
         node.closest("[data-chatgpt-selection-conversation-id]") ||
         node.querySelector("[data-chatgpt-selection-conversation-id]");
@@ -1121,8 +1132,11 @@ async function waitForConversationReady(
 ): Promise<ScrapedChat> {
   const deadline = Date.now() + timeoutMs;
   await page.waitForLoadState("domcontentloaded", { timeout: Math.min(timeoutMs, 15_000) }).catch(() => undefined);
-  await page.locator("main").first().waitFor({ state: "visible", timeout: Math.min(timeoutMs, 20_000) });
-  await page.locator('#prompt-textarea, [data-composer-markdown][contenteditable="true"], [contenteditable="true"][role="textbox"], textarea').first()
+  // ChatGPT may keep hidden/inert previous surfaces mounted during navigation.
+  // Never wait on `.first()` here: it can point to a permanently hidden main.
+  await page.locator("main:visible").first()
+    .waitFor({ state: "visible", timeout: Math.min(timeoutMs, 20_000) });
+  await page.locator('#prompt-textarea:visible, [data-composer-markdown][contenteditable="true"]:visible, [contenteditable="true"][role="textbox"]:visible, textarea:visible').first()
     .waitFor({ state: "visible", timeout: Math.min(timeoutMs, 20_000) });
 
   let previousSignature = "";
@@ -1131,10 +1145,11 @@ async function waitForConversationReady(
     // ChatGPT's scrollable thread container differs between UI revisions.
     // Move every scrollable descendant of main to its end, plus the document.
     await page.evaluate(() => {
-      const roots = Array.from(document.querySelectorAll<HTMLElement>("main, main *"));
-      for (const element of roots) {
-        if (element.scrollHeight > element.clientHeight + 80) {
-          element.scrollTop = element.scrollHeight;
+      const roots = Array.from(document.querySelectorAll<HTMLElement>("main"));
+      for (const root of roots) {
+        if (!root.getClientRects().length || getComputedStyle(root).visibility === "hidden") continue;
+        for (const element of [root, ...Array.from(root.querySelectorAll<HTMLElement>("*"))]) {
+          if (element.scrollHeight > element.clientHeight + 80) element.scrollTop = element.scrollHeight;
         }
       }
       const scrolling = document.scrollingElement;
@@ -1479,7 +1494,12 @@ async function findZipTargets(page: Page): Promise<ZipTarget[]> {
       // as "Open Download the repaired full project ZIP", with no filename.
       // Include those links; the browser Download event supplies the real name.
       const isDescriptiveZipLink = isLink && /\bzip\b/i.test(`${aria} ${title} ${text}`);
-      if (!hasZipExtension && !isDescriptiveZipLink) return;
+      // Generated sandbox files expose a DIL pressable with aria-label
+      // "Open Download <display name>" and often omit both the .zip suffix
+      // and the word ZIP (e.g. "Download updated Watcher — v3").
+      // Only accept a download-like link, then verify ZIP magic after clicking.
+      const isGeneratedDownload = isLink && /^Open\s+Download\b/i.test(aria);
+      if (!hasZipExtension && !isDescriptiveZipLink && !isGeneratedDownload) return;
 
       const label = [aria, downloadName, title, text].find((value) => /\.zip(?:$|[?#\s])/i.test(value))
         || aria || downloadName || title || text || href;
@@ -1578,7 +1598,24 @@ async function downloadZipTarget(page: Page, targetInfo: ZipTarget, directory: s
   const filename = safeFilename(suggested);
   const target = path.join(directory, filename);
   await download.saveAs(target);
-  log.info(`[download] saved ${target}`);
+  // Do not allow a generic "Open Download" pressable to feed a non-ZIP
+  // file into a destructive project-update hook.
+  const handle = await open(target, "r");
+  let magic = Buffer.alloc(4);
+  try {
+    const { bytesRead } = await handle.read(magic, 0, 4, 0);
+    if (bytesRead !== 4) magic = Buffer.alloc(0);
+  } finally {
+    await handle.close();
+  }
+  if (!(magic.length === 4 && magic[0] === 0x50 && magic[1] === 0x4b &&
+    ((magic[2] === 0x03 && magic[3] === 0x04) ||
+     (magic[2] === 0x05 && magic[3] === 0x06) ||
+     (magic[2] === 0x07 && magic[3] === 0x08)))) {
+    await rm(target, { force: true });
+    throw new Error(`selected download '${targetInfo.label}' is not a ZIP archive; hook aborted`);
+  }
+  log.info(`[download] saved verified ZIP ${target}`);
   return target;
 }
 
@@ -1607,7 +1644,12 @@ async function latestAssistantMessage(page: Page, expectedChatId?: string): Prom
   // number override a newer, explicitly numbered turn.
   const latestAssistant = latestAssistantFromMessages(chat.messages);
   if (!latestAssistant?.id) {
-    throw new Error("cannot identify the latest assistant message; refusing to download an older ZIP");
+    const roles = chat.messages.map((message) => `${message.role}:${message.id.slice(0, 8)}`).join(", ");
+    throw new Error(
+      `cannot identify the latest assistant message in ${chat.id}; refusing an older ZIP ` +
+      `(scraped ${chat.messages.length} messages: ${roles || "none"}). ` +
+      `Check visible conversation message selectors and whether the assistant response is loaded.`
+    );
   }
   return { id: latestAssistant.id.toLowerCase(), ...(latestAssistant.turnOrder !== undefined ? { turnOrder: latestAssistant.turnOrder } : {}) };
 }
@@ -1672,8 +1714,10 @@ async function sendInPage(page: Page, text: string, chatId?: string, files: stri
     await page.goto(new URL(`/c/${chatId}`, "https://chatgpt.com").toString(), { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(900);
   }
-  const composer = page.locator('#prompt-textarea, [data-composer-markdown][contenteditable="true"], [contenteditable="true"][role="textbox"], textarea').first();
-  await composer.waitFor({ state: "visible" });
+  // ChatGPT can keep a hidden composer mounted alongside the active one.
+  // `.first()` then waits forever on the hidden instance.
+  const composer = page.locator('#prompt-textarea:visible, [data-composer-markdown][contenteditable="true"]:visible, [contenteditable="true"][role="textbox"]:visible, textarea:visible').last();
+  await composer.waitFor({ state: "visible", timeout: 20_000 });
   if (files.length > 0) {
     const fileInput = page.locator(
       'input[type="file"][aria-label="Attach files" i], ' +
@@ -2493,17 +2537,25 @@ async function watch(cfg: Config, configPath: string) {
                   // stable global turn number proves it is newer. This excludes
                   // historical attachments revealed by scrolling/editing older turns.
                   if (!hasNewUserTurn || !latestAssistant || !zipTargetAssociation(target, latestAssistant)) continue;
-                  if (!pending.has(latestAssistant.id) || !newAssistantMessages.has(latestAssistant.id)) continue;
+                  // The attachment can materialize several polls after the assistant
+                  // message was first persisted. Retain that pending event until
+                  // the ZIP is successfully downloaded or its TTL expires.
+                  if (!pending.has(latestAssistant.id)) continue;
                   if (baselineTurn === null || baselineTurn === undefined ||
                       latestAssistant.turnOrder === undefined || target.messageOrder === null ||
                       target.messageOrder !== latestAssistant.turnOrder || latestAssistant.turnOrder <= baselineTurn) continue;
                   const hookKey = `${chat.id}:${target.identity}`;
                   if (handledHookDownloads.has(hookKey)) continue;
-                  handledHookDownloads.add(hookKey);
                   try {
                     const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
                     const archive = await downloadZipTarget(page, target, archiveDir);
-                    if (archive) await runHookForZip(page, chat.id, hook, archive, configPath);
+                    if (archive) {
+                      // Mark handled only once the download is captured. Avoid
+                      // permanently losing transient click/download failures.
+                      handledHookDownloads.add(hookKey);
+                      pending.delete(latestAssistant.id);
+                      await runHookForZip(page, chat.id, hook, archive, configPath);
+                    }
                   } catch (hookError) {
                     log.error(`[hook] chat=${chat.id} failed: ${formatError(hookError)}`);
                   }
