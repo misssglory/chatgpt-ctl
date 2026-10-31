@@ -37,8 +37,8 @@ struct Cli {
 enum Commands {
     /// List chats (most recently updated first)
     Chats {
-        /// Max rows
-        #[arg(short, long, default_value_t = 50)]
+        /// Max rows (0 = all chats across all browser profiles)
+        #[arg(short, long, default_value_t = 0)]
         limit: i64,
         /// Case-insensitive title substring filter
         #[arg(short, long)]
@@ -71,7 +71,7 @@ enum Commands {
         chat: Option<String>,
     },
 
-    /// Close an opened chat pane by UUID, unique title substring, or 0-based pane index.
+    /// Close an opened chat pane by UUID, unique title substring, or 0-based chats index.
     Close {
         /// Chat UUID, title substring, or 0-based index from `chatgpt-ctl chats`
         chat: String,
@@ -80,10 +80,13 @@ enum Commands {
     /// Open a blank new chat in its own watcher browser pane (URL has no conversation UUID).
     NewChat,
 
-    /// Download the newest ZIP attachment from the currently open conversation.
+    /// Download the newest ZIP attachment from virtual focus or a selected chat.
     DownloadLastZip {
         /// Destination directory for the ZIP file (default: ./var/downloads)
         directory: Option<PathBuf>,
+        /// Chat UUID, title substring, or 0-based index; defaults to virtual focus
+        #[arg(short = 'c', long = "chat", value_name = "CHAT")]
+        chat: Option<String>,
         /// Extract the downloaded ZIP into this directory (keeps the ZIP file)
         #[arg(long = "extract-to", alias = "unzip-to", value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
         extract_to: Option<PathBuf>,
@@ -268,22 +271,45 @@ async fn connect(url: &str) -> Result<Client> {
 struct ChatRow {
     id: Uuid,
     title: String,
+    browser_name: String,
     updated_at: Option<DateTime<Utc>>,
     message_count: i64,
+    /// Zero-based position in the complete, unfiltered combined chat ordering.
+    global_index: i64,
+}
+
+async fn ensure_browser_map_table(client: &Client) -> Result<()> {
+    client.execute(
+        r#"CREATE TABLE IF NOT EXISTS chatgpt_watcher_chat_browsers (
+             chat_id uuid PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+             browser_name text NOT NULL DEFAULT 'default',
+             updated_at timestamptz NOT NULL DEFAULT now()
+           )"#,
+        &[],
+    ).await?;
+    Ok(())
 }
 
 async fn list_chats(client: &Client, limit: i64, query: Option<&str>) -> Result<Vec<ChatRow>> {
+    ensure_browser_map_table(client).await?;
     let rows = if let Some(q) = query {
         let pattern = format!("%{}%", q);
         client
             .query(
                 r#"
-                SELECT c.id, c.title, c.updated_at,
-                       (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS message_count
-                FROM chats c
-                WHERE c.title ILIKE $1 OR c.id::text ILIKE $1
-                ORDER BY c.updated_at DESC NULLS LAST
-                LIMIT $2
+                WITH ranked_chats AS (
+                    SELECT c.id, c.title, COALESCE(b.browser_name, 'default') AS browser_name,
+                           c.updated_at,
+                           (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS message_count,
+                           (row_number() OVER (ORDER BY c.updated_at DESC NULLS LAST, c.id DESC) - 1) AS global_index
+                    FROM chats c
+                    LEFT JOIN chatgpt_watcher_chat_browsers b ON b.chat_id = c.id
+                )
+                SELECT id, title, browser_name, updated_at, message_count, global_index
+                FROM ranked_chats
+                WHERE title ILIKE $1 OR id::text ILIKE $1
+                ORDER BY global_index
+                LIMIT NULLIF($2::bigint, 0::bigint)
                 "#,
                 &[&pattern, &limit],
             )
@@ -292,11 +318,18 @@ async fn list_chats(client: &Client, limit: i64, query: Option<&str>) -> Result<
         client
             .query(
                 r#"
-                SELECT c.id, c.title, c.updated_at,
-                       (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS message_count
-                FROM chats c
-                ORDER BY c.updated_at DESC NULLS LAST
-                LIMIT $1
+                WITH ranked_chats AS (
+                    SELECT c.id, c.title, COALESCE(b.browser_name, 'default') AS browser_name,
+                           c.updated_at,
+                           (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS message_count,
+                           (row_number() OVER (ORDER BY c.updated_at DESC NULLS LAST, c.id DESC) - 1) AS global_index
+                    FROM chats c
+                    LEFT JOIN chatgpt_watcher_chat_browsers b ON b.chat_id = c.id
+                )
+                SELECT id, title, browser_name, updated_at, message_count, global_index
+                FROM ranked_chats
+                ORDER BY global_index
+                LIMIT NULLIF($1::bigint, 0::bigint)
                 "#,
                 &[&limit],
             )
@@ -308,17 +341,20 @@ async fn list_chats(client: &Client, limit: i64, query: Option<&str>) -> Result<
         .map(|r| ChatRow {
             id: r.get(0),
             title: r.get(1),
-            updated_at: r.get(2),
-            message_count: r.get(3),
+            browser_name: r.get(2),
+            updated_at: r.get(3),
+            message_count: r.get(4),
+            global_index: r.get(5),
         })
         .collect())
 }
 
 async fn resolve_chat_id(client: &Client, spec: &str) -> Result<Uuid> {
+    ensure_browser_map_table(client).await?;
     if spec.eq_ignore_ascii_case("current") || spec.is_empty() {
         let row = client
             .query_opt(
-                "SELECT id FROM chats ORDER BY updated_at DESC NULLS LAST LIMIT 1",
+                "SELECT id FROM chats ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 1",
                 &[],
             )
             .await?
@@ -330,14 +366,25 @@ async fn resolve_chat_id(client: &Client, spec: &str) -> Result<Uuid> {
         return Ok(u);
     }
 
+    // Numeric selectors are zero-based indices in the unified `chats` listing.
+    if spec.chars().all(|ch| ch.is_ascii_digit()) {
+        let index: i64 = spec.parse().context("chat index is too large")?;
+        let row = client.query_opt(
+            "SELECT id FROM chats ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 1 OFFSET $1",
+            &[&index],
+        ).await?.with_context(|| format!("no chat at 0-based index {index}; run `chatgpt-ctl chats` to inspect the list"))?;
+        return Ok(row.get(0));
+    }
+
     // Title / partial uuid match
     let pattern = format!("%{}%", spec);
     let rows = client
         .query(
             r#"
-            SELECT id, title FROM chats
-            WHERE title ILIKE $1 OR id::text ILIKE $1
-            ORDER BY updated_at DESC NULLS LAST
+            SELECT c.id, c.title, COALESCE(b.browser_name, 'default')
+            FROM chats c LEFT JOIN chatgpt_watcher_chat_browsers b ON b.chat_id = c.id
+            WHERE c.title ILIKE $1 OR c.id::text ILIKE $1
+            ORDER BY c.updated_at DESC NULLS LAST, c.id DESC
             LIMIT 10
             "#,
             &[&pattern],
@@ -352,7 +399,8 @@ async fn resolve_chat_id(client: &Client, spec: &str) -> Result<Uuid> {
         for r in &rows {
             let id: Uuid = r.get(0);
             let title: String = r.get(1);
-            eprintln!("  {}  {}", id, title);
+            let browser_name: String = r.get(2);
+            eprintln!("  [{}] {}  {}", browser_name, id, title);
         }
         anyhow::bail!("refine the query (or pass a full UUID)");
     }
@@ -822,38 +870,34 @@ async fn main() -> Result<()> {
         }
         Commands::Chats { limit, query, refresh } => {
             if refresh {
-                run_watcher(&watcher_args("sync-chats", &["--quiet".to_string()]))?;
-            }
-            let client = connect(&url).await?;
-            let mut chats = list_chats(&client, limit, query.as_deref()).await?;
-            let (open_chats, focused_chat) = watcher_status();
-            // Include open panes even when their conversations fall outside --limit.
-            if query.is_none() {
-                for id in &open_chats {
-                    if chats.iter().any(|chat| chat.id == *id) { continue; }
-                    if let Some(row) = client.query_opt(
-                        r#"SELECT c.id, c.title, c.updated_at,
-                                  (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id)
-                           FROM chats c WHERE c.id = $1"#,
-                        &[id],
-                    ).await? {
-                        chats.push(ChatRow { id: row.get(0), title: row.get(1), updated_at: row.get(2), message_count: row.get(3) });
+                // Prefer the already-running watcher so profile locks are never
+                // contended by a second Chromium process. Fall back to a one-shot
+                // sync when the control server is not running.
+                match watcher_request("POST", "/sync-chats", Some("{}")) {
+                    Ok(_) => {}
+                    Err(error) if format!("{error:#}").contains("connect to watcher control server") => {
+                        run_watcher(&watcher_args("sync-chats", &["--quiet".to_string()]))?;
                     }
+                    Err(error) => return Err(error),
                 }
             }
-            for c in chats {
-                let ts = c
-                    .updated_at
+            let client = connect(&url).await?;
+            let chats = list_chats(&client, limit, query.as_deref()).await?;
+            let (open_chats, focused_chat) = watcher_status();
+            println!("  #  BROWSER       STATE     CHAT ID                                  MSGS  UPDATED          TITLE");
+            for c in chats.iter() {
+                let ts = c.updated_at
                     .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or_else(|| "-".into());
                 let pane_index = open_chats.iter().position(|id| *id == c.id);
+                let state = if focused_chat == Some(c.id) { "FOCUSED" } else if pane_index.is_some() { "OPEN" } else { "" };
+                let line = format!("{:>3}  {:<12}  {:<8}  {}  {:>4}  {:<16}  {}", c.global_index, c.browser_name, state, c.id, c.message_count, ts, c.title.replace('\n', " ").replace('\r', " "));
                 if focused_chat == Some(c.id) {
-                    // The active browser pane is the target for download-last-zip.
-                    println!("\x1b[1;30;103m▶ FOCUSED / ZIP TARGET [{}] {}\t{:>4} msgs\t{}\t{}\x1b[0m", pane_index.unwrap_or(0), c.id, c.message_count, ts, c.title);
-                } else if let Some(pane_index) = pane_index {
-                    println!("\x1b[1;36m● OPEN [{pane_index}] {}\t{:>4} msgs\t{}\t{}\x1b[0m", c.id, c.message_count, ts, c.title);
+                    println!("\x1b[1;30;103m▶ {line}\x1b[0m");
+                } else if pane_index.is_some() {
+                    println!("\x1b[1;36m● {line}\x1b[0m");
                 } else {
-                    println!("  {}\t{:>4} msgs\t{}\t{}", c.id, c.message_count, ts, c.title);
+                    println!("  {line}");
                 }
             }
         }
@@ -884,13 +928,15 @@ async fn main() -> Result<()> {
             let response = watcher_request("POST", "/send", Some(&body))?;
             let value: serde_json::Value = serde_json::from_str(&response)?;
             let destination = value.get("chat_id").and_then(|v| v.as_str()).unwrap_or("focused chat");
+            let browser_name = value.get("browser_name").and_then(|v| v.as_str()).unwrap_or("default");
             if new_chat {
-                println!("message sent to new chat {destination} ({})", value.get("url").and_then(|v| v.as_str()).unwrap_or("ChatGPT pane"));
+                println!("message sent to new chat {destination} [{browser_name}] ({})", value.get("url").and_then(|v| v.as_str()).unwrap_or("ChatGPT pane"));
             } else {
-                println!("message sent to {destination} ({})", value.get("url").and_then(|v| v.as_str()).unwrap_or("ChatGPT pane"));
+                println!("message sent to {destination} [{browser_name}] ({})", value.get("url").and_then(|v| v.as_str()).unwrap_or("ChatGPT pane"));
             }
         }
         Commands::Open { chat } => {
+            let command_started = std::time::Instant::now();
             let client = connect(&url).await?;
             let chat_id = match chat {
                 Some(spec) => resolve_chat_id(&client, &spec).await?,
@@ -901,35 +947,48 @@ async fn main() -> Result<()> {
             let value: serde_json::Value = serde_json::from_str(&response)?;
             let already_open = value.get("already_open").and_then(|v| v.as_bool()).unwrap_or(false);
             let pane_index = value.get("pane_index").and_then(|v| v.as_i64());
+            let browser_name = value.get("browser_name").and_then(|v| v.as_str()).unwrap_or("default");
+            let watcher_ms = value.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            let total_ms = command_started.elapsed().as_millis();
             if already_open {
-                println!("focused existing pane{} for {chat_id}", pane_index.map(|i| format!(" [{i}] ")).unwrap_or_else(|| " ".into()));
+                println!("focused existing pane{} for {chat_id} in browser {browser_name} (total {total_ms} ms; watcher {watcher_ms} ms)", pane_index.map(|i| format!(" [{i}] ")).unwrap_or_else(|| " ".into()));
             } else {
-                println!("opened {chat_id} in a new pane{}", pane_index.map(|i| format!(" [{i}] ")).unwrap_or_default());
+                println!("opened {chat_id} in browser {browser_name} in a new pane{} (total {total_ms} ms; watcher {watcher_ms} ms)", pane_index.map(|i| format!(" [{i}] ")).unwrap_or_default());
             }
         }
         Commands::Close { chat } => {
-            let body = serde_json::json!({ "chat": &chat }).to_string();
+            let client = connect(&url).await?;
+            let chat_id = resolve_chat_id(&client, &chat).await?;
+            let body = serde_json::json!({ "chat_id": chat_id }).to_string();
             let response = watcher_request("POST", "/close", Some(&body))?;
             let value: serde_json::Value = serde_json::from_str(&response)?;
-            println!("closed {}", value.get("closed_chat_id").and_then(|v| v.as_str()).unwrap_or(&chat));
+            let browser_name = value.get("browser_name").and_then(|v| v.as_str()).unwrap_or("unknown");
+            println!("closed {} from browser {browser_name}", value.get("closed_chat_id").and_then(|v| v.as_str()).unwrap_or(&chat));
         }
         Commands::NewChat => {
             let response = watcher_request("POST", "/new-chat", Some("{}"))?;
             let value: serde_json::Value = serde_json::from_str(&response)?;
             println!("opened blank chat in a new pane ({})", value.get("url").and_then(|v| v.as_str()).unwrap_or("ChatGPT"));
         }
-        Commands::DownloadLastZip { directory, extract_to } => {
+        Commands::DownloadLastZip { directory, chat, extract_to } => {
+            let chat_id = if let Some(spec) = chat {
+                let client = connect(&url).await?;
+                Some(resolve_chat_id(&client, &spec).await?)
+            } else {
+                None
+            };
             let cwd = std::env::current_dir()?;
             let absolute = |value: Option<PathBuf>| -> Option<PathBuf> {
                 value.map(|path| if path.is_absolute() { path } else { cwd.join(path) })
             };
             let body = serde_json::json!({
+                "chat_id": chat_id,
                 "directory": absolute(directory),
                 "extract_to": absolute(extract_to),
             }).to_string();
             let response = watcher_request("POST", "/download-last-zip", Some(&body))?;
             let value: serde_json::Value = serde_json::from_str(&response)?;
-            println!("{}", value.get("path").and_then(|v| v.as_str()).unwrap_or("download complete"));
+            println!("{} [browser: {}]", value.get("path").and_then(|v| v.as_str()).unwrap_or("download complete"), value.get("browser_name").and_then(|v| v.as_str()).unwrap_or("virtual focus"));
             if let Some(destination) = value.get("extracted_to").and_then(|v| v.as_str()) {
                 println!("extracted to {destination}");
             }

@@ -113,9 +113,9 @@ nix build
 chatgpt-ctl chats [--limit N] [-q substring] [--refresh]
 chatgpt-ctl send "message text" [--chat CHAT | --new-chat] [-f PATH]...  # focused, targeted, or new chat
 chatgpt-ctl open [CHAT|current]              # UUID/title; new pane unless already open
-chatgpt-ctl close <CHAT|INDEX>               # close by UUID/title or 0-based open-pane index
+chatgpt-ctl close <CHAT|INDEX>               # close by UUID/title or 0-based chats index
 chatgpt-ctl new-chat                         # open a blank chat in a separate pane
-chatgpt-ctl download-last-zip [DIRECTORY] [--extract-to DIR]  # download, optionally extract
+chatgpt-ctl download-last-zip [DIRECTORY] [--chat CHAT] [--extract-to DIR]  # virtual focus or routed chat
 chatgpt-ctl history [CHAT|current] [--all] [--follow] [--json]
 chatgpt-ctl retry <CHAT> enable|disable      # auto-click the final Retry button per chat
 chatgpt-ctl history                          # interactive; TAB completes titles/UUIDs from DB
@@ -178,11 +178,11 @@ While `bun run watch` is running, it exposes a localhost control endpoint
 `chatgpt-ctl open <CHAT>` focuses the existing page when that chat is already open,
 or creates a new page and opens it otherwise. The watcher polls and persists messages,
 Retry settings, and ZIP/build hooks independently in every open conversation page.
-`chatgpt-ctl chats` marks every opened conversation with a cyan `●` and its 0-based
-pane index. `chatgpt-ctl close <CHAT>` closes a pane by UUID or unique title substring;
-`chatgpt-ctl close 0` closes the first currently opened conversation pane (indices follow
-the order shown by `chats`). Closing the active pane focuses another open conversation,
-or creates a blank ChatGPT page if none remain. `chatgpt-ctl send` submits into the currently focused browser tab by default. Use `--chat CHAT` to
+`chatgpt-ctl chats` marks every opened conversation with a cyan `●`. `chatgpt-ctl close <CHAT>`
+closes a pane by UUID or unique title substring; `chatgpt-ctl close 0` resolves the first row
+in the combined `chats` table and closes it when that chat is open. Numeric selectors use the
+same stable order as the unfiltered `chats` listing. Closing the active pane focuses another open conversation,
+or creates a blank ChatGPT page if none remain. `chatgpt-ctl send` submits into the virtual-focus chat by default. Use `--chat CHAT` to
 send to a specific chat by UUID or title substring; if it is not already open, the watcher creates
 a new pane for it. Sending focuses the destination pane. Browser tab focus is tracked from page
 focus/visibility events, in addition to `open` and `send` commands.
@@ -192,7 +192,7 @@ or `CHATGPT_CTL_HOST` / `CHATGPT_CTL_PORT` for the watcher to override the addre
 The interactive `open` prompt uses cached PostgreSQL chat titles and UUIDs for TAB completion.
 
 `chatgpt-ctl download-last-zip [DIRECTORY]` asks the watcher to download the newest ZIP attachment
-from the currently open conversation. With no directory it uses `[downloads].directory` from
+from the virtual-focus conversation. Pass `--chat CHAT` to route to a UUID, title, or chats index. With no directory it uses `[downloads].directory` from
 `config.toml` (default `./var/downloads`). Add `--extract-to DIR` (alias `--unzip-to`) to
 extract the downloaded archive into `DIR`; the original ZIP is kept. If the archive contains
 exactly one top-level directory, its contents are merged directly into `DIR` (so no redundant
@@ -206,8 +206,9 @@ chatgpt-ctl download-last-zip ./var/downloads --extract-to ./work/latest-project
 ```
 
 `chatgpt-ctl send "message text" [--chat CHAT | --new-chat] [-f PATH]...` sends through the watcher's browser
-context. Without `--chat`, it sends to the currently focused pane. With `--chat`, it resolves a
-UUID or title substring and sends to that conversation, opening a new pane if necessary. Use
+context. Without `--chat`, it sends to the virtual-focus pane. With `--chat`, it resolves a
+UUID, title substring, or unfiltered chats index and sends to that conversation in its mapped
+browser, opening a new pane if necessary. Use
 `--new-chat` (alias `--new`) to create a separate blank pane, send the first message, wait for
 ChatGPT to assign the conversation UUID, and print that acquired UUID. The watcher immediately persists the acquired UUID and first visible messages to PostgreSQL,
 so the new conversation is available to `chats`, `open`, and `history` without waiting for the
@@ -371,3 +372,64 @@ idle. The watcher persists this snapshot and establishes the per-chat hook basel
 any automation. Hook candidates must be the newest completed assistant message and have a stable
 turn number greater than the initialization baseline. This prevents historical ZIP links that appear
 when scrolling through or editing older messages from being clicked by automatic hooks.
+
+
+## Multiple isolated browser accounts
+
+The watcher now manages one Chromium profile per browser name while keeping a single
+control server on the existing `127.0.0.1:17381` port. The existing
+`[chatgpt].profile_dir` remains the `default` browser profile, so existing login
+cookies and local storage are reused without moving the profile.
+
+The existing profile is named `default`; `bun run login` creates/opens that profile.
+Create another independently authenticated profile with:
+
+```bash
+bun run login --browser-name work
+bun run login --browser-name research
+```
+
+Both `--browser-name name` and `--browser-name=name` are accepted. Stop the watcher
+before logging into a profile that it currently has open; otherwise Chromium may refuse
+to acquire the profile lock. After adding a new profile, restart `bun run watch` so it
+can discover and attach to it.
+
+Each command launches a normal Chromium window for ChatGPT. Sign into the account,
+then close the window. Named profiles are stored beside the default profile in a
+`<profile_dir>.profiles/<browser-name>/` directory. Browser names are lowercase
+letters, digits, `_` or `-`; `default` is reserved for the original profile.
+
+Start the watcher normally:
+
+```bash
+bun run watch
+```
+
+It discovers `default` and every named profile directory and attaches a separate
+persistent Playwright context to each. Cookies, local storage, and browser session
+state remain isolated. No browser-name option is needed for chat commands: a chat's
+saved browser mapping determines where the command runs.
+
+`chatgpt-ctl chats` now displays one combined table for all browser profiles (all rows by default; use `--limit N` to cap it), with
+browser name, open/focused state, and a zero-based global row index. The index can be used
+where a chat selector is accepted, for example `chatgpt-ctl open 0` or
+`chatgpt-ctl send --chat 1 "message"`. Titles must resolve uniquely; duplicate
+matches are reported with their browser names. `chatgpt-ctl chats --refresh` asks
+the running watcher to refresh all profiles, avoiding a second Chromium process
+trying to lock the same profile.
+
+The watcher maintains a virtual focus shared across browser profiles. `open` sets
+it to the requested chat; focusing or manually navigating to a conversation in any profile
+updates it as well. Blank tabs and non-conversation pages do not steal the last-chat focus.
+Commands
+without an explicit chat target (such as `send` and `download-last-zip`) use that
+virtual focus. `download-last-zip --chat CHAT` also accepts a UUID, title, or chats index
+and opens/routs that target automatically. A chat-specific command (`open`, `send --chat`, `retry`, or `hook run`)
+is dispatched to the profile associated with that chat.
+
+Focusing a chat that is already open no longer waits for the full conversation
+readiness scan or re-scrapes the message history. It focuses the existing page and
+returns immediately; the normal watcher scan continues to enforce conversation
+readiness before persistence and automatic hooks. Newly opened chats still wait for
+the initial page readiness gate. `chatgpt-ctl open` reports both total command time
+and watcher-side time, which separates database/CLI delay from browser focus delay.

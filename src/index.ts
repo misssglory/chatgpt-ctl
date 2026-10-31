@@ -87,6 +87,26 @@ interface SidebarChat {
   url: string;
 }
 
+interface BrowserProfile {
+  name: string;
+  profileDir: string;
+}
+
+interface BrowserRuntime extends BrowserProfile {
+  context: BrowserContext;
+  activePage?: Page;
+  lastFocusAt: number;
+}
+
+interface VirtualFocus {
+  runtime?: BrowserRuntime;
+  page?: Page;
+  at: number;
+  source: "manual" | "ctl";
+  /** Per-page timestamps are needed when the previously focused page closes. */
+  pageFocusAt: WeakMap<Page, number>;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -123,6 +143,46 @@ async function mergeDirectoryContents(sourceDir: string, destinationDir: string)
 function resolveFromConfig(configPath: string, rel: string): string {
   if (path.isAbsolute(rel)) return rel;
   return path.resolve(path.dirname(configPath), rel);
+}
+
+function normalizeBrowserName(raw: string): string {
+  const name = raw.trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9_-]{0,47}$/.test(name)) {
+    throw new Error(`invalid browser name "${raw}"; use 1-48 letters, numbers, '_' or '-'`);
+  }
+  return name;
+}
+
+function browserProfilesRoot(defaultProfileDir: string): string {
+  return `${defaultProfileDir}.profiles`;
+}
+
+function resolveBrowserProfileDir(cfg: Config, configPath: string, browserName: string): string {
+  const name = normalizeBrowserName(browserName);
+  const defaultDir = resolveFromConfig(configPath, cfg.chatgpt.profile_dir);
+  if (name === "default") return defaultDir;
+  return path.join(browserProfilesRoot(defaultDir), name);
+}
+
+async function discoverBrowserProfiles(cfg: Config, configPath: string): Promise<BrowserProfile[]> {
+  const defaultProfile = resolveBrowserProfileDir(cfg, configPath, "default");
+  const profiles: BrowserProfile[] = [{ name: "default", profileDir: defaultProfile }];
+  const namedProfiles: BrowserProfile[] = [];
+  const root = browserProfilesRoot(defaultProfile);
+  try {
+    const entries = await readdir(root, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name === "default") continue;
+      try {
+        const name = normalizeBrowserName(entry.name);
+        namedProfiles.push({ name, profileDir: path.join(root, name) });
+      } catch { /* Ignore folders that are not valid named profiles. */ }
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  namedProfiles.sort((a, b) => a.name.localeCompare(b.name));
+  return profiles.concat(namedProfiles);
 }
 
 async function loadConfig(configPath: string): Promise<Config> {
@@ -221,6 +281,48 @@ type ChatHook = {
   build_command: string | null;
   enabled: boolean;
 };
+
+async function ensureBrowserSchema(sql: Sql): Promise<void> {
+  await sql.unsafe(`
+    CREATE TABLE IF NOT EXISTS chatgpt_watcher_chat_browsers (
+      chat_id uuid PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+      browser_name text NOT NULL DEFAULT 'default',
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+  await sql.unsafe(`
+    CREATE TABLE IF NOT EXISTS chatgpt_watcher_browsers (
+      name text PRIMARY KEY,
+      profile_dir text NOT NULL,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+}
+
+async function registerBrowser(sql: Sql, profile: BrowserProfile): Promise<void> {
+  await sql`
+    INSERT INTO chatgpt_watcher_browsers (name, profile_dir, updated_at)
+    VALUES (${profile.name}, ${profile.profileDir}, NOW())
+    ON CONFLICT (name) DO UPDATE SET profile_dir=EXCLUDED.profile_dir, updated_at=NOW()
+  `;
+}
+
+async function recordChatBrowser(sql: Sql, chatId: string, browserName: string): Promise<void> {
+  const id = normalizeUuid(chatId);
+  if (!id) return;
+  await sql`
+    INSERT INTO chatgpt_watcher_chat_browsers (chat_id, browser_name, updated_at)
+    VALUES (${id}::uuid, ${browserName}, NOW())
+    ON CONFLICT (chat_id) DO UPDATE SET browser_name=EXCLUDED.browser_name, updated_at=NOW()
+  `;
+}
+
+async function browserNameForChat(sql: Sql, chatId: string): Promise<string | null> {
+  const rows = await sql`
+    SELECT browser_name FROM chatgpt_watcher_chat_browsers WHERE chat_id = ${chatId}::uuid
+  `;
+  return rows.length ? String(rows[0]!.browser_name) : null;
+}
 
 async function ensureRetrySchema(sql: Sql): Promise<void> {
   await sql.unsafe(`
@@ -323,7 +425,7 @@ async function flush(cfg: Config) {
   }
 }
 
-async function upsertChat(sql: Sql, chat: ScrapedChat): Promise<void> {
+async function upsertChat(sql: Sql, chat: ScrapedChat, browserName = "default"): Promise<void> {
   const chatId = normalizeUuid(chat.id);
   if (!chatId) throw new Error(`upsertChat: invalid chat id "${chat.id}"`);
   await sql`
@@ -335,10 +437,11 @@ async function upsertChat(sql: Sql, chat: ScrapedChat): Promise<void> {
       updated_at = NOW(),
       last_message_at = NOW()
   `;
+  await recordChatBrowser(sql, chatId, browserName);
 }
 
 /** Synchronize sidebar metadata without making every chat look newly active. */
-async function upsertSidebarChats(sql: Sql, chats: SidebarChat[]): Promise<void> {
+async function upsertSidebarChats(sql: Sql, chats: SidebarChat[], browserName = "default"): Promise<void> {
   for (const chat of chats) {
     await sql`
       INSERT INTO chats (id, title, url, updated_at)
@@ -351,6 +454,7 @@ async function upsertSidebarChats(sql: Sql, chats: SidebarChat[]): Promise<void>
           ELSE chats.updated_at
         END
     `;
+    await recordChatBrowser(sql, chat.id, browserName);
   }
 }
 
@@ -404,11 +508,12 @@ async function upsertMessage(sql: Sql, chatId: string, msg: ScrapedMessage): Pro
 async function launchContext(
   cfg: Config,
   configPath: string,
-  headless: boolean
+  headless: boolean,
+  browserName = "default"
 ): Promise<BrowserContext> {
   const executablePath = await resolveBrowserExecutable(cfg, configPath);
-  const profileDir = resolveFromConfig(configPath, cfg.chatgpt.profile_dir);
-  await mkdir(profileDir, { recursive: true });
+  const profileDir = resolveBrowserProfileDir(cfg, configPath, browserName);
+  await mkdir(profileDir, { recursive: true, mode: 0o700 });
 
   const nativeWindowViewport = !headless && (cfg.browser?.native_window_viewport ?? true);
   const viewport = nativeWindowViewport
@@ -544,9 +649,9 @@ async function scrapeSidebarChats(page: Page, scrollAll = false): Promise<Sideba
   }, scrollAll);
 }
 
-async function syncSidebarChats(page: Page, sql: Sql, scrollAll = false): Promise<SidebarChat[]> {
+async function syncSidebarChats(page: Page, sql: Sql, scrollAll = false, browserName = "default"): Promise<SidebarChat[]> {
   const chats = await scrapeSidebarChats(page, scrollAll);
-  await upsertSidebarChats(sql, chats);
+  await upsertSidebarChats(sql, chats, browserName);
   return chats;
 }
 
@@ -801,19 +906,44 @@ async function ensureCurrentChatGPTPage(page: Page, cfg: Config) {
 }
 
 async function syncChatsCommand(cfg: Config, configPath: string, quiet = false) {
-  const sql = openDb(cfg);
-  const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false);
   try {
-    const page = await getPage(context);
-    attachNetworkDebug(page, cfg);
-    await openChatGPT(page, cfg);
-    const chats = await syncSidebarChats(page, sql, true);
-    if (!quiet) {
-      for (const chat of chats) console.log(`${chat.id}\t${chat.title}`);
+    const response = await fetch(`http://${CONTROL_HOST}:${CONTROL_PORT}/sync-chats`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: "{}",
+    });
+    if (response.ok) {
+      const result = await response.json() as { total?: number; browsers?: Array<{ browser_name: string; count: number }> };
+      if (!quiet) for (const browser of result.browsers ?? []) console.log(`${browser.browser_name}\t${browser.count} chats synchronized`);
+      log.info(`[chats] refreshed ${result.total ?? 0} sidebar chats through the running multi-browser watcher`);
+      return;
     }
-    log.info(`[chats] synchronized ${chats.length} sidebar chats`);
+    if (response.status !== 404) throw new Error(await response.text());
+  } catch (error) {
+    if (error instanceof Error && !/fetch failed|ECONNREFUSED|Failed to fetch/i.test(error.message)) throw error;
+  }
+  const sql = openDb(cfg);
+  const profiles = await discoverBrowserProfiles(cfg, configPath);
+  let total = 0;
+  try {
+    await ensureBrowserSchema(sql);
+    for (const profile of profiles) {
+      await registerBrowser(sql, profile);
+      const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false, profile.name);
+      try {
+        const page = await getPage(context);
+        attachNetworkDebug(page, cfg);
+        await ensureCurrentChatGPTPage(page, cfg);
+        const chats = await syncSidebarChats(page, sql, true, profile.name);
+        total += chats.length;
+        if (!quiet) {
+          for (const chat of chats) console.log(`${profile.name}\t${chat.id}\t${chat.title}`);
+        }
+        log.info(`[chats] browser=${profile.name} synchronized ${chats.length} sidebar chats`);
+      } finally {
+        await context.close();
+      }
+    }
+    log.info(`[chats] synchronized ${total} sidebar chat rows across ${profiles.length} browser profile(s)`);
   } finally {
-    await context.close();
     await sql.end();
   }
 }
@@ -830,16 +960,16 @@ async function openChatCommand(_cfg: Config, _configPath: string, rawId: string)
       body: JSON.stringify({ chat_id: chatId }),
     }
   );
-  const result = await response.json().catch(() => ({})) as { error?: string; url?: string };
+  const result = await response.json().catch(() => ({})) as { error?: string; url?: string; browser_name?: string; already_open?: boolean };
   if (!response.ok) {
     throw new Error(result.error || `watch control server returned ${response.status}; start \`bun run watch\` first`);
   }
-  console.log(result.url || `opened ${chatId}`);
+  console.log(`${result.already_open ? "focused" : "opened"} ${chatId} in browser ${result.browser_name || "default"} (${result.url || "ChatGPT"})`);
 }
 
 async function sendMessageCommand(
-  cfg: Config,
-  configPath: string,
+  _cfg: Config,
+  _configPath: string,
   text: string,
   files: string[]
 ) {
@@ -848,53 +978,14 @@ async function sendMessageCommand(
   }
   const resolvedFiles = files.map((file) => path.resolve(file));
   for (const file of resolvedFiles) await access(file, constants.R_OK);
-
-  const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false);
-  try {
-    const page = await getPage(context);
-    attachNetworkDebug(page, cfg);
-    await ensureCurrentChatGPTPage(page, cfg);
-
-    const composer = page.locator(
-      '#prompt-textarea, [data-composer-markdown][contenteditable="true"], ' +
-        '[contenteditable="true"][role="textbox"], textarea'
-    ).first();
-    await composer.waitFor({ state: "visible" });
-
-    if (resolvedFiles.length > 0) {
-      const fileInput = page.locator(
-        'input[type="file"][aria-label="Attach files" i], ' +
-          'input[type="file"]:not([capture]):not([accept*="image" i]):not([accept*="video" i])'
-      ).first();
-      if (await fileInput.count()) {
-        await fileInput.setInputFiles(resolvedFiles);
-      } else {
-        throw new Error("send: could not find ChatGPT's file upload input");
-      }
-      // Let attachment rows initialize; clicking send below still waits for enablement.
-      await page.waitForTimeout(1000);
-    }
-
-    if (text) await composer.fill(text);
-    const sendButton = page.locator(
-      'button[data-testid="send-button"], button[aria-label="Send message" i], ' +
-        'button[aria-label="Send" i], button[data-composer-navigation-target="send"]'
-    ).first();
-
-    try {
-      await sendButton.waitFor({ state: "visible", timeout: 5000 });
-      await sendButton.click();
-    } catch (error) {
-      if (!text || (await sendButton.count())) throw error;
-      await composer.press("Enter");
-    }
-    await page.waitForTimeout(1000);
-    log.info(
-      `[send] submitted text_chars=${text.length} files=${resolvedFiles.length} url=${page.url()}`
-    );
-  } finally {
-    await context.close();
-  }
+  const response = await fetch(`http://${CONTROL_HOST}:${CONTROL_PORT}/send`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text, files: resolvedFiles }),
+  });
+  const result = await response.json().catch(() => ({})) as { error?: string; chat_id?: string; browser_name?: string };
+  if (!response.ok) throw new Error(result.error || `watch control server returned ${response.status}; start \`bun run watch\` first`);
+  log.info(`[send] submitted to browser=${result.browser_name ?? "virtual-focus"} chat=${result.chat_id ?? "current"}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -940,12 +1031,14 @@ async function doctor(cfg: Config, configPath: string) {
  * Launch a NORMAL Chromium (no Playwright automation) so the user can log in.
  * Cookies / local storage land in profile_dir and are reused by watch/dump.
  */
-async function login(cfg: Config, configPath: string) {
+async function login(cfg: Config, configPath: string, browserName = "default") {
+  browserName = normalizeBrowserName(browserName);
   const executablePath = await resolveBrowserExecutable(cfg, configPath);
-  const profileDir = resolveFromConfig(configPath, cfg.chatgpt.profile_dir);
-  await mkdir(profileDir, { recursive: true });
+  const profileDir = resolveBrowserProfileDir(cfg, configPath, browserName);
+  await mkdir(profileDir, { recursive: true, mode: 0o700 });
 
   log.info(`[login] browser=${executablePath}`);
+  log.info(`[login] browser-name=${browserName}`);
   log.info(`[login] profile=${profileDir}`);
   log.info("[login] launching a NORMAL Chromium process (no Playwright/CDP automation)");
   log.info("[login] sign into ChatGPT, open any chat, then CLOSE this Chromium window.");
@@ -971,11 +1064,12 @@ async function login(cfg: Config, configPath: string) {
   const code = await proc.exited;
   if (code !== 0) throw new Error(`Manual Chromium login process exited with code ${code}`);
   log.info(`[login] browser closed; profile saved: ${profileDir}`);
-  log.info("[login] next: bun run dump   or   bun run watch");
+  log.info("[login] next: bun run watch; all registered profiles are loaded automatically");
 }
 
 async function dump(cfg: Config, configPath: string) {
   const sql = openDb(cfg);
+  await ensureBrowserSchema(sql);
   const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false);
   try {
     const page = await getPage(context);
@@ -1002,8 +1096,8 @@ async function dump(cfg: Config, configPath: string) {
   }
 }
 
-async function persistChat(sql: Sql, chat: ScrapedChat, settleMs: number, prevIncomplete: Map<string, number>): Promise<Set<string>> {
-  await upsertChat(sql, chat);
+async function persistChat(sql: Sql, chat: ScrapedChat, settleMs: number, prevIncomplete: Map<string, number>, browserName = "default"): Promise<Set<string>> {
+  await upsertChat(sql, chat, browserName);
   const newlyCompletedAssistantMessages = new Set<string>();
   for (const msg of chat.messages) {
     // Debounce completion: if just flipped to completed, wait settleMs
@@ -1036,6 +1130,7 @@ async function persistChat(sql: Sql, chat: ScrapedChat, settleMs: number, prevIn
 
 async function once(cfg: Config, configPath: string) {
   const sql = openDb(cfg);
+  await ensureBrowserSchema(sql);
   const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false);
   const settleMs = cfg.chatgpt.complete_settle_ms ?? 800;
   try {
@@ -1356,65 +1451,147 @@ async function runHookWithLastZip(
   return archive;
 }
 
-function openConversationPages(context: BrowserContext): Array<{ page: Page; chatId: string }> {
+function openConversationPages(runtimes: BrowserRuntime[]): Array<{ runtime: BrowserRuntime; page: Page; chatId: string }> {
+  const result: Array<{ runtime: BrowserRuntime; page: Page; chatId: string }> = [];
   const seen = new Set<string>();
-  const result: Array<{ page: Page; chatId: string }> = [];
-  for (const page of context.pages()) {
-    if (page.isClosed()) continue;
-    const chatId = normalizeUuid(page.url());
-    if (!chatId || seen.has(chatId)) continue;
-    seen.add(chatId);
-    result.push({ page, chatId });
+  for (const runtime of runtimes) {
+    for (const page of runtime.context.pages()) {
+      if (page.isClosed()) continue;
+      const chatId = normalizeUuid(page.url());
+      if (!chatId || seen.has(chatId)) continue;
+      seen.add(chatId);
+      result.push({ runtime, page, chatId });
+    }
   }
   return result;
 }
 
-async function installFocusTracking(
-  context: BrowserContext,
-  setActivePage: (page: Page) => void,
-) {
-  await context.exposeBinding("__chatgptCtlPageFocused", (source) => {
-    if (!source.page.isClosed()) setActivePage(source.page);
+function setVirtualFocus(focus: VirtualFocus, runtime: BrowserRuntime, page: Page, source: "manual" | "ctl") {
+  runtime.activePage = page;
+  runtime.lastFocusAt = Date.now();
+  focus.runtime = runtime;
+  focus.page = page;
+  focus.at = runtime.lastFocusAt;
+  focus.pageFocusAt.set(page, focus.at);
+  focus.source = source;
+}
+
+function getVirtualFocus(focus: VirtualFocus, runtimes: BrowserRuntime[]): { runtime: BrowserRuntime; page: Page } {
+  // Keep a CLI-created blank / page-with-first-prompt as focus, but a manually
+  // focused non-conversation page must not steal focus away from the last chat.
+  if (focus.runtime && focus.page && !focus.page.isClosed() &&
+      (Boolean(normalizeUuid(focus.page.url())) || focus.source === "ctl")) {
+    return { runtime: focus.runtime, page: focus.page };
+  }
+  const openChats = openConversationPages(runtimes)
+    .sort((a, b) =>
+      (focus.pageFocusAt.get(b.page) ?? 0) - (focus.pageFocusAt.get(a.page) ?? 0) ||
+      Number(b.page === b.runtime.activePage) - Number(a.page === a.runtime.activePage)
+    );
+  const latestChat = openChats[0];
+  const fallback = latestChat
+    ? { runtime: latestChat.runtime, page: latestChat.page }
+    : (() => {
+        const runtime = runtimes.find((item) => item.name === "default") ?? runtimes[0]!;
+        const page = runtime.activePage && !runtime.activePage.isClosed()
+          ? runtime.activePage
+          : runtime.context.pages().find((candidate) => !candidate.isClosed());
+        return page ? { runtime, page } : undefined;
+      })();
+  if (!fallback) throw new Error("no browser page is available; start the watcher again");
+  setVirtualFocus(focus, fallback.runtime, fallback.page, latestChat ? "manual" : "ctl");
+  return fallback;
+}
+
+async function runtimeForChat(
+  sql: Sql,
+  runtimes: BrowserRuntime[],
+  chatId: string
+): Promise<BrowserRuntime> {
+  const opened = openConversationPages(runtimes).find((item) => item.chatId === chatId);
+  if (opened) return opened.runtime;
+  const browserName = await browserNameForChat(sql, chatId);
+  return runtimes.find((runtime) => runtime.name === browserName)
+    ?? runtimes.find((runtime) => runtime.name === "default")
+    ?? runtimes[0]!;
+}
+
+async function installFocusTracking(runtime: BrowserRuntime, focus: VirtualFocus) {
+  await runtime.context.exposeBinding("__chatgptCtlPageFocused", (source) => {
+    if (!source.page.isClosed() && normalizeUuid(source.page.url())) {
+      setVirtualFocus(focus, runtime, source.page, "manual");
+    }
   });
   const installListeners = () => {
     const notify = () => {
-      if (document.visibilityState !== "visible") return;
+      if (document.visibilityState !== "visible" || !document.hasFocus()) return;
       const callback = (window as any).__chatgptCtlPageFocused;
       if (typeof callback === "function") void callback();
     };
     window.addEventListener("focus", notify);
     document.addEventListener("visibilitychange", notify);
+    window.addEventListener("pageshow", notify);
   };
-  await context.addInitScript(installListeners);
-  // The initial page may already have loaded before the watcher installs the
-  // binding, so attach the same listeners to all existing pages as well.
-  for (const page of context.pages()) {
-    await page.evaluate(installListeners).catch(() => undefined);
-    const visibility = await page.evaluate(() => document.visibilityState).catch(() => "hidden");
-    if (visibility === "visible") setActivePage(page);
+  await runtime.context.addInitScript(installListeners);
+
+  const attachPage = (page: Page) => {
+    void page.evaluate(installListeners).catch(() => undefined);
+    const markWhenActuallyFocused = async () => {
+      const focused = await page.evaluate(() => document.visibilityState === "visible" && document.hasFocus()).catch(() => false);
+      if (focused && !page.isClosed() && normalizeUuid(page.url())) {
+        setVirtualFocus(focus, runtime, page, "manual");
+      }
+    };
+    page.on("domcontentloaded", () => { void markWhenActuallyFocused(); });
+    page.on("framenavigated", (frame) => {
+      if (frame === page.mainFrame()) void markWhenActuallyFocused();
+    });
+    page.on("close", () => {
+      if (focus.page === page) {
+        focus.page = undefined;
+        focus.runtime = undefined;
+      }
+    });
+  };
+
+  runtime.context.on("page", attachPage);
+  for (const page of runtime.context.pages()) {
+    attachPage(page);
+    const focused = await page.evaluate(() => document.visibilityState === "visible" && document.hasFocus()).catch(() => false);
+    if (focused && normalizeUuid(page.url())) setVirtualFocus(focus, runtime, page, "manual");
   }
 }
 
 function startControlServer(
-  context: BrowserContext,
-  getActivePage: () => Page,
-  setActivePage: (page: Page) => void,
+  runtimes: BrowserRuntime[],
+  focus: VirtualFocus,
   cfg: Config,
   configPath: string,
   sql: Sql
 ) {
+  const defaultRuntime = runtimes.find((runtime) => runtime.name === "default") ?? runtimes[0]!;
+  const makePage = async (runtime: BrowserRuntime): Promise<Page> => {
+    const page = await runtime.context.newPage();
+    configurePage(page, cfg);
+    attachNetworkDebug(page, cfg);
+    runtime.activePage = page;
+    return page;
+  };
   const server = Bun.serve({
     hostname: CONTROL_HOST,
     port: CONTROL_PORT,
     async fetch(request) {
       const url = new URL(request.url);
-      const opened = openConversationPages(context);
+      const opened = openConversationPages(runtimes);
       if (request.method === "GET" && url.pathname === "/status") {
-        const active = getActivePage();
+        let active: { runtime: BrowserRuntime; page: Page } | undefined;
+        try { active = getVirtualFocus(focus, runtimes); } catch { /* no live page */ }
         return Response.json({
-          chat_id: normalizeUuid(active.url()),
+          chat_id: active ? normalizeUuid(active.page.url()) : null,
+          browser_name: active?.runtime.name ?? null,
           chat_ids: opened.map((item) => item.chatId),
-          url: active.url(),
+          panes: opened.map((item, index) => ({ chat_id: item.chatId, browser_name: item.runtime.name, pane_index: index })),
+          url: active?.page.url() ?? null,
         });
       }
       if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
@@ -1423,69 +1600,88 @@ function startControlServer(
           chat_id?: string; chat?: string; directory?: string; extract_to?: string;
           text?: string; files?: string[]; new_chat?: boolean;
         };
+        if (url.pathname === "/sync-chats") {
+          const counts: Array<{ browser_name: string; count: number }> = [];
+          for (const runtime of runtimes) {
+            let page = runtime.activePage;
+            if (!page || page.isClosed()) page = await getPage(runtime.context);
+            runtime.activePage = page;
+            await ensureCurrentChatGPTPage(page, cfg);
+            const chats = await syncSidebarChats(page, sql, true, runtime.name);
+            counts.push({ browser_name: runtime.name, count: chats.length });
+          }
+          return Response.json({ ok: true, browsers: counts, total: counts.reduce((sum, item) => sum + item.count, 0) });
+        }
         if (url.pathname === "/open") {
+          const openStartedAt = performance.now();
           const chatId = normalizeUuid(body.chat_id || "");
           if (!chatId) return Response.json({ error: "invalid chat_id" }, { status: 400 });
-          let page = opened.find((item) => item.chatId === chatId)?.page;
-          const alreadyOpen = Boolean(page);
-          if (!page) {
-            page = await context.newPage();
-            attachNetworkDebug(page, cfg);
-          }
-          setActivePage(page);
-          const target = new URL(`/c/${chatId}`, cfg.chatgpt.url).toString();
-          if (normalizeUuid(page.url()) !== chatId) {
+          const existing = openConversationPages(runtimes).find((item) => item.chatId === chatId);
+          const runtime = existing?.runtime ?? await runtimeForChat(sql, runtimes, chatId);
+          const alreadyOpen = Boolean(existing);
+          const page = existing?.page ?? await makePage(runtime);
+          if (!alreadyOpen) {
+            const target = new URL(`/c/${chatId}`, cfg.chatgpt.url).toString();
             await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
+            await waitForConversationReady(page, chatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
+            await recordChatBrowser(sql, chatId, runtime.name);
           }
-          await waitForConversationReady(page, chatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
+          // An already loaded pane is already past the expensive readiness gate.
+          // Do not rescrape its entire message history just to focus it again.
+          setVirtualFocus(focus, runtime, page, "ctl");
           await page.bringToFront();
-          return Response.json({ ok: true, chat_id: chatId, url: target, already_open: alreadyOpen, pane_index: openConversationPages(context).findIndex((item) => item.chatId === chatId) });
+          const paneIndex = openConversationPages(runtimes).findIndex((item) => item.chatId === chatId);
+          const durationMs = Math.round(performance.now() - openStartedAt);
+          log.info(`[ctl] open chat=${chatId} browser=${runtime.name} already_open=${alreadyOpen} duration=${durationMs}ms`);
+          return Response.json({ ok: true, chat_id: chatId, browser_name: runtime.name, url: page.url(), already_open: alreadyOpen, pane_index: paneIndex, duration_ms: durationMs });
         }
         if (url.pathname === "/close") {
           const selector = (body.chat || body.chat_id || "").trim();
           if (!selector) return Response.json({ error: "close requires a chat UUID, title, or 0-based pane index" }, { status: 400 });
-          const panes = openConversationPages(context);
+          const panes = openConversationPages(runtimes);
           let target = panes.find((item) => item.chatId === normalizeUuid(selector));
           if (!target && /^[0-9a-f-]{4,}$/i.test(selector)) {
             const prefix = selector.toLowerCase();
             const prefixMatches = panes.filter((item) => item.chatId.startsWith(prefix));
             if (prefixMatches.length === 1) target = prefixMatches[0];
             else if (prefixMatches.length > 1) {
-              return Response.json({ error: `id prefix matches multiple opened chats: ${prefixMatches.map((item) => item.chatId).join(", ")}` }, { status: 409 });
+              return Response.json({ error: `id prefix matches multiple opened chats: ${prefixMatches.map((item) => `${item.runtime.name}:${item.chatId}`).join(", ")}` }, { status: 409 });
             }
           }
           if (!target && /^\d+$/.test(selector)) target = panes[Number(selector)];
           if (!target) {
             const matches = await sql`
-              SELECT id FROM chats WHERE title ILIKE ${`%${selector}%`}
-              ORDER BY updated_at DESC NULLS LAST LIMIT 10
+              SELECT c.id FROM chats c WHERE c.title ILIKE ${`%${selector}%`}
+              ORDER BY c.updated_at DESC NULLS LAST LIMIT 20
             `;
             const ids = new Set(matches.map((row: any) => String(row.id).toLowerCase()));
             const matchingPanes = panes.filter((item) => ids.has(item.chatId));
             if (matchingPanes.length > 1) {
-              return Response.json({ error: `title matches multiple opened chats: ${matchingPanes.map((item) => item.chatId).join(", ")}` }, { status: 409 });
+              return Response.json({ error: `title matches multiple opened chats: ${matchingPanes.map((item) => `${item.runtime.name}:${item.chatId}`).join(", ")}` }, { status: 409 });
             }
             target = matchingPanes[0];
           }
           if (!target) return Response.json({ error: `no opened chat matches '${selector}'` }, { status: 404 });
           const closedId = target.chatId;
-          const wasActive = target.page === getActivePage();
+          const wasFocused = target.page === focus.page;
           await target.page.close();
-          const remaining = openConversationPages(context);
-          if (wasActive || getActivePage().isClosed()) {
-            let next = remaining[0]?.page ?? context.pages().find((candidate) => !candidate.isClosed() && !normalizeUuid(candidate.url()));
-            if (!next) {
-              next = await context.newPage();
-              await openChatGPT(next, cfg);
+          if (wasFocused || !focus.page || focus.page.isClosed()) {
+            const remaining = openConversationPages(runtimes);
+            const next = remaining[remaining.length - 1];
+            if (next) {
+              setVirtualFocus(focus, next.runtime, next.page, "ctl");
+              await next.page.bringToFront();
+            } else {
+              const page = await makePage(defaultRuntime);
+              await openChatGPT(page, cfg);
+              setVirtualFocus(focus, defaultRuntime, page, "ctl");
             }
-            setActivePage(next);
-            await next.bringToFront();
           }
-          return Response.json({ ok: true, closed_chat_id: closedId, chat_ids: openConversationPages(context).map((item) => item.chatId) });
+          return Response.json({ ok: true, closed_chat_id: closedId, browser_name: target.runtime.name, chat_ids: openConversationPages(runtimes).map((item) => item.chatId) });
         }
         if (url.pathname === "/new-chat") {
-          const page = await context.newPage();
-          attachNetworkDebug(page, cfg);
+          const runtime = focus.runtime && runtimes.includes(focus.runtime) ? focus.runtime : defaultRuntime;
+          const page = await makePage(runtime);
           const target = new URL("/", cfg.chatgpt.url).toString();
           await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
           await page.locator('#prompt-textarea, [data-composer-markdown][contenteditable="true"], [contenteditable="true"][role="textbox"], textarea').first()
@@ -1495,9 +1691,9 @@ function startControlServer(
             await page.close();
             return Response.json({ error: `ChatGPT redirected away from the new-chat URL: ${finalUrl}`, url: finalUrl }, { status: 409 });
           }
-          setActivePage(page);
+          setVirtualFocus(focus, runtime, page, "ctl");
           await page.bringToFront();
-          return Response.json({ ok: true, url: finalUrl });
+          return Response.json({ ok: true, browser_name: runtime.name, url: finalUrl });
         }
         if (url.pathname === "/send") {
           const text = body.text || "";
@@ -1505,68 +1701,76 @@ function startControlServer(
           if (!text.trim() && files.length === 0) return Response.json({ error: "text or at least one file is required" }, { status: 400 });
           for (const file of files) await access(file, constants.R_OK);
           const requestedChatId = normalizeUuid(body.chat_id || "");
+          let runtime: BrowserRuntime;
           let page: Page;
-          if (body.new_chat) {
-            if (requestedChatId) return Response.json({ error: "new_chat cannot be combined with chat_id" }, { status: 400 });
-            // A new chat always gets its own pane; do not disturb existing chats.
-            page = await context.newPage();
-            attachNetworkDebug(page, cfg);
-            await page.goto(new URL("/", cfg.chatgpt.url).toString(), {
-              waitUntil: "domcontentloaded",
-              timeout: cfg.browser?.navigation_timeout_ms ?? 45_000,
-            });
-            await page.locator('#prompt-textarea, [data-composer-markdown][contenteditable="true"], [contenteditable="true"][role="textbox"], textarea').first()
-              .waitFor({ state: "visible", timeout: 30_000 });
-          } else if (requestedChatId) {
-            page = openConversationPages(context).find((item) => item.chatId === requestedChatId)?.page
-              ?? await context.newPage();
-            attachNetworkDebug(page, cfg);
-            if (normalizeUuid(page.url()) !== requestedChatId) {
+          if (requestedChatId) {
+            runtime = await runtimeForChat(sql, runtimes, requestedChatId);
+            const existingPane = openConversationPages([runtime]).find((item) => item.chatId === requestedChatId);
+            page = existingPane?.page ?? await makePage(runtime);
+            if (!existingPane) {
               const target = new URL(`/c/${requestedChatId}`, cfg.chatgpt.url).toString();
-              await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
+              if (normalizeUuid(page.url()) !== requestedChatId) {
+                await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
+              }
+              await waitForConversationReady(page, requestedChatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
             }
-            await waitForConversationReady(page, requestedChatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
+            await recordChatBrowser(sql, requestedChatId, runtime.name);
           } else {
-            page = getActivePage();
-            if (page.isClosed()) {
-              page = await context.newPage();
-              attachNetworkDebug(page, cfg);
-              await openChatGPT(page, cfg);
+            const virtual = getVirtualFocus(focus, runtimes);
+            runtime = virtual.runtime;
+            if (body.new_chat) {
+              page = await makePage(runtime);
+              await page.goto(new URL("/", cfg.chatgpt.url).toString(), {
+                waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000,
+              });
+              await page.locator('#prompt-textarea, [data-composer-markdown][contenteditable="true"], [contenteditable="true"][role="textbox"], textarea').first()
+                .waitFor({ state: "visible", timeout: 30_000 });
+            } else {
+              page = virtual.page;
+              if (page.isClosed()) {
+                page = await makePage(runtime);
+                await ensureCurrentChatGPTPage(page, cfg);
+              }
             }
           }
           await sendInPage(page, text, undefined, files);
           if (body.new_chat) {
-            // ChatGPT assigns the conversation UUID after the first message is
-            // submitted. Wait for that route before reporting success to ctl.
             await page.waitForFunction(() =>
               /\/c\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(location.pathname),
               null,
               { timeout: 45_000 },
             );
           }
-          setActivePage(page);
+          setVirtualFocus(focus, runtime, page, "ctl");
           await page.bringToFront();
           const acquiredChatId = normalizeUuid(page.url());
           if (body.new_chat && !acquiredChatId) {
             return Response.json({ error: "message was sent but ChatGPT did not expose a conversation UUID yet", url: page.url() }, { status: 504 });
           }
-          if (body.new_chat && acquiredChatId) {
-            // Persist the newly assigned ID and first user message immediately,
-            // rather than making the CLI wait for the next background poll.
+          if (acquiredChatId && (body.new_chat || requestedChatId)) {
+            await recordChatBrowser(sql, acquiredChatId, runtime.name);
             await page.waitForTimeout(300);
             const firstSnapshot = await scrapeCurrentChat(page).catch(() => null);
-            if (firstSnapshot?.id === acquiredChatId) {
-              await upsertChat(sql, firstSnapshot);
+            if (firstSnapshot?.id === acquiredChatId && body.new_chat) {
+              await upsertChat(sql, firstSnapshot, runtime.name);
               for (const message of firstSnapshot.messages) await upsertMessage(sql, acquiredChatId, message);
             }
           }
-          return Response.json({ ok: true, chat_id: acquiredChatId, url: page.url(), new_chat: Boolean(body.new_chat) });
+          return Response.json({ ok: true, chat_id: acquiredChatId, browser_name: runtime.name, url: page.url(), new_chat: Boolean(body.new_chat) });
         }
 
         const requestedChatId = normalizeUuid(body.chat_id || "");
-        const page = requestedChatId
-          ? openConversationPages(context).find((item) => item.chatId === requestedChatId)?.page
-          : getActivePage();
+        const runtime = requestedChatId ? await runtimeForChat(sql, runtimes, requestedChatId) : getVirtualFocus(focus, runtimes).runtime;
+        let page = requestedChatId
+          ? openConversationPages([runtime]).find((item) => item.chatId === requestedChatId)?.page
+          : getVirtualFocus(focus, runtimes).page;
+        if ((url.pathname === "/hook/run" || url.pathname === "/download-last-zip") && requestedChatId && !page) {
+          page = await makePage(runtime);
+          const target = new URL(`/c/${requestedChatId}`, cfg.chatgpt.url).toString();
+          await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
+          await waitForConversationReady(page, requestedChatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
+          await recordChatBrowser(sql, requestedChatId, runtime.name);
+        }
         if (!page) return Response.json({ error: `chat ${requestedChatId} is not open in a watcher pane` }, { status: 404 });
         if (url.pathname === "/hook/run") {
           const chatId = requestedChatId;
@@ -1574,9 +1778,14 @@ function startControlServer(
           const hook = await loadChatHook(sql, chatId);
           if (!hook) return Response.json({ error: `no hook configured for ${chatId}` }, { status: 404 });
           const archive = await runHookWithLastZip(page, chatId, hook, cfg, configPath);
-          return Response.json({ ok: true, chat_id: chatId, archive, url: page.url() });
+          setVirtualFocus(focus, runtime, page, "ctl");
+          return Response.json({ ok: true, chat_id: chatId, browser_name: runtime.name, archive, url: page.url() });
         }
         if (url.pathname === "/download-last-zip") {
+          if (requestedChatId) {
+            setVirtualFocus(focus, runtime, page, "ctl");
+            await page.bringToFront();
+          }
           const directory = body.directory
             ? path.resolve(body.directory)
             : resolveFromConfig(configPath, cfg.downloads?.directory || "./var/downloads");
@@ -1597,8 +1806,6 @@ function startControlServer(
             const singleRoot = topLevel.size === 1 ? [...topLevel][0]! : null;
             const flattenRoot = Boolean(singleRoot && entries.some((entry) => entry.replace(/\\/g, "/").startsWith(`${singleRoot}/`)));
             if (flattenRoot && singleRoot) {
-              // Extract to a temporary sibling first, then move the sole root
-              // folder's contents into the requested destination.
               const staging = await mkdtemp(path.join(extractTo, ".chatgpt-ctl-unzip-"));
               try {
                 const extracted = await commandOutput(["unzip", "-o", "-q", saved, "-d", staging]);
@@ -1614,9 +1821,9 @@ function startControlServer(
               if (extracted.code !== 0) throw new Error(`ZIP extraction failed: ${extracted.stderr}`);
             }
             log.info(`[download] extracted ${saved} to ${extractTo}`);
-            return Response.json({ ok: true, path: saved, extracted_to: extractTo, flattened: flattenRoot });
+            return Response.json({ ok: true, path: saved, browser_name: runtime.name, extracted_to: extractTo, flattened: flattenRoot });
           }
-          return Response.json({ ok: true, path: saved });
+          return Response.json({ ok: true, path: saved, browser_name: runtime.name });
         }
         return new Response("not found", { status: 404 });
       } catch (error) {
@@ -1625,7 +1832,7 @@ function startControlServer(
       }
     },
   });
-  log.info(`[ctl] listening on http://${CONTROL_HOST}:${server.port}`);
+  log.info(`[ctl] listening on http://${CONTROL_HOST}:${server.port} (${runtimes.length} browser profile(s))`);
   return server;
 }
 
@@ -1633,9 +1840,23 @@ async function watch(cfg: Config, configPath: string) {
   const sql = openDb(cfg);
   await ensureHookSchema(sql);
   await ensureRetrySchema(sql);
+  await ensureBrowserSchema(sql);
   const pollMs = Math.max(500, cfg.chatgpt.poll_ms ?? 1500);
   const settleMs = cfg.chatgpt.complete_settle_ms ?? 800;
-  const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false);
+  const profiles = await discoverBrowserProfiles(cfg, configPath);
+  const runtimes: BrowserRuntime[] = [];
+  const focus: VirtualFocus = { at: 0, source: "manual", pageFocusAt: new WeakMap<Page, number>() };
+  try {
+    for (const profile of profiles) {
+      await registerBrowser(sql, profile);
+      const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false, profile.name);
+      runtimes.push({ ...profile, context, lastFocusAt: 0 });
+    }
+  } catch (error) {
+    await Promise.all(runtimes.map((runtime) => runtime.context.close().catch(() => undefined)));
+    await sql.end();
+    throw error;
+  }
   const prevIncomplete = new Map<string, number>();
   const lastSeenChatByPage = new WeakMap<Page, string>();
   const readyChatByPage = new WeakMap<Page, string>();
@@ -1643,7 +1864,6 @@ async function watch(cfg: Config, configPath: string) {
   const baselineUserTurnByChat = new Map<string, number | null>();
   const baselineUserMessageByChat = new Map<string, string | null>();
   const baselineUserSequenceByChat = new Map<string, number | null>();
-  let activePage: Page;
   let controlServer: ReturnType<typeof Bun.serve> | undefined;
   const handledHookDownloads = new Set<string>();
   const initializedHookChats = new Set<string>();
@@ -1655,7 +1875,7 @@ async function watch(cfg: Config, configPath: string) {
   const stop = async () => {
     log.info("\n[watch] stopping...");
     controlServer?.stop(true);
-    await context.close();
+    await Promise.all(runtimes.map((runtime) => runtime.context.close().catch(() => undefined)));
     await sql.end();
     process.exit(0);
   };
@@ -1663,27 +1883,43 @@ async function watch(cfg: Config, configPath: string) {
   process.on("SIGTERM", stop);
 
   try {
-    activePage = await getPage(context);
-    await installFocusTracking(context, (page) => { activePage = page; });
-    attachNetworkDebug(activePage, cfg);
-    await openChatGPT(activePage, cfg);
-    controlServer = startControlServer(context, () => activePage, (page) => { activePage = page; }, cfg, configPath, sql);
-    const sidebarChats = await syncSidebarChats(activePage, sql, true);
-    log.info(`[watch] synchronized ${sidebarChats.length} sidebar chats`);
-    log.info(`[watch] poll=${pollMs}ms settle=${settleMs}ms multi-pane enabled`);
+    let initialTotal = 0;
+    for (const runtime of runtimes) {
+      runtime.activePage = await getPage(runtime.context);
+      await installFocusTracking(runtime, focus);
+      attachNetworkDebug(runtime.activePage, cfg);
+      await ensureCurrentChatGPTPage(runtime.activePage, cfg);
+      const sidebarChats = await syncSidebarChats(runtime.activePage, sql, true, runtime.name);
+      initialTotal += sidebarChats.length;
+      log.info(`[watch] browser=${runtime.name} synchronized ${sidebarChats.length} sidebar chats`);
+    }
+    const initialFocus = runtimes.find((runtime) => runtime.name === "default") ?? runtimes[0]!;
+    if (!focus.page && initialFocus?.activePage) setVirtualFocus(focus, initialFocus, initialFocus.activePage, "manual");
+    controlServer = startControlServer(runtimes, focus, cfg, configPath, sql);
+    log.info(`[watch] synchronized ${initialTotal} sidebar chats across ${runtimes.length} browser profile(s)`);
+    log.info(`[watch] poll=${pollMs}ms settle=${settleMs}ms multi-pane and multi-browser enabled`);
 
     while (true) {
       try {
-        let pages = context.pages().filter((page) => !page.isClosed());
-        if (!pages.includes(activePage)) {
-          activePage = pages[0] ?? await context.newPage();
-          if (pages.length === 0) await openChatGPT(activePage, cfg);
-          pages = context.pages().filter((page) => !page.isClosed());
+        const entries: Array<{ runtime: BrowserRuntime; page: Page }> = [];
+        for (const runtime of runtimes) {
+          let pages = runtime.context.pages().filter((page) => !page.isClosed());
+          if (!runtime.activePage || runtime.activePage.isClosed() || !pages.includes(runtime.activePage)) {
+            runtime.activePage = pages[0] ?? await runtime.context.newPage();
+            if (pages.length === 0) {
+              configurePage(runtime.activePage, cfg);
+              attachNetworkDebug(runtime.activePage, cfg);
+              await ensureCurrentChatGPTPage(runtime.activePage, cfg);
+            }
+            pages = runtime.context.pages().filter((page) => !page.isClosed());
+          }
+          if (pages.length && runtime.activePage) {
+            await syncSidebarChats(runtime.activePage, sql, false, runtime.name);
+          }
+          for (const page of pages) entries.push({ runtime, page });
         }
-        // Refresh sidebar metadata once per tick; any live pane can expose it.
-        if (pages.length) await syncSidebarChats(activePage, sql, false);
 
-        await Promise.all(pages.map(async (page) => {
+        await Promise.all(entries.map(async ({ runtime, page }) => {
           try {
             const chat = await scrapeCurrentChat(page);
             if (!chat) return;
@@ -1699,7 +1935,7 @@ async function watch(cfg: Config, configPath: string) {
               const readySnapshot = await waitForConversationReady(
                 page, chat.id, cfg.browser?.navigation_timeout_ms ?? 45_000
               );
-              await persistChat(sql, readySnapshot, settleMs, prevIncomplete);
+              await persistChat(sql, readySnapshot, settleMs, prevIncomplete, runtime.name);
               const lastAssistant = [...readySnapshot.messages].reverse().find((message) => message.role === "assistant");
               const lastUser = [...readySnapshot.messages].reverse().find((message) => message.role === "user");
               baselineAssistantTurnByChat.set(chat.id, lastAssistant?.turnOrder ?? null);
@@ -1725,7 +1961,8 @@ async function watch(cfg: Config, configPath: string) {
 
             const hook = await loadChatHook(sql, chat.id);
             const hookWasInitialized = initializedHookChats.has(chat.id);
-            const newAssistantMessages = await persistChat(sql, chat, settleMs, prevIncomplete);
+            await recordChatBrowser(sql, chat.id, runtime.name);
+            const newAssistantMessages = await persistChat(sql, chat, settleMs, prevIncomplete, runtime.name);
 
             if (await isAutoRetryEnabled(sql, chat.id)) {
               const now = Date.now();
@@ -1803,12 +2040,12 @@ async function watch(cfg: Config, configPath: string) {
       } catch (error) {
         log.error(`[watch] scan failed:\n${formatError(error)}`);
       }
-      await activePage.waitForTimeout(pollMs).catch(() => new Promise((resolve) => setTimeout(resolve, pollMs)));
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
     }
   } catch (error) {
     log.error(`[watch] fatal:\n${formatError(error)}`);
     controlServer?.stop(true);
-    await context.close();
+    await Promise.all(runtimes.map((runtime) => runtime.context.close().catch(() => undefined)));
     await sql.end();
     throw error;
   }
@@ -1868,8 +2105,17 @@ async function main() {
       }
       return sendMessageCommand(cfg, configPath, textParts.join(" "), files);
     }
-    case "login":
-      return login(cfg, configPath);
+    case "login": {
+      const nameArg = args.find((arg) => arg.startsWith("--browser-name="));
+      const nameIndex = args.findIndex((arg) => arg === "--browser-name");
+      const browserName = nameArg
+        ? nameArg.slice("--browser-name=".length)
+        : nameIndex >= 0 ? args[nameIndex + 1] : "default";
+      if ((nameIndex >= 0 && !browserName) || browserName === "") {
+        throw new Error("login: --browser-name requires a name");
+      }
+      return login(cfg, configPath, browserName || "default");
+    }
     case "migrate":
       return migrate(cfg);
     case "flush":

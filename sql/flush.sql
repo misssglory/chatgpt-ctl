@@ -1,2 +1,2 @@
--- Wipe all scraped history (keeps schema). Used by: nix run .#flush-db
-TRUNCATE messages, chats RESTART IDENTITY CASCADE;
+-- Clear conversation history and dependent per-chat settings/mappings.
+TRUNCATE TABLE messages, chats RESTART IDENTITY CASCADE;
