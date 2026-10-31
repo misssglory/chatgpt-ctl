@@ -295,12 +295,15 @@ function openDb(cfg: Config): Sql {
   return postgres(url, { max: 4, idle_timeout: 20 });
 }
 
+type HookStage = { type: "build" | "git-add" | "git-commit" | "custom"; command?: string };
+
 type ChatHook = {
   folder: string;
   child_folder: string;
   nix_flake: boolean;
   clipboard_command: string[];
   build_command: string | null;
+  stages: HookStage[];
   enabled: boolean;
 };
 
@@ -400,12 +403,21 @@ async function persistOpenChatSession(
   focus: VirtualFocus,
 ): Promise<number> {
   const snapshot: SavedOpenChat[] = [];
+  const savedKeys = new Set<string>();
   for (const runtime of runtimes) {
     let paneOrder = 0;
     for (const page of runtime.context.pages()) {
       if (page.isClosed()) continue;
       const chatId = normalizeUuid(page.url());
       if (!chatId) continue; // Ignore blank tabs, ChatGPT home, and transient new chats.
+      const key = `${runtime.name}:${chatId}`;
+      if (savedKeys.has(key)) {
+        // A hook/download race or external browser navigation can produce two
+        // tabs displaying the same chat. The DB key is (browser_name,chat_id).
+        // Never let duplicate pages invalidate the complete session snapshot.
+        continue;
+      }
+      savedKeys.add(key);
       let focusedAt = focus.pageFocusAt.get(page) ?? 0;
       if (focus.page === page) focusedAt = Math.max(focusedAt, focus.at);
       snapshot.push({
@@ -439,6 +451,10 @@ async function persistOpenChatSession(
           (browser_name, chat_id, pane_order, focused_at, updated_at)
         VALUES
           (${item.browser_name}, ${item.chat_id}::uuid, ${item.pane_order}, ${item.focused_at}, NOW())
+        ON CONFLICT (browser_name, chat_id) DO UPDATE
+          SET pane_order = EXCLUDED.pane_order,
+              focused_at = EXCLUDED.focused_at,
+              updated_at = NOW()
       `;
     }
   });
@@ -679,17 +695,37 @@ async function ensureHookSchema(sql: Sql): Promise<void> {
       nix_flake boolean NOT NULL DEFAULT false,
       clipboard_command jsonb NOT NULL DEFAULT '["wl-paste", "-n"]'::jsonb,
       build_command text DEFAULT 'wcc build',
+      stages jsonb,
       enabled boolean NOT NULL DEFAULT true,
       updated_at timestamptz NOT NULL DEFAULT now()
     )
   `);
   // Keep existing installations compatible; this is a non-destructive additive migration.
   await sql.unsafe("ALTER TABLE chat_hooks ADD COLUMN IF NOT EXISTS build_command text DEFAULT 'wcc build'");
+  await sql.unsafe("ALTER TABLE chat_hooks ADD COLUMN IF NOT EXISTS stages jsonb");
+}
+
+function parseHookStages(raw: unknown, buildCommand: string | null): HookStage[] {
+  const decoded = typeof raw === "string" ? JSON.parse(raw) : raw;
+  // NULL means a pre-pipeline hook: migrate its behavior to build + git-add.
+  if (decoded == null) return [
+    ...(buildCommand && buildCommand.trim() ? [{ type: "build" as const }] : []),
+    { type: "git-add" },
+  ];
+  if (!Array.isArray(decoded)) throw new Error("hook stages must be a JSON array");
+  return decoded.map((step, index) => {
+    if (!step || typeof step !== "object" ||
+      !["build", "git-add", "git-commit", "custom"].includes(step.type) ||
+      (step.type === "custom" && (typeof step.command !== "string" || !step.command.trim()))) {
+      throw new Error(`invalid hook stage at index ${index}`);
+    }
+    return { type: step.type, ...(step.type === "custom" ? { command: step.command } : {}) } as HookStage;
+  });
 }
 
 async function loadChatHook(sql: Sql, chatId: string): Promise<ChatHook | null> {
   const rows = await sql`
-    SELECT folder, child_folder, nix_flake, clipboard_command, enabled, build_command
+    SELECT folder, child_folder, nix_flake, clipboard_command, enabled, build_command, stages
     FROM chat_hooks WHERE chat_id = ${chatId}::uuid
   `;
   if (!rows.length) return null;
@@ -703,6 +739,7 @@ async function loadChatHook(sql: Sql, chatId: string): Promise<ChatHook | null> 
     nix_flake: Boolean(row.nix_flake),
     clipboard_command: Array.isArray(command) && command.length ? command : ["wl-paste", "-n"],
     build_command: row.build_command == null ? null : String(row.build_command),
+    stages: parseHookStages(row.stages, row.build_command),
     enabled: Boolean(row.enabled),
   };
 }
@@ -1896,98 +1933,93 @@ async function runHookForZip(
     stagedPaths = normalizedEntries;
   }
 
-  // Build before touching the Git index. A failing build must never create a
-  // commit for an archive that does not build successfully.
   const buildDir = path.resolve(projectDir, hook.child_folder || ".");
-  if (hook.build_command !== null && hook.build_command.trim() !== "") {
-    const buildCommand = hook.nix_flake
-      ? ["nix", "develop", buildDir, "-c", "sh", "-lc", hook.build_command]
-      : ["sh", "-lc", hook.build_command];
-    const build = await commandOutput(buildCommand, buildDir);
-    log.info(`[hook] build exit=${build.code}${build.stdout ? ` stdout=${build.stdout.slice(-1000)}` : ""}${build.stderr ? ` stderr=${build.stderr.slice(-1000)}` : ""}`);
-    if (build.code !== 0) {
-      const clipboardCommand = hook.clipboard_command?.length ? hook.clipboard_command : ["wl-paste", "-n"];
-      const clipboard = await commandOutput(clipboardCommand);
-      const diagnostic = clipboard.stdout || clipboard.stderr || build.stderr || build.stdout || `build command failed with exit code ${build.code}; clipboard was empty`;
-      try {
-        await sendInPage(page, `Build failed (exit code ${build.code}). No Git commit was created. Latest build output from clipboard:\n\n${diagnostic}`, chatId);
-      } catch (sendError) {
-        log.error(`[hook] failed to send build diagnostic: ${String(sendError)}`);
-      }
-      throw new Error(`build failed with exit code ${build.code}; extracted files were kept, Git staging and commit were skipped`);
-    }
-  } else {
-    log.info(`[hook] build command disabled for ${chatId}; skipping build (commit is allowed)`);
-  }
-
-  // Stage only actual files supplied by this archive, not directory entries.
-  // This avoids explicitly passing an ignored directory (e.g. src/bin) to
-  // `git add`, which makes Git exit non-zero even when other files are valid.
   const archiveFiles: string[] = [];
   for (const entry of [...new Set(stagedPaths)]) {
-    if (!entry || entry === "." || entry.endsWith("/")) continue; // ZIP directory marker
+    if (!entry || entry === "." || entry.endsWith("/")) continue;
     const absolute = path.resolve(projectDir, entry);
     const relative = path.relative(projectDir, absolute);
-    if (relative.startsWith("..") || path.isAbsolute(relative)) {
-      throw new Error(`unsafe staged archive path rejected: ${entry}`);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error(`unsafe staged archive path rejected: ${entry}`);
+    // Keep deleted paths: Git may need to stage their removal.
+    archiveFiles.push(relative.split(path.sep).join("/"));
+  }
+
+  // Query Git's *own* index + exclude engine. Unlike git check-ignore followed
+  // by git add, this also handles ignored parent directories and nested rules.
+  // Tracked files stay eligible even if a new ignore rule matches them.
+  const pathspecs = archiveFiles.map((file) => `:(literal)${file}`);
+  let eligiblePaths: string[] | undefined;
+  async function stageArchiveFiles(): Promise<string[]> {
+    if (!pathspecs.length) return [];
+    const ls = await commandOutput(
+      ["git", "-C", projectDir, "ls-files", "--cached", "--others", "--exclude-standard", "--full-name", "-z", "--", ...pathspecs],
+      undefined, "", // Preserve NUL-separated output.
+    );
+    if (ls.code !== 0) throw new Error(`git ls-files failed: ${ls.stderr}`);
+    const allowed = [...new Set(ls.stdout.split("\0").filter(Boolean))];
+    const allowedSet = new Set(allowed);
+    const skipped = archiveFiles.filter((name) => !allowedSet.has(name));
+    if (skipped.length) log.info(`[hook] skipped ${skipped.length} ignored or untracked-in-nested-repo file(s): ${skipped.join(", ")}`);
+    if (allowed.length) {
+      const result = await commandOutput(["git", "-C", projectDir, "add", "-A", "--", ...allowed.map((name) => `:(literal)${name}`)]);
+      if (result.code !== 0) throw new Error(`git add failed: ${result.stderr || result.stdout}`);
     }
-    try {
-      const stat = await lstat(absolute);
-      if (!stat.isDirectory()) archiveFiles.push(relative.split(path.sep).join("/"));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      // A non-directory ZIP entry removed by the build is still an archive
-      // path; keeping it lets `git add -A` stage the resulting deletion.
-      archiveFiles.push(relative.split(path.sep).join("/"));
+    log.info(`[hook] git-add staged eligible archive paths=${allowed.length} chat=${chatId}`);
+    return allowed;
+  }
+
+  const stages = hook.stages;
+  for (let index = 0; index < stages.length; index++) {
+    const stage = stages[index]!;
+    const label = `${index + 1}/${stages.length} ${stage.type}`;
+    const started = performance.now();
+    log.info(`[hook] stage START chat=${chatId} stage=${label} cwd=${stage.type === "custom" || stage.type === "build" ? buildDir : projectDir}`);
+    if (stage.type === "build" || stage.type === "custom") {
+      const shellCommand = stage.type === "build" ? hook.build_command : stage.command;
+      if (!shellCommand?.trim()) {
+        log.info(`[hook] stage SKIP chat=${chatId} stage=${label} (no command)`);
+        continue;
+      }
+      const command = hook.nix_flake
+        ? ["nix", "develop", buildDir, "-c", "sh", "-lc", shellCommand]
+        : ["sh", "-lc", shellCommand];
+      log.info(`[hook] command START chat=${chatId} stage=${label} command=${JSON.stringify(command)} archive=${path.basename(archive)}`);
+      const result = await commandOutput(command, buildDir);
+      log.info(`[hook] command FINISHED chat=${chatId} stage=${label} exit=${result.code} duration_ms=${Math.round(performance.now() - started)}${result.stderr ? ` stderr=${result.stderr.slice(-1000)}` : ""}`);
+      if (result.code !== 0) {
+        if (stage.type === "build") {
+          const clipboardCommand = hook.clipboard_command?.length ? hook.clipboard_command : ["wl-paste", "-n"];
+          const clipboard = await commandOutput(clipboardCommand);
+          const diagnostic = clipboard.stdout || clipboard.stderr || result.stderr || result.stdout || `build command failed with exit code ${result.code}`;
+          try {
+            await sendInPage(page, `Build failed (exit code ${result.code}). Pipeline stopped at ${label}. Latest build output:\n\n${diagnostic}`, chatId);
+          } catch (sendError) {
+            log.error(`[hook] failed to send build diagnostic: ${String(sendError)}`);
+          }
+        }
+        throw new Error(`hook ${label} failed (exit ${result.code}): ${result.stderr || result.stdout}`);
+      }
+    } else if (stage.type === "git-add") {
+      eligiblePaths = await stageArchiveFiles();
+    } else if (stage.type === "git-commit") {
+      // Commit the index, not --only pathspecs: custom stages may stage files.
+      const diff = await commandOutput(["git", "-C", projectDir, "diff", "--cached", "--quiet"]);
+      if (diff.code === 0) {
+        log.info(`[hook] stage SKIP chat=${chatId} stage=${label} (no staged changes)`);
+        continue;
+      }
+      if (diff.code !== 1) throw new Error(`git diff --cached failed: ${diff.stderr}`);
+      const mdPaths = (eligiblePaths || archiveFiles).filter((name) => name.toLowerCase().endsWith(".md"));
+      const mdDiff = mdPaths.length
+        ? await commandOutput(["git", "-C", projectDir, "diff", "--cached", "--", ...mdPaths.map((name) => `:(literal)${name}`)])
+        : { code: 0, stdout: "", stderr: "" };
+      if (mdDiff.code !== 0) throw new Error(`git diff markdown failed: ${mdDiff.stderr}`);
+      const message = (mdDiff.stdout || "Auto update").slice(0, 18000);
+      const commit = await commandOutput(["git", "-C", projectDir, "commit", "-m", message]);
+      if (commit.code !== 0) throw new Error(`git commit failed: ${commit.stderr || commit.stdout}`);
+      log.info(`[hook] git commit created chat=${chatId}`);
     }
-  }
-
-  if (archiveFiles.length === 0) {
-    log.info(`[hook] archive contains no stageable files in ${projectDir}`);
-    return;
-  }
-
-  // Ask Git which archive files are ignored. check-ignore exits 1 when none
-  // match, which is a normal result. Tracked files are not reported as ignored.
-  const ignoredResult = await commandOutput(
-    ["git", "-C", projectDir, "check-ignore", "-z", "--stdin"],
-    undefined,
-    `${archiveFiles.join("\0")}\0`,
-  );
-  if (ignoredResult.code !== 0 && ignoredResult.code !== 1) {
-    throw new Error(`git check-ignore failed: ${ignoredResult.stderr || ignoredResult.stdout}`);
-  }
-  const ignored = new Set(ignoredResult.stdout.split("\0").filter(Boolean));
-  const stageablePaths = archiveFiles.filter((entry) => !ignored.has(entry));
-  const ignoredPaths = archiveFiles.filter((entry) => ignored.has(entry));
-  if (ignoredPaths.length > 0) {
-    log.info(`[hook] skipping ${ignoredPaths.length} ignored archive path(s): ${ignoredPaths.join(", ")}`);
-  }
-  if (stageablePaths.length === 0) {
-    log.info(`[hook] all ${archiveFiles.length} archive file(s) are ignored; nothing to stage or commit`);
-    return;
-  }
-
-  // Use literal pathspecs so unusual filenames from an archive cannot be
-  // interpreted as Git pathspec magic.
-  const pathspecs = stageablePaths.map((entry) => `:(literal)${entry}`);
-  const add = await commandOutput(["git", "-C", projectDir, "add", "-A", "--", ...pathspecs]);
-  if (add.code !== 0) throw new Error(`git add failed: ${add.stderr}`);
-  const staged = await commandOutput(["git", "-C", projectDir, "diff", "--cached", "--quiet", "--", ...pathspecs]);
-  if (staged.code === 1) {
-    const mdPaths = stageablePaths.filter((entry) => entry.toLowerCase().endsWith(".md"));
-    const mdPathspecs = mdPaths.map((entry) => `:(literal)${entry}`);
-    const mdDiff = mdPathspecs.length
-      ? await commandOutput(["git", "-C", projectDir, "diff", "--cached", "--", ...mdPathspecs])
-      : { code: 0, stdout: "", stderr: "" };
-    const commitMessage = (mdDiff.stdout || "Auto update").slice(0, 18000);
-    const commit = await commandOutput(["git", "-C", projectDir, "commit", "--only", "-m", commitMessage, "--", ...pathspecs]);
-    if (commit.code !== 0) throw new Error(`git commit failed: ${commit.stderr || commit.stdout}`);
-    log.info(`[hook] committed ZIP update in ${projectDir}`);
-  } else if (staged.code !== 0) {
-    throw new Error(`git diff failed: ${staged.stderr}`);
-  } else {
-    log.info(`[hook] archive produced no Git changes in ${projectDir}`);
+    log.info(`[hook] stage FINISHED chat=${chatId} stage=${label} duration_ms=${Math.round(performance.now() - started)}`);
   }
 }
 
@@ -2626,7 +2658,35 @@ async function watch(cfg: Config, configPath: string) {
             if (runtime.activePage) {
               await syncSidebarChats(runtime.activePage, sql, false, runtime.name);
             }
-            for (const page of pages) entries.push({ runtime, page });
+            // Prevent extra panes for the same conversation from accumulating.
+            // Do not touch tabs belonging to an in-progress ZIP hook: parallel
+            // download probes may temporarily navigate to that same chat.
+            const uniqueChats = new Map<string, Page>();
+            for (const page of pages) {
+              const chatId = normalizeUuid(page.url());
+              if (!chatId || activeHookChats.has(chatId)) {
+                entries.push({ runtime, page });
+                continue;
+              }
+              const previous = uniqueChats.get(chatId);
+              if (!previous) {
+                uniqueChats.set(chatId, page);
+                entries.push({ runtime, page });
+                continue;
+              }
+              const keep = focus.page === page ? page : previous;
+              const duplicate = keep === page ? previous : page;
+              uniqueChats.set(chatId, keep);
+              if (keep === page) {
+                const index = entries.findIndex((entry) => entry.page === previous);
+                if (index >= 0) entries[index] = { runtime, page };
+              }
+              log.warn(`[watch] closing duplicate pane browser=${runtime.name} chat=${chatId}`);
+              await duplicate.close().catch((error) => {
+                if (!isClosedTargetError(error)) log.warn(`[watch] duplicate pane close failed: ${formatError(error)}`);
+              });
+              sessionPersistence.schedule("duplicate-pane-closed");
+            }
           } catch (error) {
             if (closedContexts.has(runtime.context) || isClosedTargetError(error)) {
               closedContexts.add(runtime.context);

@@ -278,6 +278,49 @@ ZIP/build hook. The setting is stored in `chat_retry_settings` and takes effect 
 poll; no watcher restart is required. Automatic clicking only applies while the watcher is on that
 conversation and a visible, enabled exact-name `Retry` button is present.
 
+### Ordered hook pipeline (v13)
+
+A hook is an ordered list of stages. The **default pipeline is `build → git-add`**;
+`git-commit` is optional and **is no longer automatic**. Define stages with repeated
+`--stage` options when configuring the hook. Order is preserved, and a nonzero
+exit stops subsequent stages:
+
+```bash
+# Default build + Git staging, using the existing wcc build command:
+chatgpt-ctl hook set "My project chat" --folder ~/src/my-project
+
+# Build → staging → commit:
+chatgpt-ctl hook set "My project chat" --folder ~/src/my-project \
+  --stage build --stage git-add --stage git-commit
+
+# Custom preparation / tests between or after stages:
+chatgpt-ctl hook set "My project chat" --folder ~/src/my-project \
+  --stage 'custom:./scripts/prepare.sh' \
+  --stage build \
+  --stage 'custom:cargo test --workspace' \
+  --stage git-add \
+  --stage git-commit \
+  --stage 'custom:echo Finished'
+
+# Custom stages may also be used without a build stage:
+chatgpt-ctl hook set "My project chat" --folder ~/src/my-project \
+  --stage 'custom:make lint' --stage git-add
+```
+
+`build` runs `--build-command` (default `wcc build`) in `--child-folder`, and
+both `build` and `custom:COMMAND` run inside `nix develop` when `--nix-flake`
+is set. `git-add` stages only archive files that `git ls-files --cached
+--others --exclude-standard` considers tracked or non-ignored, respecting
+`.gitignore`, `.git/info/exclude`, and global excludes. Ignored files stay
+on disk but are not force-added. `git-commit` commits the staged index only
+when changes exist; its message uses the staged Markdown diff, falling back
+to `Auto update`. All stages log START and FINISHED with their position in the
+pipeline, and shell stages log the executable command and exit code.
+
+Existing hooks with no `stages` column value automatically use build + git-add,
+so old configurations remain usable without reconfiguring them. A new `hook set`
+replaces the hook's stage configuration. `hook show` prints the saved stages.
+
 ### Per-chat ZIP automation hooks
 
 Hooks are managed dynamically by `chatgpt-ctl` and stored in PostgreSQL; no hook entries are
@@ -336,8 +379,8 @@ or commit. The default is `wcc build`; set `--build-command none` to skip buildi
 A nonzero build exit sends the diagnostic to the hooked conversation, keeps the extracted files for
 inspection, and stops without staging or committing anything. After a successful build (or when
 building is explicitly disabled), the hook stages only actual files supplied by the archive and
-skips paths matched by the repository's `.gitignore` rules. It commits the archive's Markdown diff
-as the commit message (or `Auto update` if no Markdown changes are present). `--nix-flake` runs
+skips paths matched by the repository's `.gitignore` rules. An optional `git-commit` stage uses the staged Markdown diff as the commit message
+(or `Auto update` if no Markdown changes are present). `--nix-flake` runs
 the configured build command inside that directory's Nix flake dev shell. Build failures read the
 configured clipboard command (default `wl-paste -n`) and send that diagnostic to the hooked conversation.
 

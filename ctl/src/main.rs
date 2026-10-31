@@ -172,6 +172,10 @@ enum HookAction {
         /// Build command executed from --child-folder; use `none` to skip building (default: wcc build)
         #[arg(long, default_value = "wcc build")]
         build_command: String,
+        /// Ordered pipeline stage (repeatable): build, git-add, git-commit, custom:COMMAND.
+        /// Default for new hooks: build, git-add. Omit git-commit to leave changes staged.
+        #[arg(long = "stage", value_name = "STAGE")]
+        stages: Vec<String>,
         /// Run the build command inside `nix develop <build-dir>`
         #[arg(long)]
         nix_flake: bool,
@@ -518,6 +522,7 @@ async fn ensure_hook_table(client: &Client) -> Result<()> {
           nix_flake boolean NOT NULL DEFAULT false,
           clipboard_command jsonb NOT NULL DEFAULT '["wl-paste", "-n"]'::jsonb,
           build_command text DEFAULT 'wcc build',
+          stages jsonb,
           enabled boolean NOT NULL DEFAULT true,
           updated_at timestamptz NOT NULL DEFAULT now()
         )
@@ -526,6 +531,7 @@ async fn ensure_hook_table(client: &Client) -> Result<()> {
     ).await?;
     // Additive migration for databases created by older watcher versions.
     client.execute("ALTER TABLE chat_hooks ADD COLUMN IF NOT EXISTS build_command text DEFAULT 'wcc build'", &[]).await?;
+    client.execute("ALTER TABLE chat_hooks ADD COLUMN IF NOT EXISTS stages jsonb", &[]).await?;
     Ok(())
 }
 
@@ -574,7 +580,7 @@ async fn run_hook_request(chat: Option<String>, database_url: &str) -> Result<()
 async fn run_hook_action(client: &Client, action: HookAction) -> Result<()> {
     ensure_hook_table(client).await?;
     match action {
-        HookAction::Set { chat, folder, child_folder, build_command, nix_flake, clipboard_command, clipboard_args } => {
+        HookAction::Set { chat, folder, child_folder, build_command, stages, nix_flake, clipboard_command, clipboard_args } => {
             let id = resolve_chat_id(client, &chat).await?;
             let folder = folder.canonicalize().with_context(|| format!("resolve hook folder {}", folder.display()))?;
             if !folder.is_dir() { anyhow::bail!("hook folder is not a directory: {}", folder.display()); }
@@ -586,15 +592,31 @@ async fn run_hook_action(client: &Client, action: HookAction) -> Result<()> {
             }
             let command_json = serde_json::to_value(command)?;
             let build_command = if build_command.trim().eq_ignore_ascii_case("none") { None } else { Some(build_command.trim().to_string()) };
+            let stages: Vec<serde_json::Value> = if stages.is_empty() {
+                let mut default_stages = Vec::new();
+                if build_command.is_some() { default_stages.push(serde_json::json!({"type":"build"})); }
+                default_stages.push(serde_json::json!({"type":"git-add"}));
+                default_stages
+            } else {
+                stages.iter().map(|raw| {
+                    match raw.as_str() {
+                        "build" | "git-add" | "git-commit" => Ok(serde_json::json!({"type":raw})),
+                        _ if raw.starts_with("custom:") && !raw[7..].trim().is_empty() =>
+                            Ok(serde_json::json!({"type":"custom","command":&raw[7..]})),
+                        _ => anyhow::bail!("invalid --stage '{}': expected build, git-add, git-commit, or custom:COMMAND", raw),
+                    }
+                }).collect::<Result<Vec<_>>>()?
+            };
+            let stages_json = serde_json::to_value(stages)?;
             let folder_text = folder.to_string_lossy().to_string();
             client.execute(
-                r#"INSERT INTO chat_hooks (chat_id, folder, child_folder, nix_flake, clipboard_command, build_command, enabled, updated_at)
-                   VALUES ($1, $2, $3, $4, $5::jsonb, $6, true, now())
+                r#"INSERT INTO chat_hooks (chat_id, folder, child_folder, nix_flake, clipboard_command, build_command, stages, enabled, updated_at)
+                   VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, true, now())
                    ON CONFLICT (chat_id) DO UPDATE SET folder=EXCLUDED.folder,
                      child_folder=EXCLUDED.child_folder, nix_flake=EXCLUDED.nix_flake,
                      clipboard_command=EXCLUDED.clipboard_command, build_command=EXCLUDED.build_command,
-                     enabled=true, updated_at=now()"#,
-                &[&id, &folder_text, &child_folder, &nix_flake, &command_json, &build_command],
+                     stages=EXCLUDED.stages, enabled=true, updated_at=now()"#,
+                &[&id, &folder_text, &child_folder, &nix_flake, &command_json, &build_command, &stages_json],
             ).await?;
             println!("hook configured for {id} ({})", chat);
         }
@@ -613,10 +635,11 @@ async fn run_hook_action(client: &Client, action: HookAction) -> Result<()> {
         }
         HookAction::Show { chat } => {
             let id = resolve_chat_id(client, &chat).await?;
-            let row = client.query_opt("SELECT folder, child_folder, nix_flake, clipboard_command, enabled, build_command FROM chat_hooks WHERE chat_id=$1", &[&id]).await?.context("no hook configured for this chat")?;
+            let row = client.query_opt("SELECT folder, child_folder, nix_flake, clipboard_command, enabled, build_command, stages FROM chat_hooks WHERE chat_id=$1", &[&id]).await?.context("no hook configured for this chat")?;
             let command: serde_json::Value = row.get(3);
             let build_command: Option<String> = row.get(5);
-            println!("chat: {id}\nfolder: {}\nchild_folder: {}\nbuild_command: {}\nnix_flake: {}\nenabled: {}\nclipboard_command: {}", row.get::<_, String>(0), row.get::<_, String>(1), build_command.as_deref().unwrap_or("none"), row.get::<_, bool>(2), row.get::<_, bool>(4), command);
+            let stages: Option<serde_json::Value> = row.get(6);
+            println!("chat: {id}\nfolder: {}\nchild_folder: {}\nbuild_command: {}\nnix_flake: {}\nenabled: {}\nclipboard_command: {}\nstages: {}", row.get::<_, String>(0), row.get::<_, String>(1), build_command.as_deref().unwrap_or("none"), row.get::<_, bool>(2), row.get::<_, bool>(4), command, stages.map(|v| v.to_string()).unwrap_or_else(|| "legacy default: build + git-add".into()));
         }
         HookAction::Run { chat } => {
             // Kept for completeness; the top-level dispatcher handles this action
