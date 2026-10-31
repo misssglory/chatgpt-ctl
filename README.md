@@ -290,7 +290,8 @@ chatgpt-ctl hook set "Docs chat" --folder ~/src/docs --child-folder website --bu
 chatgpt-ctl hook set "No build chat" --folder ~/src/docs --child-folder website --build-command none
 chatgpt-ctl hook list
 chatgpt-ctl hook show "My project chat"
-chatgpt-ctl hook run "My project chat"      # manually use the newest ZIP already in that chat
+chatgpt-ctl hook run                           # run against the virtual-focus chat
+chatgpt-ctl hook run "My project chat"      # manually use the newest ZIP in a specific chat
 chatgpt-ctl hook disable "My project chat"  # keep configuration, pause automation
 chatgpt-ctl hook enable "My project chat"
 chatgpt-ctl hook remove "My project chat"
@@ -317,12 +318,17 @@ After initialization, automatic processing is restricted to a ZIP control whose 
 belongs to the latest assistant message, whose turn number is newer than the baseline, and whose
 message has just completed. Historical ZIP links revealed by scrolling, revisiting, or editing older
 turns are therefore ignored. ZIP controls without stable message/turn metadata fail closed rather
-than triggering automation. Run `chatgpt-ctl hook run <chat>` (also available as `hook trigger`) to
+than triggering automation. Run `chatgpt-ctl hook run [chat]` (also available as `hook trigger`) to
 manually download the ZIP attached to the latest assistant message in that conversation and run the same extraction,
 build, and Git commit pipeline immediately. It refuses to substitute an older attachment if the latest
-assistant message has no ZIP. The command opens the specified chat in the active watcher
-pane if needed. Manual runs also work while a hook is disabled; disabling only pauses automatic
-processing of new attachments. Each new ZIP is saved under
+assistant message has no ZIP. An explicit chat argument opens that chat in its owning browser pane
+if needed; with no argument, the watcher uses the already selected virtual-focus page. Manual runs
+also work while a hook is disabled; disabling only pauses automatic
+processing of new attachments. Omitting the chat argument (or using `hook trigger`)
+selects the conversation under virtual focus across all browser profiles. With no argument,
+`chatgpt-ctl` does not need to open its own PostgreSQL connection; the running watcher resolves
+virtual focus and returns the selected chat UUID. If virtual focus is on a blank/new-chat page
+rather than a conversation, the watcher returns an explicit error instead of guessing another chat. Each new ZIP is saved under
 `<folder>/.chatgpt-ctl-downloads/`, checked for path-traversal entries, and extracted into
 `folder`. The configured `build_command` runs from `child_folder` (or `.`) before any Git staging
 or commit. The default is `wcc build`; set `--build-command none` to skip building explicitly.

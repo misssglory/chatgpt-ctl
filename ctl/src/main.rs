@@ -186,9 +186,12 @@ enum HookAction {
     List,
     /// Show one chat's hook
     Show { chat: String },
-    /// Manually run a hook using the newest ZIP attachment in that conversation
+    /// Manually run a hook using the newest ZIP attachment in the selected or virtual-focus conversation
     #[command(alias = "trigger")]
-    Run { chat: String },
+    Run {
+        /// Optional chat UUID or title; defaults to the virtual-focus conversation
+        chat: Option<String>,
+    },
     /// Enable a hook
     Enable { chat: String },
     /// Disable a hook without deleting it
@@ -540,6 +543,34 @@ async fn complete_chat_values(client: &Client, prefix: &str) -> Result<()> {
     Ok(())
 }
 
+
+async fn run_hook_request(chat: Option<String>, database_url: &str) -> Result<()> {
+    // Only explicit selectors need a CLI-side database lookup. For the default
+    // virtual-focus target, the watcher already owns the database connection.
+    let requested_id = if let Some(spec) = chat {
+        let client = connect(database_url).await?;
+        Some(resolve_chat_id(&client, &spec).await?)
+    } else {
+        None
+    };
+    let body = match requested_id.as_ref() {
+        Some(id) => serde_json::json!({ "chat_id": id }).to_string(),
+        None => "{}".to_string(),
+    };
+    let response = watcher_request("POST", "/hook/run", Some(&body))
+        .context("could not trigger hook; is `bun run watch` running?")?;
+    let value: serde_json::Value = serde_json::from_str(&response)?;
+    let response_id = value.get("chat_id").and_then(|v| v.as_str()).map(str::to_owned);
+    let id = response_id.or_else(|| requested_id.as_ref().map(ToString::to_string))
+        .context("watcher response did not include the hook chat UUID")?;
+    if let Some(path) = value.get("archive").and_then(|v| v.as_str()) {
+        println!("hook completed for {id}: {path}");
+    } else {
+        println!("hook completed for {id}");
+    }
+    Ok(())
+}
+
 async fn run_hook_action(client: &Client, action: HookAction) -> Result<()> {
     ensure_hook_table(client).await?;
     match action {
@@ -588,11 +619,23 @@ async fn run_hook_action(client: &Client, action: HookAction) -> Result<()> {
             println!("chat: {id}\nfolder: {}\nchild_folder: {}\nbuild_command: {}\nnix_flake: {}\nenabled: {}\nclipboard_command: {}", row.get::<_, String>(0), row.get::<_, String>(1), build_command.as_deref().unwrap_or("none"), row.get::<_, bool>(2), row.get::<_, bool>(4), command);
         }
         HookAction::Run { chat } => {
-            let id = resolve_chat_id(client, &chat).await?;
-            let body = serde_json::json!({ "chat_id": id }).to_string();
+            // Kept for completeness; the top-level dispatcher handles this action
+            // without a database connection when no explicit chat was supplied.
+            let requested_id = if let Some(spec) = chat {
+                Some(resolve_chat_id(client, &spec).await?)
+            } else {
+                None
+            };
+            let body = match requested_id {
+                Some(id) => serde_json::json!({ "chat_id": id }).to_string(),
+                None => "{}".to_string(),
+            };
             let response = watcher_request("POST", "/hook/run", Some(&body))
                 .context("could not trigger hook; is `bun run watch` running?")?;
             let value: serde_json::Value = serde_json::from_str(&response)?;
+            let response_id = value.get("chat_id").and_then(|v| v.as_str()).map(str::to_owned);
+            let id = response_id.or_else(|| requested_id.map(|id| id.to_string()))
+                .context("watcher response did not include the hook chat UUID")?;
             if let Some(path) = value.get("archive").and_then(|v| v.as_str()) {
                 println!("hook completed for {id}: {path}");
             } else {
@@ -925,6 +968,9 @@ async fn main() -> Result<()> {
         Commands::Retry { chat, mode } => {
             let client = connect(&url).await?;
             set_retry_setting(&client, &chat, mode).await?;
+        }
+        Commands::Hook { action: HookAction::Run { chat } } => {
+            run_hook_request(chat, &url).await?;
         }
         Commands::Hook { action } => {
             let client = connect(&url).await?;

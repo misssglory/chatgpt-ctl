@@ -2055,10 +2055,23 @@ function startControlServer(
         }
 
         const requestedChatId = normalizeUuid(body.chat_id || "");
-        const runtime = requestedChatId ? await runtimeForChat(sql, runtimes, requestedChatId) : getVirtualFocus(focus, runtimes).runtime;
+        // Resolve virtual focus once per request; this preserves the exact page
+        // selected across browser profiles and avoids a second fallback decision.
+        let virtualTarget: ReturnType<typeof getVirtualFocus> | undefined;
+        if (!requestedChatId) {
+          try {
+            virtualTarget = getVirtualFocus(focus, runtimes);
+          } catch (error) {
+            if (url.pathname === "/hook/run") return Response.json({
+              error: "no virtual-focus conversation is available; open a chat first"
+            }, { status: 409 });
+            throw error;
+          }
+        }
+        const runtime = requestedChatId ? await runtimeForChat(sql, runtimes, requestedChatId) : virtualTarget!.runtime;
         let page = requestedChatId
           ? openConversationPages([runtime]).find((item) => item.chatId === requestedChatId)?.page
-          : getVirtualFocus(focus, runtimes).page;
+          : virtualTarget!.page;
         if ((url.pathname === "/hook/run" || url.pathname === "/download-last-zip") && requestedChatId && !page) {
           page = await makePage(runtime);
           const target = new URL(`/c/${requestedChatId}`, cfg.chatgpt.url).toString();
@@ -2066,10 +2079,16 @@ function startControlServer(
           await waitForConversationReady(page, requestedChatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
           await recordChatBrowser(sql, requestedChatId, runtime.name);
         }
-        if (!page) return Response.json({ error: `chat ${requestedChatId} is not open in a watcher pane` }, { status: 404 });
+        if (!page) return Response.json({ error: requestedChatId
+          ? `chat ${requestedChatId} is not open in a watcher pane`
+          : "no virtual-focus browser page is available; open a conversation first" }, { status: 404 });
         if (url.pathname === "/hook/run") {
-          const chatId = requestedChatId;
-          if (!chatId) return Response.json({ error: "valid chat_id is required" }, { status: 400 });
+          // With no chat_id, run against the conversation currently selected by
+          // cross-browser virtual focus. A blank/new-chat page is not a valid target.
+          const chatId = requestedChatId || normalizeUuid(page.url());
+          if (!chatId) return Response.json({
+            error: "virtual focus is not on a conversation; use `chatgpt-ctl open <chat>` or `chatgpt-ctl hook run <chat>` first"
+          }, { status: 409 });
           const hook = await loadChatHook(sql, chatId);
           if (!hook) return Response.json({ error: `no hook configured for ${chatId}` }, { status: 404 });
           const archive = await runHookWithLastZip(page, chatId, hook, cfg, configPath);
