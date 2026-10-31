@@ -2456,6 +2456,21 @@ async function watch(cfg: Config, configPath: string) {
   const pendingHookMessages = new Map<string, Map<string, number>>();
   const retryClickCooldowns = new Map<string, number>();
   const deliveryRetryState = new Map<string, { attempts: number; lastAttempt: number; absentPolls: number }>();
+  // Closing a Chromium window also closes its persistent context. This is
+  // normal user intent, not a recoverable polling failure.
+  const closedContexts = new WeakSet<BrowserContext>();
+  for (const runtime of runtimes) {
+    runtime.context.on("close", () => {
+      closedContexts.add(runtime.context);
+      runtime.activePage = undefined;
+      if (!stopping) {
+        sessionPersistence.schedule("browser-closed");
+        log.info(`[watch] browser=${runtime.name} closed by user`);
+      }
+    });
+  }
+  const isClosedTargetError = (error: unknown) =>
+    /(?:target page, context or browser has been closed|browser has been closed|target closed|context closed|page closed)/i.test(formatError(error));
 
   let stopping = false;
   const stop = async () => {
@@ -2513,20 +2528,35 @@ async function watch(cfg: Config, configPath: string) {
       try {
         const entries: Array<{ runtime: BrowserRuntime; page: Page }> = [];
         for (const runtime of runtimes) {
-          let pages = runtime.context.pages().filter((page) => !page.isClosed());
-          if (!runtime.activePage || runtime.activePage.isClosed() || !pages.includes(runtime.activePage)) {
-            runtime.activePage = pages[0] ?? await runtime.context.newPage();
-            if (pages.length === 0) {
-              configurePage(runtime.activePage, cfg);
-              attachNetworkDebug(runtime.activePage, cfg);
-              await ensureCurrentChatGPTPage(runtime.activePage, cfg);
-            }
+          if (closedContexts.has(runtime.context)) continue;
+          let pages: Page[];
+          try {
             pages = runtime.context.pages().filter((page) => !page.isClosed());
+            // A user closing all tabs must not cause the watcher to reopen one.
+            if (!pages.length) {
+              runtime.activePage = undefined;
+              continue;
+            }
+            if (!runtime.activePage || runtime.activePage.isClosed() || !pages.includes(runtime.activePage)) {
+              runtime.activePage = pages[0];
+            }
+            if (runtime.activePage) {
+              await syncSidebarChats(runtime.activePage, sql, false, runtime.name);
+            }
+            for (const page of pages) entries.push({ runtime, page });
+          } catch (error) {
+            if (closedContexts.has(runtime.context) || isClosedTargetError(error)) {
+              closedContexts.add(runtime.context);
+              runtime.activePage = undefined;
+              continue;
+            }
+            throw error;
           }
-          if (pages.length && runtime.activePage) {
-            await syncSidebarChats(runtime.activePage, sql, false, runtime.name);
-          }
-          for (const page of pages) entries.push({ runtime, page });
+        }
+        if (!entries.length) {
+          log.info("[watch] all browser windows closed; exiting cleanly");
+          await stop();
+          return;
         }
 
         await Promise.all(entries.map(async ({ runtime, page }) => {
@@ -2674,10 +2704,16 @@ async function watch(cfg: Config, configPath: string) {
               pendingHookMessages.delete(chat.id);
             }
           } catch (pageError) {
+            if (page.isClosed() || closedContexts.has(runtime.context) || isClosedTargetError(pageError)) return;
             log.error(`[watch] pane scan failed url=${page.url()}: ${formatError(pageError)}`);
           }
         }));
       } catch (error) {
+        if (isClosedTargetError(error)) {
+          // A window may close between enumerating tabs and scanning them.
+          // The next poll will check whether any browser windows remain.
+          continue;
+        }
         log.error(`[watch] scan failed:\n${formatError(error)}`);
       }
       await new Promise((resolve) => setTimeout(resolve, pollMs));
