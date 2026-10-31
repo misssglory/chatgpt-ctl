@@ -24,6 +24,9 @@ conversation_id = ""
 executable_path = "/etc/profiles/per-user/mg/bin/chromium-regular"
 prefer_system_chromium = true
 headless = false
+# Keep Chromium sandboxing enabled. Set false only in environments that cannot
+# support Chromium sandboxing (Playwright otherwise adds --no-sandbox).
+chromium_sandbox = true
 native_window_viewport = true
 viewport_width = 1440
 viewport_height = 900

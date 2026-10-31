@@ -369,6 +369,8 @@ bun run watch                  # persist messages when streaming completes
 
 Login uses a **non-Playwright** Chromium process with `--user-data-dir` so Google/OpenAI cookies land in the profile; `watch` reuses it via `launchPersistentContext`.
 
+Chromium launched by Playwright uses `chromiumSandbox = true` by default, so Playwright does not pass `--no-sandbox` and Chromium does not display its unsupported-flag warning. This can be changed in `[browser]` in `config.toml`; keep it enabled unless the host cannot provide a working Chromium sandbox.
+
 ---
 
 ## Layout

@@ -45,6 +45,8 @@ interface Config {
     executable_path?: string;
     prefer_system_chromium?: boolean;
     headless?: boolean;
+    /** Enable Chromium's own process sandbox (prevents Playwright adding --no-sandbox). */
+    chromium_sandbox?: boolean;
     native_window_viewport?: boolean;
     viewport_width?: number;
     viewport_height?: number;
@@ -809,6 +811,7 @@ async function launchContext(
   log.info(
     `[browser] profile=${profileDir} headless=${headless} ` +
       `viewport=${nativeWindowViewport ? "native-window" : `${viewport!.width}x${viewport!.height}`} ` +
+      `sandbox=${cfg.browser?.chromium_sandbox ?? true} ` +
       `exe=${executablePath}`
   );
 
@@ -818,6 +821,9 @@ async function launchContext(
     return await chromium.launchPersistentContext(profileDir, {
       executablePath,
       headless,
+      // Playwright defaults this to false and injects --no-sandbox. Keep the
+      // Chromium sandbox enabled unless explicitly disabled in config.
+      chromiumSandbox: cfg.browser?.chromium_sandbox ?? true,
       viewport, // null | { width, height }
     });
   } catch (error) {
@@ -1284,11 +1290,16 @@ async function doctor(cfg: Config, configPath: string) {
 
   const executablePath = await resolveBrowserExecutable(cfg, configPath);
   log.info(`[doctor] selected browser=${executablePath}`);
+  log.info(`[doctor] chromium sandbox=${cfg.browser?.chromium_sandbox ?? true}`);
   const version = await commandOutput([executablePath, "--version"]);
   log.info(`[doctor] browser --version exit=${version.code} ${version.stdout || version.stderr}`);
 
   log.info("[doctor] attempting Playwright headless launch...");
-  const browser = await chromium.launch({ executablePath, headless: true });
+  const browser = await chromium.launch({
+    executablePath,
+    headless: true,
+    chromiumSandbox: cfg.browser?.chromium_sandbox ?? true,
+  });
   try {
     const page = await browser.newPage();
     await page.goto("data:text/html,<title>ok</title>");

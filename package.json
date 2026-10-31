@@ -18,7 +18,8 @@
     "test:hook-transaction": "node tests/hook-transaction-order.mjs && bash tests/hook-git-filtering-smoke.sh",
     "test:watch-session": "node tests/watch-session-restoration.mjs",
     "test:hook-virtual-focus": "node tests/hook-run-virtual-focus.mjs",
-    "test:zip-selection": "node tests/zip-target-selection.mjs"
+    "test:zip-selection": "node tests/zip-target-selection.mjs",
+    "test:chromium-sandbox": "node tests/chromium-sandbox.mjs"
   },
   "dependencies": {
     "playwright-core": "^1.55.0",
