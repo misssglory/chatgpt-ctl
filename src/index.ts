@@ -319,6 +319,7 @@ async function ensureBrowserSchema(sql: Sql): Promise<void> {
       updated_at timestamptz NOT NULL DEFAULT now()
     )
   `);
+  await sql.unsafe(`ALTER TABLE chatgpt_watcher_browsers ADD COLUMN IF NOT EXISTS auto_open boolean NOT NULL DEFAULT true`);
   // Continuously persisted watcher pane snapshot, restored on the next launch.
   // One row represents one open conversation pane; focused_at preserves the
   // virtual-focus choice across browser contexts.
@@ -344,6 +345,15 @@ async function registerBrowser(sql: Sql, profile: BrowserProfile): Promise<void>
     VALUES (${profile.name}, ${profile.profileDir}, NOW())
     ON CONFLICT (name) DO UPDATE SET profile_dir=EXCLUDED.profile_dir, updated_at=NOW()
   `;
+}
+
+async function browserStartupEnabled(sql: Sql, name: string): Promise<boolean> {
+  const rows = await sql`SELECT auto_open FROM chatgpt_watcher_browsers WHERE name = ${name}`;
+  return rows.length === 0 || rows[0]!.auto_open !== false;
+}
+
+async function setBrowserStartupEnabled(sql: Sql, name: string, enabled: boolean): Promise<void> {
+  await sql`UPDATE chatgpt_watcher_browsers SET auto_open = ${enabled}, updated_at = NOW() WHERE name = ${name}`;
 }
 
 async function recordChatBrowser(sql: Sql, chatId: string, browserName: string): Promise<void> {
@@ -1256,7 +1266,12 @@ async function syncChatsCommand(cfg: Config, configPath: string, quiet = false) 
   try {
     await ensureBrowserSchema(sql);
     for (const profile of profiles) {
+      const allowed = await browserStartupEnabled(sql, profile.name);
       await registerBrowser(sql, profile);
+      if (!allowed) {
+        log.info(`[watch] browser=${profile.name} stays closed (manual close persisted)`);
+        continue;
+      }
       const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false, profile.name);
       try {
         const page = await getPage(context);
@@ -2138,9 +2153,10 @@ function startControlServer(
   focus: VirtualFocus,
   cfg: Config,
   configPath: string,
-  sql: Sql
+  sql: Sql,
+  ensureRuntimeForChat: (chatId: string) => Promise<BrowserRuntime>,
 ) {
-  const defaultRuntime = runtimes.find((runtime) => runtime.name === "default") ?? runtimes[0]!;
+  const chooseDefaultRuntime = () => runtimes.find((runtime) => runtime.name === "default") ?? runtimes[0];
   const makePage = async (runtime: BrowserRuntime): Promise<Page> => {
     const page = await runtime.context.newPage();
     configurePage(page, cfg);
@@ -2188,7 +2204,7 @@ function startControlServer(
           const chatId = normalizeUuid(body.chat_id || "");
           if (!chatId) return Response.json({ error: "invalid chat_id" }, { status: 400 });
           const existing = openConversationPages(runtimes).find((item) => item.chatId === chatId);
-          const runtime = existing?.runtime ?? await runtimeForChat(sql, runtimes, chatId);
+          const runtime = existing?.runtime ?? await ensureRuntimeForChat(chatId);
           const alreadyOpen = Boolean(existing);
           const page = existing?.page ?? await makePage(runtime);
           if (!alreadyOpen) {
@@ -2243,15 +2259,16 @@ function startControlServer(
               setVirtualFocus(focus, next.runtime, next.page, "ctl");
               await next.page.bringToFront();
             } else {
-              const page = await makePage(defaultRuntime);
-              await openChatGPT(page, cfg);
-              setVirtualFocus(focus, defaultRuntime, page, "ctl");
+              // Closing the last pane must not resurrect a manually closed browser.
+              focus.page = undefined;
+              focus.runtime = undefined;
             }
           }
           return Response.json({ ok: true, closed_chat_id: closedId, browser_name: target.runtime.name, chat_ids: openConversationPages(runtimes).map((item) => item.chatId) });
         }
         if (url.pathname === "/new-chat") {
-          const runtime = focus.runtime && runtimes.includes(focus.runtime) ? focus.runtime : defaultRuntime;
+          const runtime = focus.runtime && runtimes.includes(focus.runtime) ? focus.runtime : chooseDefaultRuntime();
+          if (!runtime) return Response.json({ error: "no browser open; use ctl open <chat> or ctl send --chat <chat> first" }, { status: 409 });
           const page = await makePage(runtime);
           const target = new URL("/", cfg.chatgpt.url).toString();
           await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
@@ -2277,7 +2294,7 @@ function startControlServer(
           let runtime: BrowserRuntime;
           let page: Page;
           if (requestedChatId) {
-            runtime = await runtimeForChat(sql, runtimes, requestedChatId);
+            runtime = await ensureRuntimeForChat(requestedChatId);
             const existingPane = openConversationPages([runtime]).find((item) => item.chatId === requestedChatId);
             page = existingPane?.page ?? await makePage(runtime);
             if (!existingPane) {
@@ -2346,7 +2363,7 @@ function startControlServer(
             throw error;
           }
         }
-        const runtime = requestedChatId ? await runtimeForChat(sql, runtimes, requestedChatId) : virtualTarget!.runtime;
+        const runtime = requestedChatId ? await ensureRuntimeForChat(requestedChatId) : virtualTarget!.runtime;
         let page = requestedChatId
           ? openConversationPages([runtime]).find((item) => item.chatId === requestedChatId)?.page
           : virtualTarget!.page;
@@ -2442,7 +2459,12 @@ async function watch(cfg: Config, configPath: string) {
   const focus: VirtualFocus = { at: 0, source: "manual", pageFocusAt: new WeakMap<Page, number>() };
   try {
     for (const profile of profiles) {
+      const allowed = await browserStartupEnabled(sql, profile.name);
       await registerBrowser(sql, profile);
+      if (!allowed) {
+        log.info(`[watch] browser=${profile.name} stays closed (manual close persisted)`);
+        continue;
+      }
       const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false, profile.name);
       runtimes.push({ ...profile, context, lastFocusAt: 0 });
     }
@@ -2469,23 +2491,69 @@ async function watch(cfg: Config, configPath: string) {
   const pendingHookMessages = new Map<string, Map<string, number>>();
   const retryClickCooldowns = new Map<string, number>();
   const deliveryRetryState = new Map<string, { attempts: number; lastAttempt: number; absentPolls: number }>();
-  // Closing a Chromium window also closes its persistent context. This is
-  // normal user intent, not a recoverable polling failure.
   const closedContexts = new WeakSet<BrowserContext>();
-  for (const runtime of runtimes) {
+  let stopping = false;
+  const attachBrowserClose = (runtime: BrowserRuntime) => {
     runtime.context.on("close", () => {
       closedContexts.add(runtime.context);
       runtime.activePage = undefined;
-      if (!stopping) {
-        sessionPersistence.schedule("browser-closed");
-        log.info(`[watch] browser=${runtime.name} closed by user`);
+      if (stopping) return;
+      // Remove the runtime from the active set: /status and ctl chats must
+      // immediately reflect only live browser panes.
+      const index = runtimes.indexOf(runtime);
+      if (index >= 0) runtimes.splice(index, 1);
+      if (focus.runtime === runtime) {
+        focus.runtime = undefined;
+        focus.page = undefined;
       }
+      void setBrowserStartupEnabled(sql, runtime.name, false).catch((err) =>
+        log.error(`[watch] cannot persist browser closure ${runtime.name}: ${formatError(err)}`));
+      sessionPersistence.schedule("browser-closed");
+      log.info(`[watch] browser=${runtime.name} closed by user; will remain closed on restart`);
     });
-  }
+  };
+  for (const runtime of runtimes) attachBrowserClose(runtime);
+
+  // Explicit ctl open/send may revive a closed profile, but ordinary scans
+  // and watcher startup will never do so.
+  const openingRuntimes = new Map<string, Promise<BrowserRuntime>>();
+  const ensureRuntimeForChat = async (chatId: string): Promise<BrowserRuntime> => {
+    const existing = openConversationPages(runtimes).find((item) => item.chatId === chatId);
+    if (existing) return existing.runtime;
+    const preferredName = await browserNameForChat(sql, chatId) ?? "default";
+    const profile = profiles.find((item) => item.name === preferredName)
+      ?? profiles.find((item) => item.name === "default") ?? profiles[0];
+    if (!profile) throw new Error("no browser profile is configured");
+    const active = runtimes.find((item) => item.name === profile.name);
+    if (active) return active;
+    const inFlight = openingRuntimes.get(profile.name);
+    if (inFlight) return inFlight;
+    const opening = (async () => {
+      const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false, profile.name);
+      const runtime: BrowserRuntime = { ...profile, context, lastFocusAt: 0 };
+      runtimes.push(runtime);
+      attachBrowserClose(runtime);
+      try {
+        runtime.activePage = await getPage(context);
+        await installFocusTracking(runtime, focus);
+        attachNetworkDebug(runtime.activePage, cfg);
+        await setBrowserStartupEnabled(sql, profile.name, true);
+        sessionPersistence.schedule("ctl-browser-reopened");
+        log.info(`[watch] reopened browser=${profile.name} for chat=${chatId}`);
+        return runtime;
+      } catch (err) {
+        await context.close().catch(() => undefined);
+        throw err;
+      }
+    })();
+    openingRuntimes.set(profile.name, opening);
+    try { return await opening; }
+    finally { openingRuntimes.delete(profile.name); }
+  };
+
   const isClosedTargetError = (error: unknown) =>
     /(?:target page, context or browser has been closed|browser has been closed|target closed|context closed|page closed)/i.test(formatError(error));
 
-  let stopping = false;
   const stop = async () => {
     if (stopping) return;
     stopping = true;
@@ -2525,7 +2593,7 @@ async function watch(cfg: Config, configPath: string) {
       initialTotal += sidebarChats.length;
       log.info(`[watch] browser=${runtime.name} synchronized ${sidebarChats.length} sidebar chats`);
     }
-    const initialFocus = runtimes.find((runtime) => runtime.name === "default") ?? runtimes[0]!;
+    const initialFocus = runtimes.find((runtime) => runtime.name === "default") ?? runtimes[0];
     if (!focus.page && initialFocus?.activePage) setVirtualFocus(focus, initialFocus, initialFocus.activePage, "manual");
     // Startup restore is complete: commit the authoritative post-restore
     // snapshot now, then keep it current from browser page/focus events.
@@ -2533,7 +2601,7 @@ async function watch(cfg: Config, configPath: string) {
     sessionPersistence.schedule("watch-startup");
     await sessionPersistence.flush();
     log.info(`[watch] restored ${restoredCount} previously open chat pane(s)`);
-    controlServer = startControlServer(runtimes, focus, cfg, configPath, sql);
+    controlServer = startControlServer(runtimes, focus, cfg, configPath, sql, ensureRuntimeForChat);
     log.info(`[watch] synchronized ${initialTotal} sidebar chats across ${runtimes.length} browser profile(s)`);
     log.info(`[watch] poll=${pollMs}ms settle=${settleMs}ms multi-pane and multi-browser enabled`);
 
@@ -2567,9 +2635,9 @@ async function watch(cfg: Config, configPath: string) {
           }
         }
         if (!entries.length) {
-          log.info("[watch] all browser windows closed; exiting cleanly");
-          await stop();
-          return;
+          // Keep the control server alive to accept explicit ctl open/send.
+          await new Promise((resolve) => setTimeout(resolve, pollMs));
+          continue;
         }
 
         await Promise.all(entries.map(async ({ runtime, page }) => {

@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS chatgpt_watcher_browsers (
 
 
 -- Continuously persisted watcher pane snapshot; used to reopen conversation panes.
+ALTER TABLE chatgpt_watcher_browsers ADD COLUMN IF NOT EXISTS auto_open boolean NOT NULL DEFAULT true;
+
 CREATE TABLE IF NOT EXISTS chatgpt_watcher_open_chats (
     browser_name text NOT NULL,
     chat_id uuid NOT NULL REFERENCES chats(id) ON DELETE CASCADE,

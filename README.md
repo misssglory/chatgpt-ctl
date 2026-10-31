@@ -519,3 +519,18 @@ helps prioritize retries and re-runs; it does not bypass latest-message matching
 ### Automatic delivery-timeout recovery
 
 When the active conversation displays the exact error `Message delivery timed out. Please try again.`, the watcher automatically clicks the `Retry` button inside the matching visible alert. This works regardless of the optional per-chat generic Retry toggle. Retries are limited to three per error episode with at least 30 seconds between attempts. The counter resets once the alert is absent for two consecutive scans. Unrelated Retry buttons are not clicked by this recovery path.
+
+### Browser close persistence and on-demand reopen (v9)
+
+Closing a browser window manually marks its browser profile `auto_open=false` in
+`chatgpt_watcher_browsers`, removes its open panes from the live `ctl chats` indicators
+and from the persisted open-pane snapshot, and prevents it from reopening when the
+watcher restarts. The watcher stays alive with no browser windows so its control
+server can still handle requests. `ctl open <CHAT_ID>` or `ctl send --chat <CHAT_ID>`
+will reopen the profile previously associated with that chat, and mark it eligible
+for launch on later restarts. Browser focus is still event-driven; no compositor
+or polling integration is added.
+
+Normal watcher shutdown (`Ctrl+C`/SIGTERM) does not mark browsers manually closed.
+Existing installations begin with `auto_open=true` until a browser is first
+closed using the updated watcher.
