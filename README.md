@@ -502,3 +502,16 @@ psql "$CHATGPT_DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/persistence-idempotency
 ```
 
 It verifies that identical watcher polls do not update message rows and that an incomplete-to-completed transition is reported only once.
+
+### ZIP candidate selection and history
+
+`chatgpt-ctl hook run` and the watcher's auto-hook use the same ZIP selector.
+For the latest assistant message only, a sole download control whose label contains
+`.zip` or the word `ZIP` is selected directly. Otherwise up to three candidate
+controls are probed concurrently in isolated temporary tabs, and only a verified
+ZIP is accepted. Non-ZIP downloads are removed; losing concurrent downloads are
+also removed. No attachments from older assistant messages are eligible.
+
+The last successful verified ZIP selection for each chat is saved in
+`<hook folder>/.chatgpt-ctl-downloads/last-successful-zips.json`. This record
+helps prioritize retries and re-runs; it does not bypass latest-message matching.

@@ -12,7 +12,7 @@
 import { TOML } from "bun";
 import { chromium, type BrowserContext, type Download, type Page } from "playwright-core";
 import { Logger } from "tslog";
-import { access, constants, lstat, mkdir, mkdtemp, readdir, rename, rm, readFile, open } from "node:fs/promises";
+import { access, constants, lstat, mkdir, mkdtemp, readdir, rename, rm, readFile, writeFile, open } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import postgres from "postgres";
@@ -1596,7 +1596,8 @@ async function downloadZipTarget(page: Page, targetInfo: ZipTarget, directory: s
   const suggested = download.suggestedFilename() || targetInfo.label || "chatgpt-download.zip";
   log.info(`[download] browser suggested filename='${suggested}' for selected attachment '${targetInfo.label}'`);
   const filename = safeFilename(suggested);
-  const target = path.join(directory, filename);
+  // Unique staging file prevents concurrent candidates overwriting each other.
+  const target = path.join(directory, `${crypto.randomUUID()}-${filename}`);
   await download.saveAs(target);
   // Do not allow a generic "Open Download" pressable to feed a non-ZIP
   // file into a destructive project-update hook.
@@ -1613,7 +1614,8 @@ async function downloadZipTarget(page: Page, targetInfo: ZipTarget, directory: s
      (magic[2] === 0x05 && magic[3] === 0x06) ||
      (magic[2] === 0x07 && magic[3] === 0x08)))) {
     await rm(target, { force: true });
-    throw new Error(`selected download '${targetInfo.label}' is not a ZIP archive; hook aborted`);
+    log.warn(`[download] candidate '${targetInfo.label}' is not a ZIP archive; trying other candidates`);
+    return null;
   }
   log.info(`[download] saved verified ZIP ${target}`);
   return target;
@@ -1654,57 +1656,115 @@ async function latestAssistantMessage(page: Page, expectedChatId?: string): Prom
   return { id: latestAssistant.id.toLowerCase(), ...(latestAssistant.turnOrder !== undefined ? { turnOrder: latestAssistant.turnOrder } : {}) };
 }
 
+/** Per-chat successful ZIP provenance; written atomically and used only as a hint. */
+type SuccessfulZip = { chatId: string; assistantId: string; turnOrder: number | null; targetIdentity: string; label: string; savedAt: string };
+const ZIP_HISTORY_FILE = "last-successful-zips.json";
+
+async function loadSuccessfulZips(directory: string): Promise<Record<string, SuccessfulZip>> {
+  try {
+    const value: unknown = JSON.parse(await readFile(path.join(directory, ZIP_HISTORY_FILE), "utf8"));
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    return value as Record<string, SuccessfulZip>;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      log.warn(`[download] cannot read ZIP history: ${formatError(error)}`);
+    }
+    return {};
+  }
+}
+
+async function persistSuccessfulZip(directory: string, chatId: string, assistant: AssistantZipIdentity | undefined, target: ZipTarget): Promise<void> {
+  await mkdir(directory, { recursive: true });
+  const history = await loadSuccessfulZips(directory);
+  history[chatId] = {
+    chatId,
+    assistantId: assistant?.id ?? target.messageId ?? "",
+    turnOrder: assistant?.turnOrder ?? target.messageOrder,
+    targetIdentity: target.identity,
+    label: target.label,
+    savedAt: new Date().toISOString(),
+  };
+  const temporary = path.join(directory, `.${ZIP_HISTORY_FILE}.${crypto.randomUUID()}.tmp`);
+  try {
+    await writeFile(temporary, JSON.stringify(history, null, 2) + "\n", { mode: 0o600 });
+    await rename(temporary, path.join(directory, ZIP_HISTORY_FILE));
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+function explicitZipCandidate(target: ZipTarget): boolean {
+  return /\.zip(?:$|[?#\s])/i.test(target.label) || /\bZIP\b/i.test(target.label);
+}
+
 async function downloadLastZip(page: Page, directory: string, expectedAssistant?: AssistantZipIdentity): Promise<string> {
   const targets = await findZipTargets(page);
-  if (targets.length === 0) {
-    throw new Error(
-      "no ZIP attachment found in the current conversation; expected a ChatGPT file link " +
-      "(role=link with a .zip name), an attachment card, or an <a href> download link",
-    );
-  }
-  // Hook/manual ZIP downloads must belong to the latest assistant message.
-  // Prefer the exact message UUID. DIL portal links can expose a different
-  // message-id wrapper than the history scraper, so allow the exact stable
-  // turn key as a fallback; never select a lower/older turn.
-  const relevantTargets = expectedAssistant
+  const chatId = normalizeUuid(page.url());
+  if (!chatId) throw new Error("cannot persist ZIP selection without a conversation id");
+  const matches = expectedAssistant
     ? targets.filter((target) => zipTargetAssociation(target, expectedAssistant) !== null)
     : targets;
-  log.info(`[download] candidates: ${JSON.stringify(targets.map(({ index, label, messageOrder, messageId, kind }) => ({
-    index, label, messageOrder, messageId, kind,
-  })))}`);
-
-  if (expectedAssistant && relevantTargets.length === 0) {
-    throw new Error(
-      `latest assistant message ${expectedAssistant.id}` +
-      `${expectedAssistant.turnOrder === undefined ? "" : ` (turn ${expectedAssistant.turnOrder})`}` +
-      ` has no identifiable ZIP attachment; refusing to fall back to an older message ` +
-      `(visible ZIP controls: ${targets.length})`,
-    );
+  if (!matches.length) {
+    throw new Error(expectedAssistant
+      ? `latest assistant message ${expectedAssistant.id} (turn ${expectedAssistant.turnOrder ?? "unknown"}) has no identifiable ZIP attachment; refusing an older message (visible controls: ${targets.length})`
+      : "no ZIP download controls found in the current conversation");
   }
-  if (expectedAssistant) {
-    for (const target of relevantTargets) {
-      const association = zipTargetAssociation(target, expectedAssistant);
-      if (association === "turn-order" && target.messageId?.toLowerCase() !== expectedAssistant.id.toLowerCase()) {
-        log.warn(`[download] matching ZIP by exact turn order ${expectedAssistant.turnOrder}; portal message id ${target.messageId ?? "missing"} differs from scraper id ${expectedAssistant.id}`);
+  const history = (await loadSuccessfulZips(directory))[chatId];
+  // History never authorizes selecting a different/older assistant's attachment.
+  // Within the currently authorized set, prioritize candidates newer than the
+  // successful turn, then the previously successful label when re-running a turn.
+  const candidates = [...matches].sort((a, b) => {
+    const prev = history?.turnOrder;
+    const aFresh = prev != null && a.messageOrder != null && a.messageOrder > prev ? 1 : 0;
+    const bFresh = prev != null && b.messageOrder != null && b.messageOrder > prev ? 1 : 0;
+    if (aFresh !== bFresh) return bFresh - aFresh;
+    const aKnown = a.identity === history?.targetIdentity || a.label === history?.label ? 1 : 0;
+    const bKnown = b.identity === history?.targetIdentity || b.label === history?.label ? 1 : 0;
+    if (aKnown !== bKnown) return bKnown - aKnown;
+    return b.index - a.index;
+  });
+  const explicit = candidates.filter(explicitZipCandidate);
+  // One unmistakable ZIP label: do not click generic "Download" controls.
+  const attempts = explicit.length === 1 ? explicit : candidates;
+  log.info(`[download] chat=${chatId} candidates=${candidates.length} explicitZIP=${explicit.length} attempts=${attempts.length} lastSuccess=${history?.label ?? "none"}`);
+  if (attempts.length === 1) {
+    const target = attempts[0]!;
+    const archive = await downloadZipTarget(page, target, directory);
+    if (!archive) throw new Error(`candidate '${target.label}' did not yield a valid ZIP`);
+    await persistSuccessfulZip(directory, chatId, expectedAssistant, target);
+    return archive;
+  }
+
+  // Each parallel click needs its own Playwright Page and download listener.
+  // A shared page would mismatch download events between candidates.
+  const limit = Math.min(3, attempts.length);
+  let next = 0;
+  let winner: { archive: string; target: ZipTarget } | null = null;
+  const errors: string[] = [];
+  async function worker(): Promise<void> {
+    while (!winner && next < attempts.length) {
+      const target = attempts[next++]!;
+      const tab = await page.context().newPage();
+      try {
+        await tab.goto(page.url(), { waitUntil: "domcontentloaded", timeout: 30_000 });
+        await waitForConversationReady(tab, chatId, 30_000);
+        if (winner) break;
+        const archive = await downloadZipTarget(tab, target, directory);
+        if (!archive) { errors.push(`${target.label}: no valid ZIP`); continue; }
+        if (!winner) winner = { archive, target };
+        else await rm(archive, { force: true });
+      } catch (error) {
+        errors.push(`${target.label}: ${formatError(error)}`);
+      } finally {
+        await tab.close().catch(() => {});
       }
     }
   }
-  const knownTargets = relevantTargets.filter((target) => target.messageOrder !== null);
-  const candidates = knownTargets.length > 0 ? knownTargets : relevantTargets;
-  const newest = candidates.reduce((best, current) => {
-    const bestTurn = best.messageOrder;
-    const currentTurn = current.messageOrder;
-    if (bestTurn !== null && currentTurn !== null) {
-      if (currentTurn > bestTurn) return current;
-      if (currentTurn < bestTurn) return best;
-    }
-    return current.index > best.index ? current : best;
-  });
-
-  log.info(`[download] selected ${newest.label} (message=${newest.messageId ?? "unknown"}; turn ${newest.messageOrder ?? "unknown"})`);
-  const downloaded = await downloadZipTarget(page, newest, directory);
-  if (!downloaded) throw new Error(`no download event for ${newest.label}; ZIP was not captured`);
-  return downloaded;
+  await Promise.all(Array.from({ length: limit }, () => worker()));
+  const selected = winner as { archive: string; target: ZipTarget } | null;
+  if (!selected) throw new Error(`no candidate produced a verified ZIP (${errors.join("; ")})`);
+  await persistSuccessfulZip(directory, chatId, expectedAssistant, selected.target);
+  return selected.archive;
 }
 
 async function sendInPage(page: Page, text: string, chatId?: string, files: string[] = [], submit = true) {
@@ -2531,33 +2591,26 @@ async function watch(cfg: Config, configPath: string) {
                 const hasNewUserTurn = Boolean(latestUser && latestUser.id !== baselineUserMessage &&
                   latestUser.turnOrder !== undefined && baselineUserTurn !== null &&
                   baselineUserTurn !== undefined && latestUser.turnOrder > baselineUserTurn);
-                for (const target of targets) {
-                  // Fail closed unless the ZIP belongs to the *latest* assistant
-                  // message, that message completed after the baseline, and its
-                  // stable global turn number proves it is newer. This excludes
-                  // historical attachments revealed by scrolling/editing older turns.
-                  if (!hasNewUserTurn || !latestAssistant || !zipTargetAssociation(target, latestAssistant)) continue;
-                  // The attachment can materialize several polls after the assistant
-                  // message was first persisted. Retain that pending event until
-                  // the ZIP is successfully downloaded or its TTL expires.
-                  if (!pending.has(latestAssistant.id)) continue;
-                  if (baselineTurn === null || baselineTurn === undefined ||
-                      latestAssistant.turnOrder === undefined || target.messageOrder === null ||
-                      target.messageOrder !== latestAssistant.turnOrder || latestAssistant.turnOrder <= baselineTurn) continue;
-                  const hookKey = `${chat.id}:${target.identity}`;
-                  if (handledHookDownloads.has(hookKey)) continue;
-                  try {
-                    const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
-                    const archive = await downloadZipTarget(page, target, archiveDir);
-                    if (archive) {
-                      // Mark handled only once the download is captured. Avoid
-                      // permanently losing transient click/download failures.
+                // Resolve the latest completed assistant once per polling cycle.
+                // Candidate selection, concurrent ZIP probes, and durable history
+                // are shared with the manual ctl hook path.
+                if (hasNewUserTurn && latestAssistant && pending.has(latestAssistant.id) &&
+                    baselineTurn !== null && baselineTurn !== undefined &&
+                    latestAssistant.turnOrder !== undefined && latestAssistant.turnOrder > baselineTurn) {
+                  const associated = targets.filter((target) =>
+                    zipTargetAssociation(target, latestAssistant) !== null &&
+                    target.messageOrder === latestAssistant.turnOrder);
+                  const hookKey = `${chat.id}:${latestAssistant.id}`;
+                  if (associated.length && !handledHookDownloads.has(hookKey)) {
+                    try {
+                      const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
+                      const archive = await downloadLastZip(page, archiveDir, latestAssistant);
                       handledHookDownloads.add(hookKey);
                       pending.delete(latestAssistant.id);
                       await runHookForZip(page, chat.id, hook, archive, configPath);
+                    } catch (hookError) {
+                      log.error(`[hook] chat=${chat.id} failed: ${formatError(hookError)}`);
                     }
-                  } catch (hookError) {
-                    log.error(`[hook] chat=${chat.id} failed: ${formatError(hookError)}`);
                   }
                 }
               }
