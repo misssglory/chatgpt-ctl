@@ -459,9 +459,12 @@ async function upsertSidebarChats(sql: Sql, chats: SidebarChat[], browserName = 
 }
 
 /**
- * Upsert a message. When `completed` flips to true we stamp completed_at.
- * Content is updated on every observation so partial streaming text is refined
- * until the message is marked completed.
+ * Persist a message only when something meaningful changed.
+ * `completed` is monotonic in the database: once true, a transient scrape that
+ * sees it as false must not reopen the row. `completed_at` is stamped only on
+ * the false -> true transition. Comparing it to statement_timestamp() in the
+ * RETURNING clause identifies that transition for this statement only; unlike
+ * comparing it with first_seen_at, the condition cannot stay true forever.
  */
 async function upsertMessage(sql: Sql, chatId: string, msg: ScrapedMessage): Promise<"inserted" | "updated" | "completed"> {
   const mid = normalizeUuid(msg.id);
@@ -487,12 +490,17 @@ async function upsertMessage(sql: Sql, chatId: string, msg: ScrapedMessage): Pro
       sequence = EXCLUDED.sequence,
       completed = messages.completed OR EXCLUDED.completed,
       completed_at = CASE
-        WHEN messages.completed = false AND EXCLUDED.completed = true THEN NOW()
+        WHEN messages.completed = false AND EXCLUDED.completed = true THEN statement_timestamp()
         ELSE messages.completed_at
       END
+    -- Avoid touching the same completed history rows on every poll. This also
+    -- prevents needless WAL/index churn for long conversations.
+    WHERE messages.content IS DISTINCT FROM EXCLUDED.content
+       OR messages.sequence IS DISTINCT FROM EXCLUDED.sequence
+       OR (messages.completed = false AND EXCLUDED.completed = true)
     RETURNING
       (xmax = 0) AS inserted,
-      (completed AND completed_at IS NOT NULL AND completed_at > first_seen_at + interval '50 milliseconds') AS just_completed
+      (completed AND completed_at = statement_timestamp()) AS just_completed
   `;
   const row = rows[0] as { inserted: boolean; just_completed: boolean } | undefined;
   if (!row) return "updated";

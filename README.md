@@ -433,3 +433,13 @@ returns immediately; the normal watcher scan continues to enforce conversation
 readiness before persistence and automatic hooks. Newly opened chats still wait for
 the initial page readiness gate. `chatgpt-ctl open` reports both total command time
 and watcher-side time, which separates database/CLI delay from browser focus delay.
+
+### Persistence regression check
+
+The repeated-message persistence regression can be checked against any PostgreSQL database (the test uses a temporary table and rolls back):
+
+```bash
+psql "$CHATGPT_DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/persistence-idempotency.sql
+```
+
+It verifies that identical watcher polls do not update message rows and that an incomplete-to-completed transition is reported only once.
