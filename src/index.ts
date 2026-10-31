@@ -979,7 +979,8 @@ async function sendMessageCommand(
   _cfg: Config,
   _configPath: string,
   text: string,
-  files: string[]
+  files: string[],
+  draft = false
 ) {
   if (!text.trim() && files.length === 0) {
     throw new Error("send: provide message text or at least one file");
@@ -989,11 +990,11 @@ async function sendMessageCommand(
   const response = await fetch(`http://${CONTROL_HOST}:${CONTROL_PORT}/send`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ text, files: resolvedFiles }),
+    body: JSON.stringify({ text, files: resolvedFiles, draft }),
   });
   const result = await response.json().catch(() => ({})) as { error?: string; chat_id?: string; browser_name?: string };
   if (!response.ok) throw new Error(result.error || `watch control server returned ${response.status}; start \`bun run watch\` first`);
-  log.info(`[send] submitted to browser=${result.browser_name ?? "virtual-focus"} chat=${result.chat_id ?? "current"}`);
+  log.info(`[send] ${draft ? "draft prepared (not submitted)" : "submitted"} in browser=${result.browser_name ?? "virtual-focus"} chat=${result.chat_id ?? "current"}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1287,6 +1288,7 @@ async function downloadZipTarget(page: Page, targetInfo: ZipTarget, directory: s
   }
 
   const suggested = download.suggestedFilename() || targetInfo.label || "chatgpt-download.zip";
+  log.info(`[download] browser suggested filename='${suggested}' for selected attachment '${targetInfo.label}'`);
   const filename = safeFilename(suggested);
   const target = path.join(directory, filename);
   await download.saveAs(target);
@@ -1294,7 +1296,26 @@ async function downloadZipTarget(page: Page, targetInfo: ZipTarget, directory: s
   return target;
 }
 
-async function downloadLastZip(page: Page, directory: string): Promise<string> {
+async function latestAssistantMessageId(page: Page, expectedChatId?: string): Promise<string> {
+  const chat = await scrapeCurrentChat(page);
+  if (!chat || (expectedChatId && chat.id !== expectedChatId)) {
+    throw new Error(`cannot identify the current conversation before ZIP selection (expected ${expectedChatId || "current chat"})`);
+  }
+  const assistants = chat.messages.filter((message) => message.role === "assistant");
+  const latestAssistant = assistants.reduce<ScrapedMessage | undefined>((best, current) => {
+    if (!best) return current;
+    if (best.turnOrder !== undefined && current.turnOrder !== undefined && best.turnOrder !== current.turnOrder) {
+      return current.turnOrder > best.turnOrder ? current : best;
+    }
+    return current.sequence > best.sequence ? current : best;
+  }, undefined);
+  if (!latestAssistant?.id) {
+    throw new Error("cannot identify the latest assistant message; refusing to download an older ZIP");
+  }
+  return latestAssistant.id.toLowerCase();
+}
+
+async function downloadLastZip(page: Page, directory: string, expectedMessageId?: string): Promise<string> {
   const targets = await findZipTargets(page);
   if (targets.length === 0) {
     throw new Error(
@@ -1302,17 +1323,25 @@ async function downloadLastZip(page: Page, directory: string): Promise<string> {
       "(role=link with a .zip name), an attachment card, or an <a href> download link",
     );
   }
-  // Log candidates to make UI changes diagnosable. User-uploaded resource
-  // cards may not expose a turn key; do not let such an unknown item override
-  // assistant attachments whose conversation turns are known.
-  log.info(`[download] candidates: ${JSON.stringify(targets.map(({ index, label, messageOrder, kind }) => ({
-    index, label, messageOrder, kind,
+  // Hook/manual ZIP downloads must belong to the latest assistant message.
+  // Choosing the highest turn number alone is unsafe: portal nodes and stale
+  // DIL attachment controls can remain mounted and advertise misleading labels.
+  const expectedId = expectedMessageId?.toLowerCase();
+  const relevantTargets = expectedId
+    ? targets.filter((target) => target.messageId === expectedId)
+    : targets;
+  log.info(`[download] candidates: ${JSON.stringify(targets.map(({ index, label, messageOrder, messageId, kind }) => ({
+    index, label, messageOrder, messageId, kind,
   })))}`);
 
-  const knownTargets = targets.filter(
-    (target) => target.messageOrder !== null,
-  );
-  const candidates = knownTargets.length > 0 ? knownTargets : targets;
+  if (expectedId && relevantTargets.length === 0) {
+    throw new Error(
+      `latest assistant message ${expectedId} has no identifiable ZIP attachment; refusing to fall back to an older message ` +
+      `(visible ZIP controls: ${targets.length})`,
+    );
+  }
+  const knownTargets = relevantTargets.filter((target) => target.messageOrder !== null);
+  const candidates = knownTargets.length > 0 ? knownTargets : relevantTargets;
   const newest = candidates.reduce((best, current) => {
     const bestTurn = best.messageOrder;
     const currentTurn = current.messageOrder;
@@ -1323,13 +1352,13 @@ async function downloadLastZip(page: Page, directory: string): Promise<string> {
     return current.index > best.index ? current : best;
   });
 
-  log.info(`[download] selected ${newest.label} (message turn ${newest.messageOrder ?? "unknown"})`);
+  log.info(`[download] selected ${newest.label} (message=${newest.messageId ?? "unknown"}; turn ${newest.messageOrder ?? "unknown"})`);
   const downloaded = await downloadZipTarget(page, newest, directory);
   if (!downloaded) throw new Error(`no download event for ${newest.label}; ZIP was not captured`);
   return downloaded;
 }
 
-async function sendInPage(page: Page, text: string, chatId?: string, files: string[] = []) {
+async function sendInPage(page: Page, text: string, chatId?: string, files: string[] = [], submit = true) {
   // This function operates on the watcher's existing page. Do not launch a
   // second browser context: `chatgpt-ctl send` must target the visible chat.
   if (chatId && normalizeUuid(page.url()) !== chatId) {
@@ -1348,8 +1377,22 @@ async function sendInPage(page: Page, text: string, chatId?: string, files: stri
     await page.waitForTimeout(1000);
   }
   if (text.trim()) await composer.fill(text);
-  const sendButton = page.locator('button[data-testid="send-button"], button[aria-label="Send message" i], button[aria-label="Send" i], button[data-composer-navigation-target="send"]').first();
+  const sendButtonSelector = 'button[data-testid="send-button"], button[aria-label="Send message" i], button[aria-label="Send" i], button[data-composer-navigation-target="send"]';
+  const sendButton = page.locator(sendButtonSelector).first();
   await sendButton.waitFor({ state: "visible", timeout: 8000 });
+  if (!submit) {
+    // Wait until ChatGPT enables submission (including any asynchronous file
+    // upload) but never click it. This leaves a complete, editable draft.
+    await page.waitForFunction((selector) => {
+      return Array.from(document.querySelectorAll(selector)).some((element) => {
+        const button = element as HTMLButtonElement;
+        const rect = button.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && !button.disabled && button.getAttribute("aria-disabled") !== "true";
+      });
+    }, sendButtonSelector, { timeout: 30_000 });
+    log.info(`[send] draft prepared text_chars=${text.length} files=${files.length} url=${page.url()}`);
+    return;
+  }
   await sendButton.click();
   await page.waitForTimeout(700);
   log.info(`[send] submitted text_chars=${text.length} files=${files.length} url=${page.url()}`);
@@ -1453,8 +1496,9 @@ async function runHookWithLastZip(
     });
   }
   await waitForConversationReady(page, chatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
+  const assistantMessageId = await latestAssistantMessageId(page, chatId);
   const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
-  const archive = await downloadLastZip(page, archiveDir);
+  const archive = await downloadLastZip(page, archiveDir, assistantMessageId);
   await runHookForZip(page, chatId, hook, archive, configPath);
   return archive;
 }
@@ -1706,7 +1750,9 @@ function startControlServer(
         if (url.pathname === "/send") {
           const text = body.text || "";
           const files = Array.isArray(body.files) ? body.files.map((file) => path.resolve(file)) : [];
+          const draft = Boolean(body.draft);
           if (!text.trim() && files.length === 0) return Response.json({ error: "text or at least one file is required" }, { status: 400 });
+          if (draft && body.new_chat) return Response.json({ error: "--draft cannot be combined with --new-chat; open a blank chat first" }, { status: 400 });
           for (const file of files) await access(file, constants.R_OK);
           const requestedChatId = normalizeUuid(body.chat_id || "");
           let runtime: BrowserRuntime;
@@ -1741,7 +1787,7 @@ function startControlServer(
               }
             }
           }
-          await sendInPage(page, text, undefined, files);
+          await sendInPage(page, text, undefined, files, !draft);
           if (body.new_chat) {
             await page.waitForFunction(() =>
               /\/c\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(location.pathname),
@@ -1764,7 +1810,7 @@ function startControlServer(
               for (const message of firstSnapshot.messages) await upsertMessage(sql, acquiredChatId, message);
             }
           }
-          return Response.json({ ok: true, chat_id: acquiredChatId, browser_name: runtime.name, url: page.url(), new_chat: Boolean(body.new_chat) });
+          return Response.json({ ok: true, chat_id: acquiredChatId, browser_name: runtime.name, url: page.url(), new_chat: Boolean(body.new_chat), draft, submitted: !draft });
         }
 
         const requestedChatId = normalizeUuid(body.chat_id || "");
@@ -1797,7 +1843,9 @@ function startControlServer(
           const directory = body.directory
             ? path.resolve(body.directory)
             : resolveFromConfig(configPath, cfg.downloads?.directory || "./var/downloads");
-          const saved = await downloadLastZip(page, directory);
+          const currentChatId = requestedChatId || normalizeUuid(page.url()) || undefined;
+          const assistantMessageId = await latestAssistantMessageId(page, currentChatId);
+          const saved = await downloadLastZip(page, directory, assistantMessageId);
           if (body.extract_to) {
             const extractTo = path.resolve(body.extract_to);
             const listing = await commandOutput(["unzip", "-Z1", saved]);
@@ -2097,10 +2145,13 @@ async function main() {
     case "send": {
       const files: string[] = [];
       const textParts: string[] = [];
+      let draft = false;
       for (let i = 1; i < args.length; i++) {
         const arg = args[i]!;
         if (arg === "--config") {
           i++;
+        } else if (arg === "--draft" || arg === "--no-send") {
+          draft = true;
         } else if (arg === "--file" || arg === "-f") {
           const file = args[++i];
           if (!file) throw new Error(`send: ${arg} requires a path`);
@@ -2111,7 +2162,7 @@ async function main() {
           textParts.push(arg);
         }
       }
-      return sendMessageCommand(cfg, configPath, textParts.join(" "), files);
+      return sendMessageCommand(cfg, configPath, textParts.join(" "), files, draft);
     }
     case "login": {
       const nameArg = args.find((arg) => arg.startsWith("--browser-name="));

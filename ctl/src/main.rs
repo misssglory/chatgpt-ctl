@@ -59,8 +59,11 @@ enum Commands {
         #[arg(long = "new-chat", alias = "new", conflicts_with = "chat")]
         new_chat: bool,
         /// File to upload; repeat for multiple attachments
-        #[arg(short = 'f', long = "file", value_name = "PATH")]
+        #[arg(short = 'f', long = "file", value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
         files: Vec<PathBuf>,
+        /// Attach files and fill the composer, but do not submit the message
+        #[arg(long, alias = "no-send", conflicts_with = "new_chat")]
+        draft: bool,
     },
 
     /// Open a chat in its own watcher browser pane (reuse its pane if already open).
@@ -83,6 +86,7 @@ enum Commands {
     /// Download the newest ZIP attachment from virtual focus or a selected chat.
     DownloadLastZip {
         /// Destination directory for the ZIP file (default: ./var/downloads)
+        #[arg(value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
         directory: Option<PathBuf>,
         /// Chat UUID, title substring, or 0-based index; defaults to virtual focus
         #[arg(short = 'c', long = "chat", value_name = "CHAT")]
@@ -160,10 +164,10 @@ enum HookAction {
         /// Chat UUID or unique title substring
         chat: String,
         /// Project root / Git working tree (stored as an absolute path)
-        #[arg(long)]
+        #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
         folder: PathBuf,
         /// Build directory below --folder (default: .)
-        #[arg(long, default_value = ".")]
+        #[arg(long, default_value = ".", value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
         child_folder: String,
         /// Build command executed from --child-folder; use `none` to skip building (default: wcc build)
         #[arg(long, default_value = "wcc build")]
@@ -199,7 +203,7 @@ enum RetryMode {
     Disable,
 }
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum ShellKind {
     Bash,
     Elvish,
@@ -218,6 +222,74 @@ impl From<ShellKind> for Shell {
             ShellKind::Zsh => Shell::Zsh,
         }
     }
+}
+
+/// Emit clap's complete static zsh parser with small additions for invocation
+/// through a path (`./target/release/chatgpt-ctl`) and database-backed chat IDs.
+/// The clap-generated body remains responsible for every command and option.
+fn zsh_completion_text(cmd: &mut clap::Command) -> Result<String> {
+    const ZSH_DYNAMIC_CHAT: &str = r#"
+# Resolve the executable as it was invoked. This matters when the user runs
+# ./ctl/target/release/chatgpt-ctl rather than a PATH-installed command.
+local _ctl_completion_bin="${words[1]}"
+if [[ ! -x "$_ctl_completion_bin" ]]; then
+  _ctl_completion_bin="${commands[chatgpt-ctl]:-chatgpt-ctl}"
+fi
+
+# Supply UUID candidates (with titles as descriptions) for chat-taking args.
+local _ctl_wants_chat=0
+case "${words[2]:-}" in
+  open|close|history|retry)
+    (( CURRENT == 3 )) && _ctl_wants_chat=1
+    ;;
+  send|download-last-zip)
+    if (( CURRENT > 2 )) && [[ "${words[CURRENT-1]:-}" == (-c|--chat) ]]; then
+      _ctl_wants_chat=1
+    fi
+    ;;
+  hook)
+    case "${words[3]:-}" in
+      set|show|run|trigger|enable|disable|remove)
+        (( CURRENT == 4 )) && _ctl_wants_chat=1
+        ;;
+    esac
+    ;;
+esac
+
+if (( _ctl_wants_chat )); then
+  local -a _ctl_chat_ids _ctl_chat_descriptions
+  local _ctl_chat_id _ctl_chat_title
+  while IFS=$'\t' read -r _ctl_chat_id _ctl_chat_title; do
+    [[ -n "$_ctl_chat_id" ]] || continue
+    _ctl_chat_ids+=("$_ctl_chat_id")
+    _ctl_chat_descriptions+=("$_ctl_chat_title")
+  done < <("$_ctl_completion_bin" __complete-chat "$PREFIX" 2>/dev/null)
+  if (( ${#_ctl_chat_ids[@]} > 0 )); then
+    compadd -Q -d _ctl_chat_descriptions -- "${_ctl_chat_ids[@]}"
+    return
+  fi
+fi
+"#;
+
+    let mut generated = Vec::new();
+    generate(Shell::Zsh, cmd, "chatgpt-ctl", &mut generated);
+    let generated = String::from_utf8(generated)
+        .context("clap generated non-UTF8 zsh completion output")?;
+    let (header, body) = generated
+        .split_once('\n')
+        .context("clap zsh completion did not contain a #compdef header")?;
+    if !header.starts_with("#compdef") {
+        anyhow::bail!("unexpected clap zsh completion header: {header}");
+    }
+
+    // zsh's #compdef -p mapping applies to both the command basename and any
+    // executable path ending in chatgpt-ctl. `ctl` is included as a short alias.
+    Ok(format!("#compdef -p '*chatgpt-ctl' ctl\n{ZSH_DYNAMIC_CHAT}{body}"))
+}
+
+fn print_zsh_completions(cmd: &mut clap::Command) -> Result<()> {
+    print!("{}", zsh_completion_text(cmd)?);
+    Ok(())
 }
 
 fn default_database_url() -> String {
@@ -864,8 +936,12 @@ async fn main() -> Result<()> {
         }
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
-            let shell: Shell = shell.into();
-            generate(shell, &mut cmd, "chatgpt-ctl", &mut io::stdout());
+            if matches!(shell, ShellKind::Zsh) {
+                print_zsh_completions(&mut cmd)?;
+            } else {
+                let shell: Shell = shell.into();
+                generate(shell, &mut cmd, "chatgpt-ctl", &mut io::stdout());
+            }
             return Ok(());
         }
         Commands::Chats { limit, query, refresh } => {
@@ -901,7 +977,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Send { text, chat, files, new_chat } => {
+        Commands::Send { text, chat, files, new_chat, draft } => {
             let text = text.unwrap_or_default();
             if text.trim().is_empty() && files.is_empty() {
                 anyhow::bail!("send: provide message text or at least one --file attachment");
@@ -924,15 +1000,19 @@ async fn main() -> Result<()> {
                 "new_chat": new_chat,
                 "text": text,
                 "files": resolved_files,
+                "draft": draft,
             }).to_string();
             let response = watcher_request("POST", "/send", Some(&body))?;
             let value: serde_json::Value = serde_json::from_str(&response)?;
             let destination = value.get("chat_id").and_then(|v| v.as_str()).unwrap_or("focused chat");
             let browser_name = value.get("browser_name").and_then(|v| v.as_str()).unwrap_or("default");
-            if new_chat {
-                println!("message sent to new chat {destination} [{browser_name}] ({})", value.get("url").and_then(|v| v.as_str()).unwrap_or("ChatGPT pane"));
+            let url = value.get("url").and_then(|v| v.as_str()).unwrap_or("ChatGPT pane");
+            if draft {
+                println!("draft prepared in {destination} [{browser_name}] ({url}); message was not sent");
+            } else if new_chat {
+                println!("message sent to new chat {destination} [{browser_name}] ({url})");
             } else {
-                println!("message sent to {destination} [{browser_name}] ({})", value.get("url").and_then(|v| v.as_str()).unwrap_or("ChatGPT pane"));
+                println!("message sent to {destination} [{browser_name}] ({url})");
             }
         }
         Commands::Open { chat } => {
@@ -1054,6 +1134,17 @@ mod cli_completion_tests {
     use super::*;
 
     #[test]
+    fn zsh_completion_supports_path_invocations_and_dynamic_chat_targets() {
+        let mut command = Cli::command();
+        let completion = zsh_completion_text(&mut command).expect("zsh completion output");
+        assert!(completion.starts_with("#compdef -p '*chatgpt-ctl' ctl"));
+        assert!(completion.contains("__complete-chat"));
+        assert!(completion.contains("hook"));
+        assert!(completion.contains("--folder"));
+        assert!(completion.contains("--child-folder"));
+    }
+
+    #[test]
     fn download_last_zip_is_exposed_to_clap_shell_completions() {
         let command = Cli::command();
         assert!(command.find_subcommand("download-last-zip").is_some());
@@ -1105,6 +1196,22 @@ mod cli_completion_tests {
                 assert_eq!(text.as_deref(), Some("first prompt"));
                 assert!(chat.is_none());
                 assert!(new_chat);
+            }
+            _ => panic!("expected send command"),
+        }
+    }
+
+    #[test]
+    fn send_draft_accepts_text_and_file_without_submitting() {
+        let cli = Cli::try_parse_from([
+            "chatgpt-ctl", "send", "--draft", "Review this archive", "--file", "./project.zip",
+        ]).expect("send --draft should parse");
+        match cli.command {
+            Commands::Send { text, files, draft, new_chat, .. } => {
+                assert_eq!(text.as_deref(), Some("Review this archive"));
+                assert_eq!(files.len(), 1);
+                assert!(draft);
+                assert!(!new_chat);
             }
             _ => panic!("expected send command"),
         }

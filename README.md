@@ -156,6 +156,34 @@ complete -o default -F _chatgpt_ctl chatgpt-ctl
 
 After updating the binary, regenerate shell completion files or rebuild/reinstall the Nix package.
 
+For **zsh without Nix**, build the Rust CLI and install completions directly from that binary:
+
+```bash
+cargo build --release --manifest-path ctl/Cargo.toml
+./scripts/install-zsh-completion.sh ./ctl/target/release/chatgpt-ctl
+```
+
+Ensure `~/.zshrc` contains the following before starting a new shell:
+
+```zsh
+fpath=("${ZDOTDIR:-$HOME}/.zfunc" $fpath)
+autoload -Uz compinit && compinit
+```
+
+Then refresh the completion cache and start a new shell:
+
+```bash
+rm -f "${ZDOTDIR:-$HOME}"/.zcompdump*
+exec zsh
+```
+
+The completion file is regenerated from the current binary, supports
+`chatgpt-ctl`, the short command name `ctl`, and executable paths ending in `chatgpt-ctl`
+(such as `./ctl/target/release/chatgpt-ctl`). It completes all current subcommands and options,
+uses directory completion for `hook set --folder` and `--child-folder`, and file/directory
+completion for attachment and ZIP paths. Chat-taking arguments also query PostgreSQL for UUID
+candidates and display their titles; this dynamic part needs a working `CHATGPT_DATABASE_URL`.
+
 `CHAT` may be a UUID, a title substring, or `current` (most recently updated chat).
 `open` without an argument and `history` without an argument provide interactive title/UUID autocomplete.
 
@@ -192,7 +220,9 @@ or `CHATGPT_CTL_HOST` / `CHATGPT_CTL_PORT` for the watcher to override the addre
 The interactive `open` prompt uses cached PostgreSQL chat titles and UUIDs for TAB completion.
 
 `chatgpt-ctl download-last-zip [DIRECTORY]` asks the watcher to download the newest ZIP attachment
-from the virtual-focus conversation. Pass `--chat CHAT` to route to a UUID, title, or chats index. With no directory it uses `[downloads].directory` from
+belonging to the latest assistant message in the virtual-focus conversation. Hook runs use the same
+strict message-identity check and refuse to fall back to an older attachment when the latest assistant
+message has no identifiable ZIP control. Pass `--chat CHAT` to route to a UUID, title, or chats index. With no directory it uses `[downloads].directory` from
 `config.toml` (default `./var/downloads`). Add `--extract-to DIR` (alias `--unzip-to`) to
 extract the downloaded archive into `DIR`; the original ZIP is kept. If the archive contains
 exactly one top-level directory, its contents are merged directly into `DIR` (so no redundant
@@ -205,7 +235,7 @@ Relative paths are resolved from the directory where you run
 chatgpt-ctl download-last-zip ./var/downloads --extract-to ./work/latest-project
 ```
 
-`chatgpt-ctl send "message text" [--chat CHAT | --new-chat] [-f PATH]...` sends through the watcher's browser
+`chatgpt-ctl send "message text" [--chat CHAT | --new-chat] [-f PATH]... [--draft]` uses the watcher's browser
 context. Without `--chat`, it sends to the virtual-focus pane. With `--chat`, it resolves a
 UUID, title substring, or unfiltered chats index and sends to that conversation in its mapped
 browser, opening a new pane if necessary. Use
@@ -213,7 +243,10 @@ browser, opening a new pane if necessary. Use
 ChatGPT to assign the conversation UUID, and print that acquired UUID. The watcher immediately persists the acquired UUID and first visible messages to PostgreSQL,
 so the new conversation is available to `chats`, `open`, and `history` without waiting for the
 next poll. The `--chat` and `--new-chat` options are mutually exclusive. It can also send file
-attachments without message text:
+attachments without message text. Add `--draft` (alias `--no-send`) to attach the files and fill the
+composer without submitting; the draft remains editable in the selected browser pane. `--draft`
+cannot be combined with `--new-chat` because ChatGPT does not assign a conversation UUID until a
+message is submitted. Examples:
 
 ```bash
 chatgpt-ctl send "Review this" -f ./src/main.rs
@@ -222,6 +255,8 @@ chatgpt-ctl send --chat 6ae4c5ad-6410-83ed-abf0-7944c8969abf -f ./archive.zip
 chatgpt-ctl send -f ./archive.zip
 chatgpt-ctl send --new-chat "Start a new project and inspect this archive" -f ./archive.zip
 chatgpt-ctl send --new "First message in a new chat"
+chatgpt-ctl send --draft "Please inspect these files" -f ./src/main.rs -f ./project.zip
+chatgpt-ctl send --chat "NixOS Wayland" --draft "Review this config" -f ./configuration.nix
 ```
 
 ### Per-chat automatic Retry button
@@ -283,8 +318,8 @@ belongs to the latest assistant message, whose turn number is newer than the bas
 message has just completed. Historical ZIP links revealed by scrolling, revisiting, or editing older
 turns are therefore ignored. ZIP controls without stable message/turn metadata fail closed rather
 than triggering automation. Run `chatgpt-ctl hook run <chat>` (also available as `hook trigger`) to
-manually download the newest ZIP attachment in that conversation and run the same extraction, Git
-commit, and build pipeline immediately. The command opens the specified chat in the active watcher
+manually download the ZIP attached to the latest assistant message in that conversation and run the same extraction, Git
+commit, and build pipeline immediately. It refuses to substitute an older attachment if the latest assistant message has no ZIP. The command opens the specified chat in the active watcher
 pane if needed. Manual runs also work while a hook is disabled; disabling only pauses automatic
 processing of new attachments. Each new ZIP is saved under
 `<folder>/.chatgpt-ctl-downloads/`, checked for path-traversal entries, and extracted into
@@ -298,7 +333,7 @@ The hook requires `unzip` and `git`; the configured build executable and, when `
 used, `nix` must be on the watcher's `PATH`. The target folder must already be a Git repository with commit identity configured.
 
 ```bash
-# static shell completion (also installed by the Nix package)
+# Generate from the current binary; use the installer above for path + DB chat support.
 chatgpt-ctl completions zsh > ~/.zfunc/_chatgpt-ctl
 ```
 
