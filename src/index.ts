@@ -2489,6 +2489,8 @@ async function watch(cfg: Config, configPath: string) {
   // Newly completed assistant message ids are retained briefly because the
   // downloadable ZIP control can render a poll or two after its message.
   const pendingHookMessages = new Map<string, Map<string, number>>();
+  // Multiple open panes can show the same conversation. Never run its hook twice concurrently.
+  const activeHookChats = new Set<string>();
   const retryClickCooldowns = new Map<string, number>();
   const deliveryRetryState = new Map<string, { attempts: number; lastAttempt: number; absentPolls: number }>();
   const closedContexts = new WeakSet<BrowserContext>();
@@ -2741,41 +2743,41 @@ async function watch(cfg: Config, configPath: string) {
                 pendingHookMessages.delete(chat.id);
                 log.info(`[hook] initialized ZIP baseline for chat=${chat.id} (${targets.length} existing attachments; no hook run)`);
               } else {
-                const now = Date.now();
-                let pending = pendingHookMessages.get(chat.id);
-                if (!pending) { pending = new Map<string, number>(); pendingHookMessages.set(chat.id, pending); }
-                for (const messageId of newAssistantMessages) pending.set(messageId, now + 5 * 60_000);
-                for (const [messageId, expiresAt] of pending) if (expiresAt < now) pending.delete(messageId);
+                // New attachments are the hook event. They may materialize well
+                // after a message is persisted, and another browser pane may
+                // receive them while virtual focus belongs to a different pane.
+                // The baseline above prevents processing existing attachments
+                // merely because a pane was opened or the watcher restarted.
                 const latestAssistant = latestAssistantFromMessages(chat.messages);
-                const latestUser = [...chat.messages].reverse().find((message) => message.role === "user");
-                const baselineTurn = baselineAssistantTurnByChat.get(chat.id);
-                const baselineUserTurn = baselineUserTurnByChat.get(chat.id);
-                const baselineUserMessage = baselineUserMessageByChat.get(chat.id);
-                // A new assistant node alone is insufficient: editing/regenerating
-                // an older turn can create a fresh message id. Require a genuinely
-                // new user turn beyond the settled history baseline as well.
-                const hasNewUserTurn = Boolean(latestUser && latestUser.id !== baselineUserMessage &&
-                  latestUser.turnOrder !== undefined && baselineUserTurn !== null &&
-                  baselineUserTurn !== undefined && latestUser.turnOrder > baselineUserTurn);
-                // Resolve the latest completed assistant once per polling cycle.
-                // Candidate selection, concurrent ZIP probes, and durable history
-                // are shared with the manual ctl hook path.
-                if (hasNewUserTurn && latestAssistant && pending.has(latestAssistant.id) &&
-                    baselineTurn !== null && baselineTurn !== undefined &&
-                    latestAssistant.turnOrder !== undefined && latestAssistant.turnOrder > baselineTurn) {
+                if (latestAssistant) {
                   const associated = targets.filter((target) =>
                     zipTargetAssociation(target, latestAssistant) !== null &&
-                    target.messageOrder === latestAssistant.turnOrder);
+                    (latestAssistant.turnOrder === undefined ||
+                      target.messageOrder === null ||
+                      target.messageOrder === latestAssistant.turnOrder));
+                  const unseen = associated.filter((target) =>
+                    !handledHookDownloads.has(`${chat.id}:${target.identity}`));
                   const hookKey = `${chat.id}:${latestAssistant.id}`;
-                  if (associated.length && !handledHookDownloads.has(hookKey)) {
+                  if (unseen.length && !handledHookDownloads.has(hookKey) &&
+                      !activeHookChats.has(chat.id)) {
+                    activeHookChats.add(chat.id);
                     try {
+                      // The selected assistant is explicit: never fall back to a
+                      // ZIP from a prior turn or a different open conversation.
                       const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
                       const archive = await downloadLastZip(page, archiveDir, latestAssistant);
+                      // Mark successful ZIP downloads before running the hook;
+                      // a build failure must not repeatedly reapply the archive.
                       handledHookDownloads.add(hookKey);
-                      pending.delete(latestAssistant.id);
+                      for (const target of associated) {
+                        handledHookDownloads.add(`${chat.id}:${target.identity}`);
+                      }
+                      log.info(`[hook] new ZIP in open pane chat=${chat.id} browser=${runtime.name} (virtual focus unchanged)`);
                       await runHookForZip(page, chat.id, hook, archive, configPath);
                     } catch (hookError) {
                       log.error(`[hook] chat=${chat.id} failed: ${formatError(hookError)}`);
+                    } finally {
+                      activeHookChats.delete(chat.id);
                     }
                   }
                 }
