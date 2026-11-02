@@ -16,7 +16,6 @@ import { access, constants, lstat, mkdir, mkdtemp, readdir, rename, rm, readFile
 import { existsSync } from "node:fs";
 import path from "node:path";
 import postgres from "postgres";
-import { zipTargetAssociation } from "./zip-target-selection.mjs";
 
 const log = new Logger({
   type: "pretty",
@@ -1577,7 +1576,11 @@ async function findZipTargets(page: Page): Promise<ZipTarget[]> {
       // and the word ZIP (e.g. "Download updated Watcher — v3").
       // Only accept a download-like link, then verify ZIP magic after clicking.
       const isGeneratedDownload = isLink && /^Open\s+Download\b/i.test(aria);
-      if (!hasZipExtension && !isDescriptiveZipLink && !isGeneratedDownload) return;
+      // User uploads are rendered as resource cards; never treat them as hook archives.
+      // An assistant generated artifact must be a link, and must belong to a
+      // message with a verifiable assistant identity (checked by caller).
+      if (!isLink || (!hasZipExtension && !isDescriptiveZipLink && !isGeneratedDownload)) return;
+      if (!el.getClientRects().length || getComputedStyle(el).visibility === "hidden") return;
 
       const label = [aria, downloadName, title, text].find((value) => /\.zip(?:$|[?#\s])/i.test(value))
         || aria || downloadName || title || text || href;
@@ -1735,7 +1738,7 @@ async function latestAssistantMessage(page: Page, expectedChatId?: string): Prom
 }
 
 /** Per-chat successful ZIP provenance; written atomically and used only as a hint. */
-type SuccessfulZip = { chatId: string; assistantId: string; turnOrder: number | null; targetIdentity: string; label: string; savedAt: string };
+type SuccessfulZip = { chatId: string; assistantId: string; turnOrder: number | null; targetIndex?: number; targetIdentity: string; label: string; savedAt: string };
 const ZIP_HISTORY_FILE = "last-successful-zips.json";
 
 async function loadSuccessfulZips(directory: string): Promise<Record<string, SuccessfulZip>> {
@@ -1759,6 +1762,7 @@ async function persistSuccessfulZip(directory: string, chatId: string, assistant
     assistantId: assistant?.id ?? target.messageId ?? "",
     turnOrder: assistant?.turnOrder ?? target.messageOrder,
     targetIdentity: target.identity,
+    targetIndex: target.index,
     label: target.label,
     savedAt: new Date().toISOString(),
   };
@@ -1775,74 +1779,83 @@ function explicitZipCandidate(target: ZipTarget): boolean {
   return /\.zip(?:$|[?#\s])/i.test(target.label) || /\bZIP\b/i.test(target.label);
 }
 
-async function downloadLastZip(page: Page, directory: string, expectedAssistant?: AssistantZipIdentity): Promise<string> {
-  const targets = await findZipTargets(page);
-  const chatId = normalizeUuid(page.url());
-  if (!chatId) throw new Error("cannot persist ZIP selection without a conversation id");
-  const matches = expectedAssistant
-    ? targets.filter((target) => zipTargetAssociation(target, expectedAssistant) !== null)
-    : targets;
-  if (!matches.length) {
-    throw new Error(expectedAssistant
-      ? `latest assistant message ${expectedAssistant.id} (turn ${expectedAssistant.turnOrder ?? "unknown"}) has no identifiable ZIP attachment; refusing an older message (visible controls: ${targets.length})`
-      : "no ZIP download controls found in the current conversation");
-  }
-  const history = (await loadSuccessfulZips(directory))[chatId];
-  // History never authorizes selecting a different/older assistant's attachment.
-  // Within the currently authorized set, prioritize candidates newer than the
-  // successful turn, then the previously successful label when re-running a turn.
-  const candidates = [...matches].sort((a, b) => {
-    const prev = history?.turnOrder;
-    const aFresh = prev != null && a.messageOrder != null && a.messageOrder > prev ? 1 : 0;
-    const bFresh = prev != null && b.messageOrder != null && b.messageOrder > prev ? 1 : 0;
-    if (aFresh !== bFresh) return bFresh - aFresh;
-    const aKnown = a.identity === history?.targetIdentity || a.label === history?.label ? 1 : 0;
-    const bKnown = b.identity === history?.targetIdentity || b.label === history?.label ? 1 : 0;
-    if (aKnown !== bKnown) return bKnown - aKnown;
-    return b.index - a.index;
+/** Return only controls provably owned by an assistant message in this chat. */
+function assistantZipTargets(targets: ZipTarget[], messages: ScrapedMessage[]): ZipTarget[] {
+  const assistants = messages.filter((message) => message.role === "assistant");
+  const users = messages.filter((message) => message.role === "user");
+  return targets.filter((target) => {
+    // Never accept a target associated with a known user message, even if a
+    // DIL portal exposes conflicting turn metadata.
+    if (users.some((message) => target.messageId && target.messageId === message.id.toLowerCase())) return false;
+    if (target.messageId) {
+      return assistants.some((message) => target.messageId === message.id.toLowerCase());
+    }
+    // No message UUID: only accept an unambiguous assistant turn.
+    return target.messageOrder !== null &&
+      assistants.some((message) => message.turnOrder === target.messageOrder) &&
+      !users.some((message) => message.turnOrder === target.messageOrder);
   });
-  const explicit = candidates.filter(explicitZipCandidate);
-  // One unmistakable ZIP label: do not click generic "Download" controls.
-  const attempts = explicit.length === 1 ? explicit : candidates;
-  log.info(`[download] chat=${chatId} candidates=${candidates.length} explicitZIP=${explicit.length} attempts=${attempts.length} lastSuccess=${history?.label ?? "none"}`);
-  if (attempts.length === 1) {
-    const target = attempts[0]!;
+}
+
+function newestZipFirst(a: ZipTarget, b: ZipTarget): number {
+  return (b.messageOrder ?? -1) - (a.messageOrder ?? -1) || b.index - a.index;
+}
+
+/** Download the newest *verified* assistant ZIP and persist a per-chat cursor.
+ * Older ZIPs are tried only if every more recent assistant-owned candidate
+ * fails verification. A successful cursor is never moved backwards.
+ */
+async function downloadLastZip(page: Page, directory: string, _expectedAssistant?: AssistantZipIdentity): Promise<string> {
+  const chat = await scrapeCurrentChat(page);
+  const chatId = chat?.id ?? normalizeUuid(page.url());
+  if (!chat || !chatId) throw new Error("cannot identify conversation for assistant ZIP selection");
+  const targets = assistantZipTargets(await findZipTargets(page), chat.messages).sort(newestZipFirst);
+  if (!targets.length) throw new Error(`chat=${chatId} has no assistant-owned ZIP download controls`);
+  const history = (await loadSuccessfulZips(directory))[chatId];
+  // A cursor survives navigation/restarts even if the previously downloaded
+  // control has disappeared. Use both turn and DOM index when available.
+  const isNewer = (target: ZipTarget) => {
+    if (!history) return true;
+    if (target.identity === history.targetIdentity) return false;
+    const turn = target.messageOrder;
+    const priorTurn = history.turnOrder;
+    if (turn !== null && priorTurn !== null) {
+      if (turn !== priorTurn) return turn > priorTurn;
+      if (history.targetIndex !== undefined) return target.index > history.targetIndex;
+    }
+    return true; // legacy cursor without index: validate the file rather than skip.
+  };
+  const newestCandidates = targets.filter(isNewer);
+  // An explicit `ctl hook run` can repeat the most recent verified ZIP when
+  // no newer attachment exists. The automatic hook trigger only sees new links.
+  const candidates = newestCandidates.length ? newestCandidates : targets.filter(
+    (target) => target.identity === history?.targetIdentity).slice(0, 1);
+  log.info(`[download] chat=${chatId} assistantCandidates=${targets.length} newCandidates=${newestCandidates.length} lastSuccess=${history?.label ?? "none"}`);
+
+  // Process newest to oldest, not "first to finish"; concurrent probing would
+  // otherwise select an older ZIP just because its download completed first.
+  const errors: string[] = [];
+  for (const target of candidates) {
     const archive = await downloadZipTarget(page, target, directory);
-    if (!archive) throw new Error(`candidate '${target.label}' did not yield a valid ZIP`);
-    await persistSuccessfulZip(directory, chatId, expectedAssistant, target);
+    if (!archive) { errors.push(`${target.label}: not a downloadable ZIP`); continue; }
+    const assistant = chat.messages.find((message) => message.role === "assistant" &&
+      (message.id.toLowerCase() === target.messageId ||
+       (!target.messageId && message.turnOrder === target.messageOrder)));
+    const newTurn = target.messageOrder ?? assistant?.turnOrder ?? null;
+    const oldTurn = history?.turnOrder ?? null;
+    // Never move the persisted cursor backwards, even if a previous download
+    // control has disappeared from the page.
+    if (history && oldTurn !== null && newTurn !== null &&
+       (newTurn < oldTurn || (newTurn === oldTurn && history.targetIndex !== undefined && target.index < history.targetIndex))) {
+      await rm(archive, { force: true });
+      errors.push(`${target.label}: older than persisted cursor`);
+      continue;
+    }
+    await persistSuccessfulZip(directory, chatId, assistant ? {id: assistant.id, turnOrder: assistant.turnOrder} : undefined, target);
+    log.info(`[download] cursor advanced chat=${chatId} assistant=${assistant?.id ?? target.messageId} turn=${newTurn} file='${target.label}'`);
     return archive;
   }
-
-  // Each parallel click needs its own Playwright Page and download listener.
-  // A shared page would mismatch download events between candidates.
-  const limit = Math.min(3, attempts.length);
-  let next = 0;
-  let winner: { archive: string; target: ZipTarget } | null = null;
-  const errors: string[] = [];
-  async function worker(): Promise<void> {
-    while (!winner && next < attempts.length) {
-      const target = attempts[next++]!;
-      const tab = await page.context().newPage();
-      try {
-        await tab.goto(page.url(), { waitUntil: "domcontentloaded", timeout: 30_000 });
-        await waitForConversationReady(tab, chatId, 30_000);
-        if (winner) break;
-        const archive = await downloadZipTarget(tab, target, directory);
-        if (!archive) { errors.push(`${target.label}: no valid ZIP`); continue; }
-        if (!winner) winner = { archive, target };
-        else await rm(archive, { force: true });
-      } catch (error) {
-        errors.push(`${target.label}: ${formatError(error)}`);
-      } finally {
-        await tab.close().catch(() => {});
-      }
-    }
-  }
-  await Promise.all(Array.from({ length: limit }, () => worker()));
-  const selected = winner as { archive: string; target: ZipTarget } | null;
-  if (!selected) throw new Error(`no candidate produced a verified ZIP (${errors.join("; ")})`);
-  await persistSuccessfulZip(directory, chatId, expectedAssistant, selected.target);
-  return selected.archive;
+  throw new Error(`no assistant-owned candidate yielded a verified ZIP (${errors.join("; ")})`);
 }
 
 async function sendInPage(page: Page, text: string, chatId?: string, files: string[] = [], submit = true) {
@@ -2038,9 +2051,8 @@ async function runHookWithLastZip(
     });
   }
   await waitForConversationReady(page, chatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
-  const assistantMessage = await latestAssistantMessage(page, chatId);
   const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
-  const archive = await downloadLastZip(page, archiveDir, assistantMessage);
+  const archive = await downloadLastZip(page, archiveDir);
   await runHookForZip(page, chatId, hook, archive, configPath);
   return archive;
 }
@@ -2437,8 +2449,7 @@ function startControlServer(
             ? path.resolve(body.directory)
             : resolveFromConfig(configPath, cfg.downloads?.directory || "./var/downloads");
           const currentChatId = requestedChatId || normalizeUuid(page.url()) || undefined;
-          const assistantMessage = await latestAssistantMessage(page, currentChatId);
-          const saved = await downloadLastZip(page, directory, assistantMessage);
+          const saved = await downloadLastZip(page, directory);
           if (body.extract_to) {
             const extractTo = path.resolve(body.extract_to);
             const listing = await commandOutput(["unzip", "-Z1", saved]);
@@ -2738,7 +2749,7 @@ async function watch(cfg: Config, configPath: string) {
               const initialHook = await loadChatHook(sql, chat.id);
               if (initialHook?.enabled) {
                 const initialTargets = await findZipTargets(page);
-                for (const target of initialTargets) handledHookDownloads.add(`${chat.id}:${target.identity}`);
+                for (const target of assistantZipTargets(initialTargets, readySnapshot.messages)) handledHookDownloads.add(`${chat.id}:${target.identity}`);
                 initializedHookChats.add(chat.id);
                 pendingHookMessages.delete(chat.id);
                 log.info(`[hook] ready baseline chat=${chat.id}; ${readySnapshot.messages.length} messages, ${initialTargets.length} ZIP controls; no hook run`);
@@ -2804,7 +2815,7 @@ async function watch(cfg: Config, configPath: string) {
               if (!hookWasInitialized) {
                 // Opening/navigating to an existing chat is not a hook event.
                 // Establish a baseline before accepting any new message IDs.
-                for (const target of targets) handledHookDownloads.add(`${chat.id}:${target.identity}`);
+                for (const target of assistantZipTargets(targets, chat.messages)) handledHookDownloads.add(`${chat.id}:${target.identity}`);
                 initializedHookChats.add(chat.id);
                 pendingHookMessages.delete(chat.id);
                 log.info(`[hook] initialized ZIP baseline for chat=${chat.id} (${targets.length} existing attachments; no hook run)`);
@@ -2814,30 +2825,28 @@ async function watch(cfg: Config, configPath: string) {
                 // receive them while virtual focus belongs to a different pane.
                 // The baseline above prevents processing existing attachments
                 // merely because a pane was opened or the watcher restarted.
-                const latestAssistant = latestAssistantFromMessages(chat.messages);
-                if (latestAssistant) {
-                  const associated = targets.filter((target) =>
-                    zipTargetAssociation(target, latestAssistant) !== null &&
-                    (latestAssistant.turnOrder === undefined ||
-                      target.messageOrder === null ||
-                      target.messageOrder === latestAssistant.turnOrder));
-                  const unseen = associated.filter((target) =>
-                    !handledHookDownloads.has(`${chat.id}:${target.identity}`));
-                  const hookKey = `${chat.id}:${latestAssistant.id}`;
-                  if (unseen.length && !handledHookDownloads.has(hookKey) &&
-                      !activeHookChats.has(chat.id)) {
+                const associated = assistantZipTargets(targets, chat.messages).sort(newestZipFirst);
+                const unseen = associated.filter((target) =>
+                  !handledHookDownloads.has(`${chat.id}:${target.identity}`));
+                if (unseen.length && !activeHookChats.has(chat.id)) {
+                    const newest = unseen[0]!;
+                    const hookKey = `${chat.id}:${newest.identity}`;
+                    if (!handledHookDownloads.has(hookKey)) {
                     activeHookChats.add(chat.id);
                     try {
                       // The selected assistant is explicit: never fall back to a
                       // ZIP from a prior turn or a different open conversation.
                       const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
-                      const archive = await downloadLastZip(page, archiveDir, latestAssistant);
+                      const archive = await downloadLastZip(page, archiveDir);
                       // Mark successful ZIP downloads before running the hook;
                       // a build failure must not repeatedly reapply the archive.
-                      handledHookDownloads.add(hookKey);
-                      for (const target of associated) {
-                        handledHookDownloads.add(`${chat.id}:${target.identity}`);
+                      const successful = (await loadSuccessfulZips(archiveDir))[chat.id];
+                      if (successful?.targetIdentity) {
+                        handledHookDownloads.add(`${chat.id}:${successful.targetIdentity}`);
                       }
+                      // If this newest candidate failed and an earlier ZIP won,
+                      // leave it eligible for a later automatic retry.
+                      if (successful?.targetIdentity === newest.identity) handledHookDownloads.add(hookKey);
                       log.info(`[hook] new ZIP in open pane chat=${chat.id} browser=${runtime.name} (virtual focus unchanged)`);
                       await runHookForZip(page, chat.id, hook, archive, configPath);
                     } catch (hookError) {

@@ -611,3 +611,11 @@ chatgpt-ctl --version  # prints chatgpt-ctl 0.1.15
 ```
 
 The CLI reads its version from `ctl/Cargo.toml` at compile time via `CARGO_PKG_VERSION`. Nix package versions are synchronized to `0.1.15`. Rebuild the CLI after updating.
+
+## ZIP hooks: assistant-only timeline cursor (v0.1.16)
+
+- User-uploaded files (including `.zip` resource cards) are **never** hook candidates.
+- Assistant-owned generated download links are associated with their message UUID, or unambiguous assistant turn metadata if UUID is absent.
+- Candidate links are considered newest-first by assistant turn, then link order. A link without `.zip` in its text is eligible only when it is a generated assistant download control, and its bytes must validate as ZIP before use.
+- For each chat, the successful cursor is stored under the hook project's `.chatgpt-ctl-downloads/last-successful-zips.json`. It is advanced after a verified download, not after an unsuccessful click. Later assistant files remain eligible even if they arrive in the same message.
+- Hook execution extracts the **actual verified ZIP selected by the downloader**, not the most recent attachment text or a user upload. Old attachments are baselined on watcher startup and do not automatically retrigger a hook.
