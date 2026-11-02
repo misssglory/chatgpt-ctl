@@ -35,6 +35,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Print the CLI version (same as --version).
+    Version,
+
     /// List chats (most recently updated first)
     Chats {
         /// Max rows (0 = all chats across all browser profiles)
@@ -48,11 +51,11 @@ enum Commands {
         refresh: bool,
     },
 
-    /// Send text to the focused chat, or target a chat explicitly with --chat
+    /// Send to virtual focus, or select a chat with -c UUID/TITLE/OPEN_INDEX. Updates focus and activates its browser pane.
     Send {
         /// Optional message text (quote text containing spaces); may be omitted when attaching files
         text: Option<String>,
-        /// Target chat UUID or title substring (opens a pane if necessary)
+        /// Chat UUID, title substring, or 0-based currently OPEN pane index (-c 0 = first)
         #[arg(short = 'c', long = "chat", value_name = "CHAT", conflicts_with = "new_chat")]
         chat: Option<String>,
         /// Create a separate blank chat, send the first message, and return its new conversation UUID
@@ -66,11 +69,18 @@ enum Commands {
         draft: bool,
     },
 
-    /// Open a chat in its own watcher browser pane (reuse its pane if already open).
+    /// Print the virtually focused chat UUID (use -v to include its title).
+    Current {
+        /// Include chat title when available from PostgreSQL
+        #[arg(short, long)]
+        verbose: bool,
+    },
+
+    /// Open a chat in a browser pane; numeric CHAT selects a 0-based OPEN pane index.
     ///
     /// With no CHAT argument, opens fzf to search chats by index, ID, or title.
     Open {
-        /// Chat UUID, title substring, or "current"
+        /// Chat UUID, title substring, or 0-based currently OPEN pane index
         chat: Option<String>,
     },
 
@@ -974,6 +984,29 @@ fn watcher_open_chats() -> Vec<Uuid> {
     watcher_status().0
 }
 
+/// Numeric arguments refer to live OPEN panes for send/open, never database history.
+/// The watcher owns the pane order; each invocation reads the latest snapshot.
+async fn resolve_live_chat_selector(database_url: &str, spec: &str) -> Result<Uuid> {
+    if let Ok(id) = Uuid::parse_str(spec) { return Ok(id); }
+    if !spec.is_empty() && spec.bytes().all(|b| b.is_ascii_digit()) {
+        let index: usize = spec.parse().context("open chat index is too large")?;
+        let response = watcher_request("GET", "/status", None)?;
+        let status: serde_json::Value = serde_json::from_str(&response)?;
+        let panes = status.get("panes").and_then(|v| v.as_array())
+            .context("watcher status does not contain opened panes")?;
+        let pane = panes.get(index).with_context(||
+            format!("no open chat at index {index}; currently {} pane(s) open", panes.len()))?;
+        let id = pane.get("chat_id").and_then(|v| v.as_str())
+            .context("open pane has no chat ID")?;
+        return Ok(Uuid::parse_str(id)?);
+    }
+    if spec.eq_ignore_ascii_case("current") {
+        return watcher_status().1.context("no chat under virtual focus");
+    }
+    let client = connect(database_url).await?;
+    resolve_chat_id(&client, spec).await
+}
+
 fn watcher_request(method: &str, path: &str, body: Option<&str>) -> Result<String> {
     let address = std::env::var("CHATGPT_CTL_ADDR").unwrap_or_else(|_| "127.0.0.1:17381".into());
     let mut stream = TcpStream::connect(&address)
@@ -1003,6 +1036,9 @@ async fn main() -> Result<()> {
         .unwrap_or_else(default_database_url);
 
     match cli.command {
+        Commands::Version => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
+        }
         Commands::Retry { chat, mode } => {
             let client = connect(&url).await?;
             set_retry_setting(&client, &chat, mode).await?;
@@ -1044,14 +1080,15 @@ async fn main() -> Result<()> {
             let client = connect(&url).await?;
             let chats = list_chats(&client, limit, query.as_deref()).await?;
             let (open_chats, focused_chat) = watcher_status();
-            println!("  #  BROWSER       STATE     CHAT ID                                  MSGS  UPDATED          TITLE");
+            println!("OPEN#  DB#  BROWSER       STATE     CHAT ID                                  MSGS  UPDATED          TITLE");
             for c in chats.iter() {
                 let ts = c.updated_at
                     .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or_else(|| "-".into());
                 let pane_index = open_chats.iter().position(|id| *id == c.id);
                 let state = if focused_chat == Some(c.id) { "FOCUSED" } else if pane_index.is_some() { "OPEN" } else { "" };
-                let line = format!("{:>3}  {:<12}  {:<8}  {}  {:>4}  {:<16}  {}", c.global_index, c.browser_name, state, c.id, c.message_count, ts, c.title.replace('\n', " ").replace('\r', " "));
+                let live_index = pane_index.map(|index| index.to_string()).unwrap_or_else(|| "-".into());
+                let line = format!("{:>5}  {:>3}  {:<12}  {:<8}  {}  {:>4}  {:<16}  {}", live_index, c.global_index, c.browser_name, state, c.id, c.message_count, ts, c.title.replace('\n', " ").replace('\r', " "));
                 if focused_chat == Some(c.id) {
                     println!("\x1b[1;30;103m▶ {line}\x1b[0m");
                 } else if pane_index.is_some() {
@@ -1061,16 +1098,26 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Commands::Current { verbose } => {
+            let (open, focused) = watcher_status();
+            let chat_id = focused.context("no chat under virtual focus (is the watcher running?)")?;
+            // stdout is intentionally UUID-only by default for shell scripts.
+            if verbose {
+                let client = connect(&url).await?;
+                let title: Option<String> = client.query_opt("SELECT title FROM chats WHERE id = $1", &[&chat_id]).await?
+                    .and_then(|row| row.get(0));
+                println!("{}\t{}{}", chat_id, title.unwrap_or_else(|| "<unknown title>".into()),
+                    if open.contains(&chat_id) { "" } else { " [not open]" });
+            } else { println!("{chat_id}"); }
+        }
         Commands::Send { text, chat, files, new_chat, draft } => {
             let text = text.unwrap_or_default();
             if text.trim().is_empty() && files.is_empty() {
                 anyhow::bail!("send: provide message text or at least one --file attachment");
             }
-            let chat_id = if let Some(spec) = chat {
-                let client = connect(&url).await?;
-                Some(resolve_chat_id(&client, &spec).await?)
-            } else {
-                None
+            let chat_id = match chat {
+                Some(spec) => Some(resolve_live_chat_selector(&url, &spec).await?),
+                None => None,
             };
             let mut resolved_files = Vec::with_capacity(files.len());
             for file in files {
@@ -1104,13 +1151,7 @@ async fn main() -> Result<()> {
             // UUIDs require no DB lookup. All other selectors need a DB query;
             // fzf is launched only when no argument is provided.
             let chat_id = match chat {
-                Some(spec) => match Uuid::parse_str(&spec) {
-                    Ok(id) => id,
-                    Err(_) => {
-                        let client = connect(&url).await?;
-                        resolve_chat_id(&client, &spec).await?
-                    }
-                },
+                Some(spec) => resolve_live_chat_selector(&url, &spec).await?,
                 None => {
                     let client = connect(&url).await?;
                     match interactive_open(&client).await? {
@@ -1271,6 +1312,7 @@ mod cli_completion_tests {
     #[test]
     fn multi_pane_commands_are_exposed_to_clap_shell_completions() {
         let command = Cli::command();
+        assert!(command.find_subcommand("version").is_some());
         assert!(command.find_subcommand("open").is_some());
         assert!(command.find_subcommand("close").is_some());
         assert!(command.find_subcommand("chats").is_some());

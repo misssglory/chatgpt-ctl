@@ -2355,6 +2355,13 @@ function startControlServer(
               }
             }
           }
+          // Select the destination as soon as the send request starts, not after
+          // the potentially slow composer/upload operation. Browser activation
+          // is dispatched asynchronously and must not delay sending.
+          setVirtualFocus(focus, runtime, page, "ctl");
+          void page.bringToFront().catch((error) => {
+            log.warn(`[ctl] asynchronous send pane activation failed chat=${requestedChatId || normalizeUuid(page.url()) || "new"}: ${String(error)}`);
+          });
           await sendInPage(page, text, undefined, files, !draft);
           if (body.new_chat) {
             await page.waitForFunction(() =>
@@ -2363,8 +2370,7 @@ function startControlServer(
               { timeout: 45_000 },
             );
           }
-          setVirtualFocus(focus, runtime, page, "ctl");
-          await page.bringToFront();
+          // Already focused and activation scheduled before the send.
           const acquiredChatId = normalizeUuid(page.url());
           if (body.new_chat && !acquiredChatId) {
             return Response.json({ error: "message was sent but ChatGPT did not expose a conversation UUID yet", url: page.url() }, { status: 504 });

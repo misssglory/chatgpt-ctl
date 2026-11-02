@@ -577,3 +577,37 @@ or polling integration is added.
 Normal watcher shutdown (`Ctrl+C`/SIGTERM) does not mark browsers manually closed.
 Existing installations begin with `auto_open=true` until a browser is first
 closed using the updated watcher.
+
+
+### Live open-pane indices and virtual focus (v14)
+
+`chatgpt-ctl chats` displays `OPEN#` as the watcher's live zero-based pane
+index (`-` means not open). This is distinct from `DB#`, which indexes the
+full saved-chat history. Opening or closing tabs automatically changes the
+`OPEN#` values; CLI numeric selectors resolve against the latest live status.
+
+```bash
+chatgpt-ctl current                 # print only focused chat UUID
+chatgpt-ctl current --verbose       # UUID and stored title
+chatgpt-ctl send -c 0 "Hello"       # send to the first currently open pane
+chatgpt-ctl send -c 1 "Hello"       # send to the second currently open pane
+chatgpt-ctl open 0                  # focus the first currently open pane
+chatgpt-ctl open                   # interactive fzf for saved chats
+chatgpt-ctl send --chat UUID "Hi"   # send to saved chat; open its pane if needed
+chatgpt-ctl send --help
+chatgpt-ctl open --help
+chatgpt-ctl current --help
+```
+
+When `send` begins its browser operation, it updates virtual focus and
+dispatches `bringToFront()` asynchronously. Browser activation does not delay
+the send operation. The watcher does not start background focus polling.
+
+### CLI version (0.1.15)
+
+```bash
+chatgpt-ctl version    # prints 0.1.15
+chatgpt-ctl --version  # prints chatgpt-ctl 0.1.15
+```
+
+The CLI reads its version from `ctl/Cargo.toml` at compile time via `CARGO_PKG_VERSION`. Nix package versions are synchronized to `0.1.15`. Rebuild the CLI after updating.
