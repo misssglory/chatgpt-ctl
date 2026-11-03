@@ -55,8 +55,8 @@ enum Commands {
     Send {
         /// Optional message text (quote text containing spaces); may be omitted when attaching files
         text: Option<String>,
-        /// Chat UUID, title substring, or 0-based currently OPEN pane index (-c 0 = first)
-        #[arg(short = 'c', long = "chat", value_name = "CHAT", conflicts_with = "new_chat")]
+        /// UUID, title, or open-pane index (-c 0 = first, -c -1 = last, -c -2 = second-last)
+        #[arg(short = 'c', long = "chat", value_name = "CHAT", conflicts_with = "new_chat", allow_hyphen_values = true)]
         chat: Option<String>,
         /// Create a separate blank chat, send the first message, and return its new conversation UUID
         #[arg(long = "new-chat", alias = "new", conflicts_with = "chat")]
@@ -76,17 +76,19 @@ enum Commands {
         verbose: bool,
     },
 
-    /// Open a chat in a browser pane; numeric CHAT selects a 0-based OPEN pane index.
+    /// Open a chat; numeric CHAT selects a live pane (0 = first, -1 = last).
     ///
     /// With no CHAT argument, opens fzf to search chats by index, ID, or title.
     Open {
-        /// Chat UUID, title substring, or 0-based currently OPEN pane index
+        /// Chat UUID, title, or live pane index (0 = first, -1 = last, -2 = second-last)
+        #[arg(allow_hyphen_values = true)]
         chat: Option<String>,
     },
 
-    /// Close an opened chat pane by UUID, unique title substring, or 0-based chats index.
+    /// Close an open chat by UUID, title, or live pane index (0 = first, -1 = last).
     Close {
-        /// Chat UUID, title substring, or 0-based index from `chatgpt-ctl chats`
+        /// Chat UUID, title, or live open-pane index (0 = first, -1 = last)
+        #[arg(allow_hyphen_values = true)]
         chat: String,
     },
 
@@ -98,8 +100,8 @@ enum Commands {
         /// Destination directory for the ZIP file (default: ./var/downloads)
         #[arg(value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
         directory: Option<PathBuf>,
-        /// Chat UUID, title substring, or 0-based index; defaults to virtual focus
-        #[arg(short = 'c', long = "chat", value_name = "CHAT")]
+        /// Chat UUID, title, or live open-pane index (negative counts from end)
+        #[arg(short = 'c', long = "chat", value_name = "CHAT", allow_hyphen_values = true)]
         chat: Option<String>,
         /// Extract the downloaded ZIP into this directory (keeps the ZIP file)
         #[arg(long = "extract-to", alias = "unzip-to", value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
@@ -111,7 +113,8 @@ enum Commands {
     /// With no CHAT argument, enters an interactive prompt with DB-backed
     /// autocomplete on chat titles and UUIDs.
     History {
-        /// Chat UUID, title substring, or "current" (most recently updated chat)
+        /// Chat UUID, title, live pane index (negative from end), or "current"
+        #[arg(allow_hyphen_values = true)]
         chat: Option<String>,
         /// Only completed messages
         #[arg(long, default_value_t = true)]
@@ -142,7 +145,8 @@ enum Commands {
 
     /// Enable or disable automatic clicking of a Retry button at the end of a chat
     Retry {
-        /// Chat UUID or unique title substring
+        /// Chat UUID, unique title substring, or live pane index (negative from end)
+        #[arg(allow_hyphen_values = true)]
         chat: String,
         /// Whether automatic retry clicking is enabled
         mode: RetryMode,
@@ -171,7 +175,8 @@ enum Commands {
 enum HookAction {
     /// Create or replace a hook for a chat
     Set {
-        /// Chat UUID or unique title substring
+        /// Chat UUID, unique title substring, or live pane index (negative from end)
+        #[arg(allow_hyphen_values = true)]
         chat: String,
         /// Project root / Git working tree (stored as an absolute path)
         #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
@@ -198,20 +203,37 @@ enum HookAction {
     },
     /// List configured hooks
     List,
-    /// Show one chat's hook
-    Show { chat: String },
+    /// Show the hook for CHAT, or the virtually focused chat when omitted
+    Show {
+        /// Chat UUID, unique title substring, or live pane index (negative from end); defaults to virtual focus
+        #[arg(allow_hyphen_values = true)]
+        chat: Option<String>,
+    },
     /// Manually run a hook using the newest ZIP attachment in the selected or virtual-focus conversation
     #[command(alias = "trigger")]
     Run {
-        /// Optional chat UUID or title; defaults to the virtual-focus conversation
+        /// Optional UUID, title, or live pane index; defaults to virtual focus
+        #[arg(allow_hyphen_values = true)]
         chat: Option<String>,
     },
     /// Enable a hook
-    Enable { chat: String },
+    Enable {
+        /// Chat UUID, title, or live pane index (negative counts from end)
+        #[arg(allow_hyphen_values = true)]
+        chat: String,
+    },
     /// Disable a hook without deleting it
-    Disable { chat: String },
+    Disable {
+        /// Chat UUID, title, or live pane index (negative counts from end)
+        #[arg(allow_hyphen_values = true)]
+        chat: String,
+    },
     /// Remove a hook
-    Remove { chat: String },
+    Remove {
+        /// Chat UUID, title, or live pane index (negative counts from end)
+        #[arg(allow_hyphen_values = true)]
+        chat: String,
+    },
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -455,14 +477,10 @@ async fn resolve_chat_id(client: &Client, spec: &str) -> Result<Uuid> {
         return Ok(u);
     }
 
-    // Numeric selectors are zero-based indices in the unified `chats` listing.
-    if spec.chars().all(|ch| ch.is_ascii_digit()) {
-        let index: i64 = spec.parse().context("chat index is too large")?;
-        let row = client.query_opt(
-            "SELECT id FROM chats ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 1 OFFSET $1",
-            &[&index],
-        ).await?.with_context(|| format!("no chat at 0-based index {index}; run `chatgpt-ctl chats` to inspect the list"))?;
-        return Ok(row.get(0));
+    // All numeric chat selectors use the live open-pane order, including negatives.
+    // Example: 0 = first open pane, -1 = last, -2 = penultimate.
+    if let Some(index) = parse_chat_index(spec)? {
+        return resolve_open_chat_index(index);
     }
 
     // Title / partial uuid match
@@ -644,7 +662,8 @@ async fn run_hook_action(client: &Client, action: HookAction) -> Result<()> {
             }
         }
         HookAction::Show { chat } => {
-            let id = resolve_chat_id(client, &chat).await?;
+            let spec = chat.context("hook show: no chat specified or resolved")?;
+            let id = resolve_chat_id(client, &spec).await?;
             let row = client.query_opt("SELECT folder, child_folder, nix_flake, clipboard_command, enabled, build_command, stages FROM chat_hooks WHERE chat_id=$1", &[&id]).await?.context("no hook configured for this chat")?;
             let command: serde_json::Value = row.get(3);
             let build_command: Option<String> = row.get(5);
@@ -984,21 +1003,40 @@ fn watcher_open_chats() -> Vec<Uuid> {
     watcher_status().0
 }
 
-/// Numeric arguments refer to live OPEN panes for send/open, never database history.
-/// The watcher owns the pane order; each invocation reads the latest snapshot.
+/// Numeric selectors always address the current open-chat list, never DB history.
+/// Negative indices count from the end (-1 = last, -2 = second-to-last).
+fn parse_chat_index(spec: &str) -> Result<Option<i64>> {
+    let digits = spec.strip_prefix('-').unwrap_or(spec);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let index = spec.parse::<i64>().context("chat index is too large")?;
+    Ok(Some(index))
+}
+
+fn resolve_open_chat_index(index: i64) -> Result<Uuid> {
+    let response = watcher_request("GET", "/status", None)?;
+    let status: serde_json::Value = serde_json::from_str(&response)?;
+    let panes = status.get("panes").and_then(|v| v.as_array())
+        .context("watcher status does not contain opened panes")?;
+    let count = i64::try_from(panes.len()).context("too many open chats")?;
+    let resolved = if index < 0 { count.checked_add(index) } else { Some(index) }
+        .filter(|position| *position >= 0 && *position < count)
+        .with_context(|| format!(
+            "open chat index {index} is out of range; currently {count} open chat(s) (valid: 0..{} or -1..-{count})",
+            count.saturating_sub(1)
+        ))?;
+    let pane = &panes[resolved as usize];
+    let id = pane.get("chat_id").and_then(|v| v.as_str())
+        .with_context(|| format!("open pane {resolved} has no chat ID"))?;
+    Ok(Uuid::parse_str(id)?)
+}
+
+/// Resolve UUID, title, current focus, or positive/negative live pane index.
 async fn resolve_live_chat_selector(database_url: &str, spec: &str) -> Result<Uuid> {
     if let Ok(id) = Uuid::parse_str(spec) { return Ok(id); }
-    if !spec.is_empty() && spec.bytes().all(|b| b.is_ascii_digit()) {
-        let index: usize = spec.parse().context("open chat index is too large")?;
-        let response = watcher_request("GET", "/status", None)?;
-        let status: serde_json::Value = serde_json::from_str(&response)?;
-        let panes = status.get("panes").and_then(|v| v.as_array())
-            .context("watcher status does not contain opened panes")?;
-        let pane = panes.get(index).with_context(||
-            format!("no open chat at index {index}; currently {} pane(s) open", panes.len()))?;
-        let id = pane.get("chat_id").and_then(|v| v.as_str())
-            .context("open pane has no chat ID")?;
-        return Ok(Uuid::parse_str(id)?);
+    if let Some(index) = parse_chat_index(spec)? {
+        return resolve_open_chat_index(index);
     }
     if spec.eq_ignore_ascii_case("current") {
         return watcher_status().1.context("no chat under virtual focus");
@@ -1045,6 +1083,15 @@ async fn main() -> Result<()> {
         }
         Commands::Hook { action: HookAction::Run { chat } } => {
             run_hook_request(chat, &url).await?;
+        }
+        Commands::Hook { action: HookAction::Show { chat: None } } => {
+            // Omitted CHAT means actual browser virtual focus, not the most
+            // recently modified conversation in PostgreSQL.
+            let focused = watcher_status().1.context(
+                "hook show: no chat under virtual focus (is `bun run watch` running?)"
+            )?;
+            let client = connect(&url).await?;
+            run_hook_action(&client, HookAction::Show { chat: Some(focused.to_string()) }).await?;
         }
         Commands::Hook { action } => {
             let client = connect(&url).await?;

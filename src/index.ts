@@ -16,6 +16,7 @@ import { access, constants, lstat, mkdir, mkdtemp, readdir, rename, rm, readFile
 import { existsSync } from "node:fs";
 import path from "node:path";
 import postgres from "postgres";
+import { zipTargetsAfterCursor, zipTargetIsAfterCursor } from "./zip-cursor.mjs";
 
 const log = new Logger({
   type: "pretty",
@@ -109,6 +110,8 @@ interface VirtualFocus {
   pageFocusAt: WeakMap<Page, number>;
   /** Persist changes to the open-pane snapshot (debounced by the session store). */
   onChange?: (reason: string) => void;
+  /** Startup navigation/focus events must not override the saved virtual focus. */
+  restoring?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +342,16 @@ async function ensureBrowserSchema(sql: Sql): Promise<void> {
     CREATE INDEX IF NOT EXISTS chatgpt_watcher_open_chats_focus_idx
     ON chatgpt_watcher_open_chats (focused_at DESC)
   `);
+  // Store the virtual-focus identity explicitly. Timestamp ordering is useful
+  // for fallback, but isn't authoritative when pages are opened during startup.
+  await sql.unsafe(`
+    CREATE TABLE IF NOT EXISTS chatgpt_watcher_virtual_focus (
+      singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+      browser_name text NOT NULL,
+      chat_id uuid NOT NULL,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
 }
 
 async function registerBrowser(sql: Sql, profile: BrowserProfile): Promise<void> {
@@ -428,6 +441,9 @@ async function persistOpenChatSession(
     }
   }
 
+  const focusedChatId = focus.page && !focus.page.isClosed()
+    ? normalizeUuid(focus.page.url()) : null;
+  const focusedBrowser = focusedChatId && focus.runtime ? focus.runtime.name : null;
   await sql.begin(async (tx) => {
     await tx`DELETE FROM chatgpt_watcher_open_chats`;
     for (const item of snapshot) {
@@ -455,6 +471,21 @@ async function persistOpenChatSession(
               focused_at = EXCLUDED.focused_at,
               updated_at = NOW()
       `;
+    }
+    if (focusedBrowser && focusedChatId && snapshot.some((item) =>
+      item.browser_name === focusedBrowser && item.chat_id === focusedChatId)) {
+      await tx`
+        INSERT INTO chatgpt_watcher_virtual_focus (singleton, browser_name, chat_id, updated_at)
+        VALUES (true, ${focusedBrowser}, ${focusedChatId}::uuid, NOW())
+        ON CONFLICT (singleton) DO UPDATE
+          SET browser_name=EXCLUDED.browser_name, chat_id=EXCLUDED.chat_id, updated_at=NOW()
+      `;
+    } else if (snapshot.length === 0) {
+      await tx`DELETE FROM chatgpt_watcher_virtual_focus WHERE singleton = true`;
+    } else {
+      // The focused pane was closed. The next startup should choose the best
+      // remaining focus candidate rather than follow a stale explicit target.
+      await tx`DELETE FROM chatgpt_watcher_virtual_focus WHERE singleton = true`;
     }
   });
   return snapshot.length;
@@ -557,6 +588,14 @@ async function restoreOpenChatSession(
 ): Promise<number> {
   const saved = await loadOpenChatSession(sql);
   if (saved.length === 0) return 0;
+  const explicitRows = await sql`
+    SELECT browser_name, chat_id::text AS chat_id
+    FROM chatgpt_watcher_virtual_focus WHERE singleton = true
+  `;
+  const explicitFocus = explicitRows.length ? {
+    browserName: String(explicitRows[0]!.browser_name),
+    chatId: String(explicitRows[0]!.chat_id),
+  } : undefined;
 
   let restoredCount = 0;
   const focusCandidates: Array<{ runtime: BrowserRuntime; page: Page; focusedAt: number }> = [];
@@ -618,10 +657,13 @@ async function restoreOpenChatSession(
 
   // Restore focus after all contexts have been opened so page focus events from
   // intermediate navigations cannot override the persisted cross-browser target.
-  const lastFocused = focusCandidates.sort((a, b) => b.focusedAt - a.focusedAt)[0];
+  const lastFocused = (explicitFocus && focusCandidates.find((candidate) =>
+    candidate.runtime.name === explicitFocus.browserName &&
+    normalizeUuid(candidate.page.url()) === explicitFocus.chatId
+  )) ?? focusCandidates.sort((a, b) => b.focusedAt - a.focusedAt)[0];
   if (lastFocused) {
     setVirtualFocus(focus, lastFocused.runtime, lastFocused.page, "ctl");
-    log.info(`[watch] restored virtual focus chat=${normalizeUuid(lastFocused.page.url())} browser=${lastFocused.runtime.name}`);
+    log.info(`[watch] restored virtual focus chat=${normalizeUuid(lastFocused.page.url())} browser=${lastFocused.runtime.name} source=${explicitFocus && normalizeUuid(lastFocused.page.url()) === explicitFocus.chatId && lastFocused.runtime.name === explicitFocus.browserName ? "saved-target" : "timestamp-fallback"}`);
   }
   return restoredCount;
 }
@@ -1805,32 +1847,23 @@ function newestZipFirst(a: ZipTarget, b: ZipTarget): number {
  * Older ZIPs are tried only if every more recent assistant-owned candidate
  * fails verification. A successful cursor is never moved backwards.
  */
-async function downloadLastZip(page: Page, directory: string, _expectedAssistant?: AssistantZipIdentity): Promise<string> {
+async function downloadLastZip(page: Page, directory: string, _expectedAssistant?: AssistantZipIdentity, onlyNew = false): Promise<string | null> {
   const chat = await scrapeCurrentChat(page);
   const chatId = chat?.id ?? normalizeUuid(page.url());
   if (!chat || !chatId) throw new Error("cannot identify conversation for assistant ZIP selection");
   const targets = assistantZipTargets(await findZipTargets(page), chat.messages).sort(newestZipFirst);
   if (!targets.length) throw new Error(`chat=${chatId} has no assistant-owned ZIP download controls`);
   const history = (await loadSuccessfulZips(directory))[chatId];
-  // A cursor survives navigation/restarts even if the previously downloaded
-  // control has disappeared. Use both turn and DOM index when available.
-  const isNewer = (target: ZipTarget) => {
-    if (!history) return true;
-    if (target.identity === history.targetIdentity) return false;
-    const turn = target.messageOrder;
-    const priorTurn = history.turnOrder;
-    if (turn !== null && priorTurn !== null) {
-      if (turn !== priorTurn) return turn > priorTurn;
-      if (history.targetIndex !== undefined) return target.index > history.targetIndex;
-    }
-    return true; // legacy cursor without index: validate the file rather than skip.
-  };
-  const newestCandidates = targets.filter(isNewer);
-  // An explicit `ctl hook run` can repeat the most recent verified ZIP when
-  // no newer attachment exists. The automatic hook trigger only sees new links.
-  const candidates = newestCandidates.length ? newestCandidates : targets.filter(
-    (target) => target.identity === history?.targetIdentity).slice(0, 1);
+  // Cursor identity in the current assistant-only timeline takes precedence
+  // over persisted turn/index, which may be stale after UI reflow. Manual
+  // invocation always probes newest-first instead of replaying an old ZIP.
+  const newestCandidates = zipTargetsAfterCursor(targets, history);
+  const candidates = onlyNew ? newestCandidates : targets;
   log.info(`[download] chat=${chatId} assistantCandidates=${targets.length} newCandidates=${newestCandidates.length} lastSuccess=${history?.label ?? "none"}`);
+  if (candidates.length === 0) {
+    log.debug(`[download] chat=${chatId} no ZIP newer than saved cursor; nothing to do`);
+    return null;
+  }
 
   // Process newest to oldest, not "first to finish"; concurrent probing would
   // otherwise select an older ZIP just because its download completed first.
@@ -1842,17 +1875,16 @@ async function downloadLastZip(page: Page, directory: string, _expectedAssistant
       (message.id.toLowerCase() === target.messageId ||
        (!target.messageId && message.turnOrder === target.messageOrder)));
     const newTurn = target.messageOrder ?? assistant?.turnOrder ?? null;
-    const oldTurn = history?.turnOrder ?? null;
-    // Never move the persisted cursor backwards, even if a previous download
-    // control has disappeared from the page.
-    if (history && oldTurn !== null && newTurn !== null &&
-       (newTurn < oldTurn || (newTurn === oldTurn && history.targetIndex !== undefined && target.index < history.targetIndex))) {
-      await rm(archive, { force: true });
-      errors.push(`${target.label}: older than persisted cursor`);
-      continue;
+    // Manual runs can inspect older archives when newer candidates are not
+    // downloadable, but only actual forward progress may advance the cursor.
+    const replay = history?.targetIdentity === target.identity;
+    const advances = !history || zipTargetIsAfterCursor(target, targets, history);
+    if (advances) {
+      await persistSuccessfulZip(directory, chatId, assistant ? {id: assistant.id, turnOrder: assistant.turnOrder} : undefined, target);
+      log.info(`[download] cursor advanced chat=${chatId} assistant=${assistant?.id ?? target.messageId} turn=${newTurn} file='${target.label}'`);
+    } else {
+      log.info(`[download] ${replay ? "replaying" : "using historical"} verified ZIP chat=${chatId} file='${target.label}' (cursor retained)`);
     }
-    await persistSuccessfulZip(directory, chatId, assistant ? {id: assistant.id, turnOrder: assistant.turnOrder} : undefined, target);
-    log.info(`[download] cursor advanced chat=${chatId} assistant=${assistant?.id ?? target.messageId} turn=${newTurn} file='${target.label}'`);
     return archive;
   }
   throw new Error(`no assistant-owned candidate yielded a verified ZIP (${errors.join("; ")})`);
@@ -2053,6 +2085,7 @@ async function runHookWithLastZip(
   await waitForConversationReady(page, chatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
   const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
   const archive = await downloadLastZip(page, archiveDir);
+  if (!archive) throw new Error(`chat=${chatId}: no ZIP available to run`);
   await runHookForZip(page, chatId, hook, archive, configPath);
   return archive;
 }
@@ -2129,7 +2162,7 @@ async function installFocusTracking(runtime: BrowserRuntime, focus: VirtualFocus
   // the user switches to a terminal or another application.
   await runtime.context.exposeBinding("__chatgptCtlPageFocused", (source) => {
     const page = source.page;
-    if (!page.isClosed() && normalizeUuid(page.url())) {
+    if (!focus.restoring && !page.isClosed() && normalizeUuid(page.url())) {
       if (focus.page !== page || focus.runtime !== runtime) {
         setVirtualFocus(focus, runtime, page, "manual");
         log.debug(`[focus] browser=${runtime.name} chat=${normalizeUuid(page.url())} selected`);
@@ -2161,7 +2194,7 @@ async function installFocusTracking(runtime: BrowserRuntime, focus: VirtualFocus
       const focused = await page.evaluate(() =>
         document.visibilityState === "visible" && document.hasFocus()
       ).catch(() => false);
-      if (focused && !page.isClosed() && normalizeUuid(page.url()) &&
+      if (!focus.restoring && focused && !page.isClosed() && normalizeUuid(page.url()) &&
           (focus.page !== page || focus.runtime !== runtime)) {
         setVirtualFocus(focus, runtime, page, "manual");
       }
@@ -2450,6 +2483,7 @@ function startControlServer(
             : resolveFromConfig(configPath, cfg.downloads?.directory || "./var/downloads");
           const currentChatId = requestedChatId || normalizeUuid(page.url()) || undefined;
           const saved = await downloadLastZip(page, directory);
+          if (!saved) throw new Error("no assistant ZIP is available for download");
           if (body.extract_to) {
             const extractTo = path.resolve(body.extract_to);
             const listing = await commandOutput(["unzip", "-Z1", saved]);
@@ -2505,7 +2539,7 @@ async function watch(cfg: Config, configPath: string) {
   const settleMs = cfg.chatgpt.complete_settle_ms ?? 800;
   const profiles = await discoverBrowserProfiles(cfg, configPath);
   const runtimes: BrowserRuntime[] = [];
-  const focus: VirtualFocus = { at: 0, source: "manual", pageFocusAt: new WeakMap<Page, number>() };
+  const focus: VirtualFocus = { at: 0, source: "manual", pageFocusAt: new WeakMap<Page, number>(), restoring: true };
   try {
     for (const profile of profiles) {
       const allowed = await browserStartupEnabled(sql, profile.name);
@@ -2645,7 +2679,10 @@ async function watch(cfg: Config, configPath: string) {
       log.info(`[watch] browser=${runtime.name} synchronized ${sidebarChats.length} sidebar chats`);
     }
     const initialFocus = runtimes.find((runtime) => runtime.name === "default") ?? runtimes[0];
-    if (!focus.page && initialFocus?.activePage) setVirtualFocus(focus, initialFocus, initialFocus.activePage, "manual");
+    if (!focus.page && initialFocus?.activePage) setVirtualFocus(focus, initialFocus, initialFocus.activePage, "ctl");
+    // Until this point, navigation and browser startup focus events are ignored.
+    // The saved target is authoritative even when another pane opened last.
+    focus.restoring = false;
     // Startup restore is complete: commit the authoritative post-restore
     // snapshot now, then keep it current from browser page/focus events.
     sessionPersistence.resume();
@@ -2826,27 +2863,37 @@ async function watch(cfg: Config, configPath: string) {
                 // The baseline above prevents processing existing attachments
                 // merely because a pane was opened or the watcher restarted.
                 const associated = assistantZipTargets(targets, chat.messages).sort(newestZipFirst);
+                // A successful cursor is authoritative. Don't treat a stale
+                // attachment as new just because its DOM position changed or
+                // the in-memory dedupe set was reset.
+                const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
+                const savedCursor = (await loadSuccessfulZips(archiveDir))[chat.id];
+                const afterCursorTargets = zipTargetsAfterCursor(associated, savedCursor);
                 const unseen = associated.filter((target) =>
-                  !handledHookDownloads.has(`${chat.id}:${target.identity}`));
+                  afterCursorTargets.includes(target) && !handledHookDownloads.has(`${chat.id}:${target.identity}`));
                 if (unseen.length && !activeHookChats.has(chat.id)) {
                     const newest = unseen[0]!;
                     const hookKey = `${chat.id}:${newest.identity}`;
                     if (!handledHookDownloads.has(hookKey)) {
                     activeHookChats.add(chat.id);
+                    // Record the attempt before clicking: a broken/non-ZIP link
+                    // must not trigger a new download every scan. A genuinely
+                    // new attachment has a different identity and remains eligible.
+                    handledHookDownloads.add(hookKey);
                     try {
-                      // The selected assistant is explicit: never fall back to a
-                      // ZIP from a prior turn or a different open conversation.
-                      const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
-                      const archive = await downloadLastZip(page, archiveDir);
+                      const archive = await downloadLastZip(page, archiveDir, undefined, true);
+                      if (!archive) {
+                        log.debug(`[hook] chat=${chat.id} no newer verified ZIP; skipping`);
+                        return;
+                      }
                       // Mark successful ZIP downloads before running the hook;
                       // a build failure must not repeatedly reapply the archive.
                       const successful = (await loadSuccessfulZips(archiveDir))[chat.id];
                       if (successful?.targetIdentity) {
                         handledHookDownloads.add(`${chat.id}:${successful.targetIdentity}`);
                       }
-                      // If this newest candidate failed and an earlier ZIP won,
-                      // leave it eligible for a later automatic retry.
-                      if (successful?.targetIdentity === newest.identity) handledHookDownloads.add(hookKey);
+                      // Older or non-ZIP candidates are not retried every scan;
+                      // subsequent newly generated attachments remain eligible.
                       log.info(`[hook] new ZIP in open pane chat=${chat.id} browser=${runtime.name} (virtual focus unchanged)`);
                       await runHookForZip(page, chat.id, hook, archive, configPath);
                     } catch (hookError) {

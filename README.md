@@ -184,7 +184,7 @@ uses directory completion for `hook set --folder` and `--child-folder`, and file
 completion for attachment and ZIP paths. Chat-taking arguments also query PostgreSQL for UUID
 candidates and display their titles; this dynamic part needs a working `CHATGPT_DATABASE_URL`.
 
-`CHAT` may be a UUID, a title substring, or `current` (most recently updated chat).
+`CHAT` may be a UUID, a title substring, `current`, or a live open-pane index. Numeric indices are shared across every chat-taking command: `0` is the first open chat, `-1` the last, `-2` the one before last, and so forth. If the watcher has no open panes, numeric selectors fail with an out-of-range error.
 `open` without an argument and `history` without an argument provide interactive title/UUID autocomplete.
 
 The browser-backed commands (`chats --refresh`, `open`, `new-chat`, and `send`) require Bun and the optional watcher.
@@ -207,9 +207,9 @@ While `bun run watch` is running, it exposes a localhost control endpoint
 or creates a new page and opens it otherwise. The watcher polls and persists messages,
 Retry settings, and ZIP/build hooks independently in every open conversation page.
 `chatgpt-ctl chats` marks every opened conversation with a cyan `●`. `chatgpt-ctl close <CHAT>`
-closes a pane by UUID or unique title substring; `chatgpt-ctl close 0` resolves the first row
-in the combined `chats` table and closes it when that chat is open. Numeric selectors use the
-same stable order as the unfiltered `chats` listing. Closing the active pane focuses another open conversation,
+closes a pane by UUID or unique title substring; `chatgpt-ctl close 0` closes the first
+currently open chat and `chatgpt-ctl close -1` closes the last. Numeric chat selectors
+always use the live `OPEN#` ordering, not the database-history `DB#` column. Closing the active pane focuses another open conversation,
 or creates a blank ChatGPT page if none remain. `chatgpt-ctl send` submits into the virtual-focus chat by default. Use `--chat CHAT` to
 send to a specific chat by UUID or title substring; if it is not already open, the watcher creates
 a new pane for it. Sending focuses the destination pane. Browser tab focus is tracked from page
@@ -503,8 +503,8 @@ state remain isolated. No browser-name option is needed for chat commands: a cha
 saved browser mapping determines where the command runs.
 
 `chatgpt-ctl chats` now displays one combined table for all browser profiles (all rows by default; use `--limit N` to cap it), with
-browser name, open/focused state, and a zero-based global row index. The index can be used
-where a chat selector is accepted, for example `chatgpt-ctl open 0` or
+browser name, open/focused state, and separate `OPEN#` / `DB#` indices. Use the live
+`OPEN#` index (including negative offsets from the end) wherever a chat selector is accepted, for example `chatgpt-ctl open 0` or
 `chatgpt-ctl send --chat 1 "message"`. Titles must resolve uniquely; duplicate
 matches are reported with their browser names. `chatgpt-ctl chats --refresh` asks
 the running watcher to refresh all profiles, avoiding a second Chromium process
@@ -584,14 +584,22 @@ closed using the updated watcher.
 `chatgpt-ctl chats` displays `OPEN#` as the watcher's live zero-based pane
 index (`-` means not open). This is distinct from `DB#`, which indexes the
 full saved-chat history. Opening or closing tabs automatically changes the
-`OPEN#` values; CLI numeric selectors resolve against the latest live status.
+`OPEN#` values; CLI numeric selectors resolve against the latest live status. For every
+chat-taking command, `-1` means the last open chat, `-2` the penultimate, etc.
+Negative indices are accepted directly as positional arguments and as `-c` / `--chat` values.
 
 ```bash
 chatgpt-ctl current                 # print only focused chat UUID
 chatgpt-ctl current --verbose       # UUID and stored title
 chatgpt-ctl send -c 0 "Hello"       # send to the first currently open pane
 chatgpt-ctl send -c 1 "Hello"       # send to the second currently open pane
+chatgpt-ctl send -c -1 "Hello"      # send to the last currently open pane
+chatgpt-ctl send -c -2 "Hello"      # send to the second-last open pane
 chatgpt-ctl open 0                  # focus the first currently open pane
+chatgpt-ctl open -1                 # focus the last currently open pane
+chatgpt-ctl close -2                # close the second-last open pane
+chatgpt-ctl hook show -1            # inspect hook of the last open pane
+chatgpt-ctl history -1              # history for the last open pane
 chatgpt-ctl open                   # interactive fzf for saved chats
 chatgpt-ctl send --chat UUID "Hi"   # send to saved chat; open its pane if needed
 chatgpt-ctl send --help
@@ -619,3 +627,80 @@ The CLI reads its version from `ctl/Cargo.toml` at compile time via `CARGO_PKG_V
 - Candidate links are considered newest-first by assistant turn, then link order. A link without `.zip` in its text is eligible only when it is a generated assistant download control, and its bytes must validate as ZIP before use.
 - For each chat, the successful cursor is stored under the hook project's `.chatgpt-ctl-downloads/last-successful-zips.json`. It is advanced after a verified download, not after an unsuccessful click. Later assistant files remain eligible even if they arrive in the same message.
 - Hook execution extracts the **actual verified ZIP selected by the downloader**, not the most recent attachment text or a user upload. Old attachments are baselined on watcher startup and do not automatically retrigger a hook.
+
+
+## Hook inspection (v0.1.17)
+
+`chatgpt-ctl hook show` displays the hook configured for the current
+virtual-focus conversation. The watcher must be running and have a focused
+chat; this does not fall back to the most recently updated PostgreSQL chat.
+
+```sh
+chatgpt-ctl hook show                     # currently virtually focused chat
+chatgpt-ctl hook show <chat-uuid>          # explicit chat
+chatgpt-ctl hook show "project chat title" # existing title matching
+chatgpt-ctl hook show --help              # updated CLI help
+```
+
+The explicit argument keeps its previous meaning.
+
+## ZIP cursor and repeat suppression (v0.1.19)
+
+Automatic ZIP hooks only attempt assistant-owned attachments newer than the
+per-chat successful-download cursor. If no newer candidate exists, the watcher
+skips the download and hook without an error. A failed/non-ZIP candidate is
+marked as attempted for the current watcher session to prevent re-downloading
+it on every scan. New attachment identities remain eligible. Explicit
+`chatgpt-ctl hook run` can intentionally replay the last successful ZIP; the
+cursor is not moved backward or rewritten on replay even if the attachment's
+DOM index has shifted.
+
+## Latest assistant ZIP selection (v0.1.19)
+
+`chatgpt-ctl hook run` probes assistant-owned downloads in newest-to-oldest
+conversation order, independent of the persisted automatic-hook cursor. The
+first verified ZIP is extracted and passed to the configured hook. User
+uploads are excluded. If the saved attachment is still visible, automatic
+updates compare *actual current timeline position* instead of a stale stored
+turn/DOM index; this prevents an old `.zip` from suppressing newer assistant
+artifacts. A manual run may replay an older ZIP if newer downloads fail, but
+never rolls the cursor backward.
+
+
+## Persisted virtual focus (v0.1.20)
+
+The watcher now saves the **explicit virtual-focus chat and browser** in a singleton
+`chatgpt_watcher_virtual_focus` row (created automatically at startup). This is
+independent of pane order and the last page navigated at startup.
+
+During session restoration, synthetic page-focus/navigation events are ignored.
+After all saved panes are restored and sidebar sync completes, focus tracking
+resumes with the saved target. If the saved chat is no longer open or fails to
+restore, the watcher falls back to the most recently focused surviving pane.
+
+`ctl current` and `ctl current -v` should show the same chat before shutdown and
+after relaunch, provided that chat's browser profile is still enabled and its
+pane successfully restores.
+
+Expected startup log: `[watch] restored virtual focus chat=... browser=... source=saved-target`.
+No manual database migration is needed.
+
+### Negative chat indices (v0.1.21)
+
+All commands that accept a CHAT selector resolve signed numeric arguments against the
+**live open-pane list** reported by the watcher. Positive indices count from the
+beginning (`0`, `1`, ...), and negative indices count backwards (`-1`, `-2`, ...).
+UUID and title selectors still resolve normally, including for chats that are not open.
+
+```bash
+ctl open -1                   # last open chat
+ctl send -c -2 "message"     # second-last open chat
+ctl close -1                  # last open chat
+ctl hook show -1              # hook for last open chat
+ctl hook run -1               # run hook for last open chat
+ctl download-last-zip -c -1   # latest assistant ZIP in last open chat
+ctl history -1                # history for last open chat
+ctl retry -1 enable           # retry configuration for last open chat
+```
+
+Out-of-range negative indices fail without selecting a different conversation.
