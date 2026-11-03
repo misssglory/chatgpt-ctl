@@ -15,6 +15,7 @@ import { Logger } from "tslog";
 import { access, constants, lstat, mkdir, mkdtemp, readdir, rename, rm, readFile, writeFile, open } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import postgres from "postgres";
 import { zipTargetsAfterCursor, zipTargetIsAfterCursor } from "./zip-cursor.mjs";
 import { autoZipCandidates } from "./auto-zip-candidates.mjs";
@@ -1961,31 +1962,63 @@ async function runHookForZip(
   const normalizedEntries = entries.map((entry) => path.posix.normalize(entry.replace(/\\/g, "/")));
   const topLevel = new Set(normalizedEntries.map((entry) => entry.split("/")[0]).filter(Boolean));
   const singleRoot = topLevel.size === 1 ? [...topLevel][0]! : null;
-  // Auto-hook extraction mirrors `download-last-zip --extract-to`: if every
-  // archive entry is inside one top-level directory, merge that directory's
-  // contents directly into the configured project folder.
+  // Extract into a temporary sibling inside the project first, validate the
+  // materialized files, and only then publish them into the build tree.
+  // A successful `unzip` command alone does not prove that the configured
+  // child_folder received the expected new sources.
   const flattenRoot = Boolean(singleRoot && normalizedEntries.some((entry) => entry.startsWith(`${singleRoot}/`)));
-  let stagedPaths: string[];
-  if (flattenRoot && singleRoot) {
-    const staging = await mkdtemp(path.join(projectDir, ".chatgpt-ctl-hook-unzip-"));
-    try {
-      const extract = await commandOutput(["unzip", "-o", "-q", archive, "-d", staging]);
-      if (extract.code !== 0) throw new Error(`ZIP extraction failed: ${extract.stderr}`);
-      await mergeDirectoryContents(path.join(staging, singleRoot), projectDir);
-    } finally {
-      await rm(staging, { recursive: true, force: true });
-    }
-    stagedPaths = normalizedEntries
-      .map((entry) => entry === singleRoot ? "" : entry.startsWith(`${singleRoot}/`) ? entry.slice(singleRoot.length + 1) : entry)
-      .filter(Boolean);
-    log.info(`[hook] flattened single root folder '${singleRoot}' into ${projectDir}`);
-  } else {
-    const extract = await commandOutput(["unzip", "-o", "-q", archive, "-d", projectDir]);
+  const stagedPaths = normalizedEntries
+    .map((entry) => flattenRoot && singleRoot
+      ? (entry === singleRoot ? "" : entry.startsWith(`${singleRoot}/`) ? entry.slice(singleRoot.length + 1) : entry)
+      : entry)
+    .filter(Boolean);
+  const stagedFiles = [...new Set(stagedPaths.filter((entry) => !entry.endsWith("/") && entry !== "."))];
+  const extractStarted = performance.now();
+  log.info(`[hook] extract START chat=${chatId} archive=${path.basename(archive)} destination=${projectDir} child_folder=${hook.child_folder || "."} zip_entries=${entries.length} flattened_root=${flattenRoot ? singleRoot : "none"}`);
+  const staging = await mkdtemp(path.join(projectDir, ".chatgpt-ctl-hook-unzip-"));
+  try {
+    const extract = await commandOutput(["unzip", "-o", "-q", archive, "-d", staging]);
     if (extract.code !== 0) throw new Error(`ZIP extraction failed: ${extract.stderr}`);
-    stagedPaths = normalizedEntries;
+    const extractedRoot = flattenRoot && singleRoot ? path.join(staging, singleRoot) : staging;
+    const toHash = [
+      "package.json", "ctl/Cargo.toml", "ctl/src/main.rs", "src/index.ts", "flake.nix",
+      ...stagedFiles,
+    ].filter((item, index, all) => all.indexOf(item) === index && stagedFiles.includes(item)).slice(0, 8);
+    const expectedHashes = new Map<string, string>();
+    for (const entry of toHash) {
+      const source = path.resolve(extractedRoot, entry);
+      const relative = path.relative(extractedRoot, source);
+      if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error(`unsafe extracted path: ${entry}`);
+      const content = await readFile(source);
+      expectedHashes.set(entry, createHash("sha256").update(content).digest("hex"));
+    }
+    await mergeDirectoryContents(extractedRoot, projectDir);
+    // Verify the exact bytes of representative source files before build.
+    // This detects an incorrect extraction root or merge silently writing
+    // sources elsewhere, which can otherwise look like a stale build.
+    for (const [entry, digest] of expectedHashes) {
+      const written = await readFile(path.resolve(projectDir, entry));
+      if (createHash("sha256").update(written).digest("hex") !== digest) {
+        throw new Error(`extracted file verification failed: ${entry}`);
+      }
+    }
+    log.info(`[hook] extract FINISHED chat=${chatId} archive=${path.basename(archive)} destination=${projectDir} files=${stagedFiles.length} verified=${expectedHashes.size} duration_ms=${Math.round(performance.now() - extractStarted)}`);
+  } catch (error) {
+    log.error(`[hook] extract FAILED chat=${chatId} archive=${path.basename(archive)} destination=${projectDir}: ${String(error)}`);
+    throw error;
+  } finally {
+    await rm(staging, { recursive: true, force: true });
   }
 
   const buildDir = path.resolve(projectDir, hook.child_folder || ".");
+  const buildRelative = path.relative(projectDir, buildDir);
+  if (buildRelative.startsWith("..") || path.isAbsolute(buildRelative)) {
+    throw new Error(`hook child_folder escapes project folder: ${hook.child_folder}`);
+  }
+  if (!(await lstat(buildDir).catch(() => null))?.isDirectory()) {
+    throw new Error(`hook build directory does not exist after ZIP extraction: ${buildDir}`);
+  }
+  log.info(`[hook] build sources ready chat=${chatId} project=${projectDir} cwd=${buildDir} archive=${path.basename(archive)}`);
   const archiveFiles: string[] = [];
   for (const entry of [...new Set(stagedPaths)]) {
     if (!entry || entry === "." || entry.endsWith("/")) continue;

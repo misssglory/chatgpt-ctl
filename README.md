@@ -794,3 +794,20 @@ For a source-checkout binary **without a system-wide package**, install the
 completion function once using `scripts/install-zsh-completion.sh` and ensure
 `~/.zfunc` is on `fpath` *before* compinit. Merely building a Rust binary does
 not automatically register completions in an already-running shell.
+
+
+## v0.1.26 — verified extraction before hook stages
+
+`hook run` and automatic ZIP hooks now log `extract START`, `extract FINISHED`,
+`build sources ready`, and then `stage START`. Every archive is expanded to a
+private staging directory, merged into the configured `folder` (flattening a
+single top-level ZIP directory), and representative source-file hashes are
+checked against the extracted bytes before invoking the configured build.
+The `child_folder` controls the **working directory for build/custom stages**,
+not the extraction destination. For example, `folder=~/gh/chatgpt-history-watcher`,
+`child_folder=ctl`, `build_command=wcc build` extracts into the project root
+and runs `wcc build` inside `ctl`.
+
+If a hook downloads the wrong project ZIP, the log now identifies the actual
+archive and destination **before any build command runs**. Build failures caused
+by unrelated commands inside a custom stage are separate from extraction.
