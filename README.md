@@ -9,6 +9,39 @@ CLI (+ optional Bun scraper) for **ChatGPT conversation history** stored in **Po
 
 ---
 
+## Shell completion in v0.1.25
+
+Bash and Zsh both offer database-backed chat UUID suggestions at chat arguments
+(`open`, `open -c`, `send -c`, `close`, `history`, `retry`, and `hook set/show/run/enable/disable/remove`).
+The static Clap completion supplies subcommand names and options (`--folder`, `--stage`, `--chat`, etc.).
+
+For the **local binary**, generating completion files does not automatically register them in your existing shell. Use either:
+
+```bash
+# Bash, for this session (run from the repository root):
+source <(ctl/target/release/chatgpt-ctl completions bash)
+
+# Zsh, for this session (run from the repository root):
+source <(ctl/target/release/chatgpt-ctl completions zsh)
+compdef _chatgpt-ctl chatgpt-ctl ctl
+```
+
+Nix-installed commands load their completion from the system's shell-completion search path.
+After a NixOS rebuild, start a fresh interactive shell so the new definition is loaded.
+
+Check database completion independently of the shell with:
+
+```bash
+ctl/target/release/chatgpt-ctl __complete-chat ""
+```
+
+That helper must print tab-separated UUID/title pairs. If it errors, check
+`CHATGPT_DATABASE_URL` and the PostgreSQL server; if it succeeds but Tab shows
+files, the shell completion definition is not registered for the command.
+
+`chatgpt-ctl open -c 0` and `chatgpt-ctl open -c -1` are supported in addition
+to the original `chatgpt-ctl open 0`/`open -1` forms.
+
 ## Install `chatgpt-ctl` only on NixOS (global)
 
 ### 1. Flake input
@@ -724,7 +757,7 @@ print -r -- ${_comps[chatgpt-ctl]}
 chatgpt-ctl completions zsh | head -n 3
 ```
 
-## Automatic ZIP hooks: late attachments (v0.1.23)
+## Automatic ZIP hooks: late attachments (v0.1.24)
 
 An enabled hook treats an assistant-owned download control that **appears after
 its chat's initial ready baseline** as a new event, including controls appended
@@ -740,3 +773,24 @@ the automatic hook baseline.
 When the watcher starts with an already-present ZIP, it remains part of the
 baseline and will not trigger automatically. Use `ctl hook run` to apply an
 archive that arrived while the watcher was stopped.
+
+
+### Zsh completion registration (v0.1.24)
+
+The Zsh completion file now starts with `#compdef chatgpt-ctl ctl -p '*chatgpt-ctl'`.
+The two explicit names register `chatgpt-ctl` and `ctl` in compinit's
+command table; the pattern enables invocation through a path, e.g.
+`./ctl/target/release/chatgpt-ctl`. Previous releases used `#compdef -p`
+without registering the command names, which could fall back to file completion.
+
+For a system-wide NixOS installation, enable `programs.zsh.enable = true` and
+`programs.zsh.enableCompletion = true` in the NixOS configuration, then rebuild
+and open a new Zsh session (or remove stale `~/.zcompdump*` and `exec zsh`).
+Check with `print -r -- ${_comps[chatgpt-ctl]}` and
+`chatgpt-ctl <TAB>`. The generated file is installed to
+`$out/share/zsh/site-functions/_chatgpt-ctl`.
+
+For a source-checkout binary **without a system-wide package**, install the
+completion function once using `scripts/install-zsh-completion.sh` and ensure
+`~/.zfunc` is on `fpath` *before* compinit. Merely building a Rust binary does
+not automatically register completions in an already-running shell.

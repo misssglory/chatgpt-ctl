@@ -81,8 +81,11 @@ enum Commands {
     /// With no CHAT argument, opens fzf to search chats by index, ID, or title.
     Open {
         /// Chat UUID, title, or live pane index (0 = first, -1 = last, -2 = second-last)
-        #[arg(allow_hyphen_values = true)]
+        #[arg(allow_hyphen_values = true, conflicts_with = "chat_option")]
         chat: Option<String>,
+        /// Alternative explicit chat selector (supports negative indices)
+        #[arg(short = 'c', long = "chat", value_name = "CHAT", allow_hyphen_values = true, conflicts_with = "chat")]
+        chat_option: Option<String>,
     },
 
     /// Close an open chat by UUID, title, or live pane index (0 = first, -1 = last).
@@ -278,7 +281,14 @@ fi
 # Supply UUID candidates (with titles as descriptions) for chat-taking args.
 local _ctl_wants_chat=0
 case "${words[2]:-}" in
-  open|close|history|retry)
+  open)
+    if (( CURRENT == 3 )) && [[ "${PREFIX}" != -* ]]; then
+      _ctl_wants_chat=1
+    elif (( CURRENT > 2 )) && [[ "${words[CURRENT-1]:-}" == (-c|--chat) ]]; then
+      _ctl_wants_chat=1
+    fi
+    ;;
+  close|history|retry)
     (( CURRENT == 3 )) && _ctl_wants_chat=1
     ;;
   send|download-last-zip)
@@ -305,8 +315,10 @@ if (( _ctl_wants_chat )); then
   done < <("$_ctl_completion_bin" __complete-chat "$PREFIX" 2>/dev/null)
   if (( ${#_ctl_chat_ids[@]} > 0 )); then
     compadd -Q -d _ctl_chat_descriptions -- "${_ctl_chat_ids[@]}"
-    return
+  else
+    _message 'no matching chats (check CHATGPT_DATABASE_URL and PostgreSQL)'
   fi
+  return 0
 fi
 "#;
 
@@ -332,7 +344,62 @@ fi
     let (before, after) = body.split_at(insert_at);
     // -p registers a completion for any invocation ending in chatgpt-ctl,
     // including ./ctl/target/release/chatgpt-ctl. Also support the `ctl` alias.
-    Ok(format!("#compdef -p '*chatgpt-ctl' ctl\n{before}\n{ZSH_DYNAMIC_CHAT}\n{after}"))
+    Ok(format!("#compdef chatgpt-ctl ctl -p '*chatgpt-ctl'\n{before}\n{ZSH_DYNAMIC_CHAT}\n{after}"))
+}
+
+/// Preserve Clap's Bash command/option completion, but intercept arguments that
+/// identify conversations. The v0.1.24 Bash output had no database integration.
+fn bash_completion_text(cmd: &mut clap::Command) -> Result<String> {
+    let mut generated = Vec::new();
+    generate(Shell::Bash, cmd, "chatgpt-ctl", &mut generated);
+    let generated = String::from_utf8(generated)
+        .context("clap generated non-UTF8 bash completion output")?;
+    // `complete -F` is last-wins: install our wrapper after Clap's own binding.
+    // On non-chat positions we delegate to Clap for flags, subcommands, and paths.
+    const DYNAMIC_BASH: &str = r#"
+_chatgpt_ctl_dynamic() {
+  local cur="${COMP_WORDS[COMP_CWORD]}"
+  local prev=""
+  (( COMP_CWORD > 0 )) && prev="${COMP_WORDS[COMP_CWORD-1]}"
+  local root="${COMP_WORDS[1]:-}" sub="${COMP_WORDS[2]:-}"
+  local wants_chat=0
+  case "$root" in
+    open)
+      if (( COMP_CWORD == 2 )) && [[ "$cur" != -* ]]; then wants_chat=1; fi
+      if [[ "$prev" == "-c" || "$prev" == "--chat" ]]; then wants_chat=1; fi
+      ;;
+    close|history|retry)
+      if (( COMP_CWORD == 2 )) && [[ "$cur" != -* ]]; then wants_chat=1; fi
+      ;;
+    send|download-last-zip)
+      if [[ "$prev" == "-c" || "$prev" == "--chat" ]]; then wants_chat=1; fi
+      ;;
+    hook)
+      case "$sub" in
+        set|show|run|trigger|enable|disable|remove)
+          if (( COMP_CWORD == 3 )) && [[ "$cur" != -* ]]; then wants_chat=1; fi
+          ;;
+      esac
+      ;;
+  esac
+  if (( wants_chat )); then
+    COMPREPLY=()
+    local id title completion_bin="${COMP_WORDS[0]}"
+    if [[ ! -x "$completion_bin" ]]; then
+      completion_bin="$(type -P chatgpt-ctl 2>/dev/null || printf chatgpt-ctl)"
+    fi
+    while IFS=$'\t' read -r id title; do
+      [[ -n "$id" && "$id" == "$cur"* ]] && COMPREPLY+=("$id")
+    done < <("$completion_bin" __complete-chat "$cur" 2>/dev/null)
+    # Suppress Bash's filesystem fallback even when the DB has no matches.
+    compopt +o default +o bashdefault 2>/dev/null || :
+    return 0
+  fi
+  _chatgpt-ctl
+}
+complete -F _chatgpt_ctl_dynamic -o bashdefault -o default chatgpt-ctl ctl
+"#;
+    Ok(format!("{generated}\n{DYNAMIC_BASH}"))
 }
 
 fn print_zsh_completions(cmd: &mut clap::Command) -> Result<()> {
@@ -1114,6 +1181,8 @@ async fn main() -> Result<()> {
             let mut cmd = Cli::command();
             if matches!(shell, ShellKind::Zsh) {
                 print_zsh_completions(&mut cmd)?;
+            } else if matches!(shell, ShellKind::Bash) {
+                print!("{}", bash_completion_text(&mut cmd)?);
             } else {
                 let shell: Shell = shell.into();
                 generate(shell, &mut cmd, "chatgpt-ctl", &mut io::stdout());
@@ -1202,11 +1271,11 @@ async fn main() -> Result<()> {
                 println!("message sent to {destination} [{browser_name}] ({url})");
             }
         }
-        Commands::Open { chat } => {
+        Commands::Open { chat, chat_option } => {
             let command_started = std::time::Instant::now();
             // UUIDs require no DB lookup. All other selectors need a DB query;
             // fzf is launched only when no argument is provided.
-            let chat_id = match chat {
+            let chat_id = match chat_option.or(chat) {
                 Some(spec) => resolve_live_chat_selector(&url, &spec).await?,
                 None => {
                     let client = connect(&url).await?;
@@ -1338,11 +1407,32 @@ mod cli_completion_tests {
     fn zsh_completion_supports_path_invocations_and_dynamic_chat_targets() {
         let mut command = Cli::command();
         let completion = zsh_completion_text(&mut command).expect("zsh completion output");
-        assert!(completion.starts_with("#compdef -p '*chatgpt-ctl' ctl"));
+        assert!(completion.starts_with("#compdef chatgpt-ctl ctl -p '*chatgpt-ctl'"));
         assert!(completion.contains("__complete-chat"));
         assert!(completion.contains("hook"));
         assert!(completion.contains("--folder"));
         assert!(completion.contains("--child-folder"));
+    }
+
+    #[test]
+    fn bash_completion_dispatches_chat_arguments_and_delegates_options() {
+        let script = bash_completion_text(&mut Cli::command()).unwrap();
+        assert!(script.contains("_chatgpt_ctl_dynamic()"));
+        assert!(script.contains("__complete-chat"));
+        assert!(script.contains("_chatgpt-ctl"));
+        assert!(script.contains("complete -F _chatgpt_ctl_dynamic"));
+    }
+
+    #[test]
+    fn open_accepts_explicit_chat_option() {
+        let cli = Cli::try_parse_from(["chatgpt-ctl", "open", "-c", "-1"]).unwrap();
+        match cli.command {
+            Commands::Open { chat, chat_option } => {
+                assert!(chat.is_none());
+                assert_eq!(chat_option.as_deref(), Some("-1"));
+            }
+            _ => panic!("expected open command"),
+        }
     }
 
     #[test]
