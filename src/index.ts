@@ -17,6 +17,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import postgres from "postgres";
 import { zipTargetsAfterCursor, zipTargetIsAfterCursor } from "./zip-cursor.mjs";
+import { autoZipCandidates } from "./auto-zip-candidates.mjs";
 
 const log = new Logger({
   type: "pretty",
@@ -1847,7 +1848,7 @@ function newestZipFirst(a: ZipTarget, b: ZipTarget): number {
  * Older ZIPs are tried only if every more recent assistant-owned candidate
  * fails verification. A successful cursor is never moved backwards.
  */
-async function downloadLastZip(page: Page, directory: string, _expectedAssistant?: AssistantZipIdentity, onlyNew = false): Promise<string | null> {
+async function downloadLastZip(page: Page, directory: string, _expectedAssistant?: AssistantZipIdentity, onlyNew = false, autoEligibleIdentities?: ReadonlySet<string>): Promise<string | null> {
   const chat = await scrapeCurrentChat(page);
   const chatId = chat?.id ?? normalizeUuid(page.url());
   if (!chat || !chatId) throw new Error("cannot identify conversation for assistant ZIP selection");
@@ -1858,7 +1859,13 @@ async function downloadLastZip(page: Page, directory: string, _expectedAssistant
   // over persisted turn/index, which may be stale after UI reflow. Manual
   // invocation always probes newest-first instead of replaying an old ZIP.
   const newestCandidates = zipTargetsAfterCursor(targets, history);
-  const candidates = onlyNew ? newestCandidates : targets;
+  // Automatic triggers are based on newly observed assistant-owned controls.
+  // An archive can arrive later in the SAME assistant turn, and the saved
+  // cursor's anchor may disappear after ChatGPT re-renders the timeline.
+  // In both situations a strict turn/index cursor would incorrectly hide it.
+  const candidates = autoEligibleIdentities
+    ? targets.filter((target) => autoEligibleIdentities.has(target.identity))
+    : onlyNew ? newestCandidates : targets;
   log.info(`[download] chat=${chatId} assistantCandidates=${targets.length} newCandidates=${newestCandidates.length} lastSuccess=${history?.label ?? "none"}`);
   if (candidates.length === 0) {
     log.debug(`[download] chat=${chatId} no ZIP newer than saved cursor; nothing to do`);
@@ -1878,7 +1885,7 @@ async function downloadLastZip(page: Page, directory: string, _expectedAssistant
     // Manual runs can inspect older archives when newer candidates are not
     // downloadable, but only actual forward progress may advance the cursor.
     const replay = history?.targetIdentity === target.identity;
-    const advances = !history || zipTargetIsAfterCursor(target, targets, history);
+    const advances = autoEligibleIdentities?.has(target.identity) || !history || zipTargetIsAfterCursor(target, targets, history);
     if (advances) {
       await persistSuccessfulZip(directory, chatId, assistant ? {id: assistant.id, turnOrder: assistant.turnOrder} : undefined, target);
       log.info(`[download] cursor advanced chat=${chatId} assistant=${assistant?.id ?? target.messageId} turn=${newTurn} file='${target.label}'`);
@@ -2863,14 +2870,18 @@ async function watch(cfg: Config, configPath: string) {
                 // The baseline above prevents processing existing attachments
                 // merely because a pane was opened or the watcher restarted.
                 const associated = assistantZipTargets(targets, chat.messages).sort(newestZipFirst);
-                // A successful cursor is authoritative. Don't treat a stale
-                // attachment as new just because its DOM position changed or
-                // the in-memory dedupe set was reset.
+                // The in-memory baseline records what was already rendered when
+                // this chat became ready. A new assistant-owned attachment is
+                // an event even when it appears later in an existing assistant
+                // turn, so do NOT prefilter it using saved cursor turn/index.
+                // Re-observing the persisted successful attachment is not new.
                 const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
                 const savedCursor = (await loadSuccessfulZips(archiveDir))[chat.id];
-                const afterCursorTargets = zipTargetsAfterCursor(associated, savedCursor);
-                const unseen = associated.filter((target) =>
-                  afterCursorTargets.includes(target) && !handledHookDownloads.has(`${chat.id}:${target.identity}`));
+                const unseen = autoZipCandidates(
+                  associated,
+                  new Set(associated.filter((target) => handledHookDownloads.has(`${chat.id}:${target.identity}`)).map((target) => target.identity)),
+                  savedCursor?.targetIdentity
+                );
                 if (unseen.length && !activeHookChats.has(chat.id)) {
                     const newest = unseen[0]!;
                     const hookKey = `${chat.id}:${newest.identity}`;
@@ -2881,7 +2892,11 @@ async function watch(cfg: Config, configPath: string) {
                     // new attachment has a different identity and remains eligible.
                     handledHookDownloads.add(hookKey);
                     try {
-                      const archive = await downloadLastZip(page, archiveDir, undefined, true);
+                      // Limit the downloader to NEW attachments. Falling back to
+                      // older verified ZIPs must never run an automatic hook.
+                      const eligible = new Set(unseen.map((target) => target.identity));
+                      log.info(`[hook] auto candidate chat=${chat.id} new=${eligible.size} latest='${newest.label}' cursor='${savedCursor?.label ?? "none"}'`);
+                      const archive = await downloadLastZip(page, archiveDir, undefined, true, eligible);
                       if (!archive) {
                         log.debug(`[hook] chat=${chat.id} no newer verified ZIP; skipping`);
                         return;
@@ -2899,6 +2914,9 @@ async function watch(cfg: Config, configPath: string) {
                     } catch (hookError) {
                       log.error(`[hook] chat=${chat.id} failed: ${formatError(hookError)}`);
                     } finally {
+                      // Do not repeatedly click the same failed candidates on
+                      // every poll; subsequent assistant attachments remain eligible.
+                      for (const target of unseen) handledHookDownloads.add(`${chat.id}:${target.identity}`);
                       activeHookChats.delete(chat.id);
                     }
                   }

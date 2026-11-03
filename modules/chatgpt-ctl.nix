@@ -104,6 +104,15 @@ in
 
     environment.systemPackages = [ cfg.package ];
 
+    # Make completion files from Nix packages visible to shell completion
+    # discovery through /run/current-system/sw/share. This also covers users
+    # installing the package via the module without their own fpath setup.
+    environment.pathsToLink = [
+      "/share/zsh"
+      "/share/bash-completion"
+      "/share/fish"
+    ];
+
     environment.sessionVariables = {
       CHATGPT_DATABASE_URL = cfg.databaseUrl;
     };

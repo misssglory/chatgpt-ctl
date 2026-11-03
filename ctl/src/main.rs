@@ -321,9 +321,18 @@ fi
         anyhow::bail!("unexpected clap zsh completion header: {header}");
     }
 
-    // zsh's #compdef -p mapping applies to both the command basename and any
-    // executable path ending in chatgpt-ctl. `ctl` is included as a short alias.
-    Ok(format!("#compdef -p '*chatgpt-ctl' ctl\n{ZSH_DYNAMIC_CHAT}{body}"))
+    // The injected code uses `local`, `CURRENT`, `PREFIX`, and `return`.
+    // It MUST be inside the generated completion function, not between the
+    // #compdef header and `autoload` / the function declaration. In v0.1.21
+    // it was injected at top level and broke `compinit` for installed shells.
+    let function_marker = "_chatgpt-ctl() {";
+    let function_start = body.find(function_marker)
+        .context("clap zsh completion function was not found")?;
+    let insert_at = function_start + function_marker.len();
+    let (before, after) = body.split_at(insert_at);
+    // -p registers a completion for any invocation ending in chatgpt-ctl,
+    // including ./ctl/target/release/chatgpt-ctl. Also support the `ctl` alias.
+    Ok(format!("#compdef -p '*chatgpt-ctl' ctl\n{before}\n{ZSH_DYNAMIC_CHAT}\n{after}"))
 }
 
 fn print_zsh_completions(cmd: &mut clap::Command) -> Result<()> {

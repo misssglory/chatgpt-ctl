@@ -14,7 +14,7 @@
         pkgs:
         pkgs.rustPlatform.buildRustPackage {
           pname = "chatgpt-ctl";
-          version = "0.1.21";
+          version = "0.1.23";
           src = ./ctl;
 
           cargoLock = {

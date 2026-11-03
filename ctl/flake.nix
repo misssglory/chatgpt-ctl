@@ -15,7 +15,7 @@
 
         chatgpt-ctl = pkgs.rustPlatform.buildRustPackage {
           pname = "chatgpt-ctl";
-          version = "0.1.21";
+          version = "0.1.23";
           src = ./.;
 
           cargoLock.lockFile = ./Cargo.lock;
@@ -35,12 +35,8 @@
               --zsh  <($out/bin/chatgpt-ctl completions zsh) \
               --fish <($out/bin/chatgpt-ctl completions fish)
 
-            # Schema lives in parent repo; optional when building from ctl/ alone
-            mkdir -p $out/share/chatgpt-ctl
-            if [[ -f ${../sql/schema.sql} ]]; then
-              cp ${../sql/schema.sql} $out/share/chatgpt-ctl/schema.sql
-              cp ${../sql/flush.sql}  $out/share/chatgpt-ctl/flush.sql
-            fi
+            # Standalone ctl flake cannot refer outside its own flake root.
+            # Use the root flake for the database schema files.
           '';
 
           meta = with pkgs.lib; {
