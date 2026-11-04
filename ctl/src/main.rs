@@ -5,6 +5,8 @@
 //!   - Dynamic chat candidates: hidden `__complete-chat` helper for shell integrations
 //!   - Interactive: `open` / `history` without an argument complete DB chat titles / UUIDs.
 
+mod watch;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -140,6 +142,16 @@ enum Commands {
         /// Follow poll interval in milliseconds
         #[arg(long, default_value_t = 1500)]
         interval_ms: u64,
+    },
+
+    /// Browse persisted questions/answers and code blocks in a Ratatui interface.
+    Watch {
+        /// Chat UUID/title/live pane index; defaults to virtual focus
+        #[arg(allow_hyphen_values = true, conflicts_with = "chat_option")]
+        chat: Option<String>,
+        /// Explicit chat selector (negative pane indices supported)
+        #[arg(short = 'c', long = "chat", value_name = "CHAT", allow_hyphen_values = true, conflicts_with = "chat")]
+        chat_option: Option<String>,
     },
 
     /// Output the live HTML DOM of an opened chat (stdout by default).
@@ -317,7 +329,7 @@ fi
 # Supply UUID candidates (with titles as descriptions) for chat-taking args.
 local _ctl_wants_chat=0
 case "${words[2]:-}" in
-  open)
+  open|watch|html)
     if (( CURRENT == 3 )) && [[ "${PREFIX}" != -* ]]; then
       _ctl_wants_chat=1
     elif (( CURRENT > 2 )) && [[ "${words[CURRENT-1]:-}" == (-c|--chat) ]]; then
@@ -400,7 +412,7 @@ _chatgpt_ctl_dynamic() {
   local root="${COMP_WORDS[1]:-}" sub="${COMP_WORDS[2]:-}"
   local wants_chat=0
   case "$root" in
-    open)
+    open|watch|html)
       if (( COMP_CWORD == 2 )) && [[ "$cur" != -* ]]; then wants_chat=1; fi
       if [[ "$prev" == "-c" || "$prev" == "--chat" ]]; then wants_chat=1; fi
       ;;
@@ -1325,6 +1337,16 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
+        Commands::Watch { chat, chat_option } => {
+            let chat_id = match chat_option.or(chat) {
+                Some(spec) => resolve_live_chat_selector(&url, &spec).await?,
+                None => watcher_status().1.context("ctl watch: no chat under virtual focus; use -c CHAT")?,
+            };
+            let client = connect(&url).await?;
+            let title = client.query_opt("SELECT title FROM chats WHERE id = $1", &[&chat_id]).await?
+                .map(|row| row.get::<_, String>(0)).unwrap_or_else(|| chat_id.to_string());
+            watch::run(&client, chat_id, title).await?;
+        }
         Commands::Chats { limit, query, refresh, open_only } => {
             if refresh {
                 // Prefer the already-running watcher so profile locks are never
@@ -1626,6 +1648,17 @@ mod cli_completion_tests {
                 assert_eq!(chat_option.as_deref(), Some("-1"));
             }
             _ => panic!("expected open command"),
+        }
+    }
+
+    #[test]
+    fn watch_accepts_focused_or_explicit_chat() {
+        let cli = Cli::try_parse_from(["chatgpt-ctl", "watch"]).unwrap();
+        assert!(matches!(cli.command, Commands::Watch { chat: None, chat_option: None }));
+        let cli = Cli::try_parse_from(["chatgpt-ctl", "watch", "-c", "-1"]).unwrap();
+        match cli.command {
+            Commands::Watch { chat: None, chat_option: Some(spec) } => assert_eq!(spec, "-1"),
+            _ => panic!("expected watch command"),
         }
     }
 

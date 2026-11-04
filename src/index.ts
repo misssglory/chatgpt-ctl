@@ -2759,7 +2759,7 @@ function startControlServer(
       if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
       try {
         const body = await request.json().catch(() => ({})) as {
-          chat_id?: string; chat?: string; directory?: string; extract_to?: string; identity?: string;
+          chat_id?: string; message_id?: string; chat?: string; directory?: string; extract_to?: string; identity?: string;
           text?: string; files?: string[]; new_chat?: boolean; draft?: boolean;
         };
         if (url.pathname === "/html") {
@@ -2789,6 +2789,54 @@ function startControlServer(
             counts.push({ browser_name: runtime.name, count: chats.length });
           }
           return Response.json({ ok: true, browsers: counts, total: counts.reduce((sum, item) => sum + item.count, 0) });
+        }
+        if (url.pathname === "/jump-message") {
+          const chatId = normalizeUuid(body.chat_id || "");
+          const messageId = normalizeUuid(body.message_id || "");
+          if (!chatId || !messageId) return Response.json({ error: "valid chat_id and message_id required" }, { status: 400 });
+          const existing = openConversationPages(runtimes).find((item) => item.chatId === chatId);
+          const runtime = existing?.runtime ?? await ensureRuntimeForChat(chatId);
+          const page = existing?.page ?? await makePage(runtime);
+          if (!existing) {
+            await page.goto(new URL(`/c/${chatId}`, cfg.chatgpt.url).toString(), {
+              waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000,
+            });
+            await waitForConversationReady(page, chatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
+            await recordChatBrowser(sql, chatId, runtime.name);
+          }
+          // Navigating historical messages is never a new ZIP event.
+          pagesReadingAttachmentHistory.add(page);
+          try {
+            const jump = async () => page.evaluate((id: string) => {
+              const candidates = Array.from(document.querySelectorAll<HTMLElement>(
+                '[data-chatgpt-search-message-ids], [data-dil-message-id], [data-content-search-unit-key]'));
+              const target = candidates.find(el => {
+                const ids = [el.getAttribute('data-chatgpt-search-message-ids') || '',
+                  el.getAttribute('data-dil-message-id') || '',
+                  el.getAttribute('data-content-search-unit-key') || ''].join(' ');
+                return ids.toLowerCase().includes(id);
+              });
+              if (!target) return false;
+              target.scrollIntoView({ block: 'center', behavior: 'instant' });
+              return true;
+            }, messageId);
+            let found = await jump();
+            let stagnant = 0;
+            for (let step = 0; !found && step < 160; step++) {
+              const move = await scrollChatHistoryUp(page);
+              await page.waitForTimeout(180);
+              found = await jump();
+              stagnant = move.moved ? 0 : stagnant + 1;
+              if (move.top && stagnant >= 4) break;
+            }
+            if (!found) return Response.json({ error: `message ${messageId} not found in loaded history`, chat_id: chatId }, { status: 404 });
+            setVirtualFocus(focus, runtime, page, "ctl");
+            await page.bringToFront();
+            log.info(`[ctl] jump chat=${chatId} message=${messageId}`);
+            return Response.json({ ok: true, chat_id: chatId, message_id: messageId });
+          } finally {
+            pagesReadingAttachmentHistory.delete(page);
+          }
         }
         if (url.pathname === "/open") {
           const openStartedAt = performance.now();

@@ -918,3 +918,21 @@ completed before its attachment can trigger an automatic hook.
 * Prefer the attachment-specific inline download control; fall back to the resource-card path.
 * Suppress previously persisted duplicate rows in the CLI picker, and clean up duplicate identities when the watcher reindexes a message.
 * Restore chat scroll position even after failed retrieval, including subsequent virtualized layout reflow.
+
+
+## Ratatui history navigator (`ctl watch`) — v0.1.37
+
+Use `ctl watch` to browse the conversation under watcher virtual focus, or `ctl watch -c 0`, `ctl watch -c -1`, `ctl watch -c UUID`, or `ctl watch TITLE`. This is a full-screen terminal UI backed by persisted PostgreSQL message content; it needs no page scraping to show history.
+
+- **1 / 2 / Tab**: switch between questions (newest-first, displaying relevant assistant matches) and fenced code blocks (all messages, each labeled with the preceding user question).
+- **/**: fuzzy filter on user questions and model answers, or on question headers and code content; matching characters appear highlighted; results rank by fuzzy match quality. **Enter** or **Esc** stops typing.
+- **Up/Down**, **j/k**, **PgUp/PgDn**, **Home/End**: navigate.
+- **Enter** when not typing: open the corresponding assistant answer (or exact code source message) in the watcher-controlled browser; the watcher loads older history incrementally if necessary. It does not run ZIP hooks while navigating.
+- **Esc**: clear filter, then quit; **q**: quit.
+
+Code tab indexes Markdown fenced code (backtick or tilde fences) from user and assistant messages. The picker previews the first four lines of each block. ChatGPT content that the database does not contain cannot be shown until the watcher observes and persists it.
+
+
+## v0.1.37 — Rust build fix
+
+Moved the `mod watch;` declaration below the crate-level `//!` documentation in `ctl/src/main.rs`. This resolves `E0753: expected outer doc comment` when building v0.1.36. No intended behavior changes to `ctl watch`.

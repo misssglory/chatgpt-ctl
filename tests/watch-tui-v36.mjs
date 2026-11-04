@@ -1,0 +1,17 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+const root = new URL('../', import.meta.url);
+const read = (p) => readFileSync(new URL(p,root),'utf8');
+const rust = read('ctl/src/main.rs');
+const tui = read('ctl/src/watch.rs');
+const browser = read('src/index.ts');
+assert.match(rust,/Commands::Watch \{ chat, chat_option \}/);
+assert.match(rust,/watch::run\(&client, chat_id, title\)/);
+assert.match(tui,/filtered_questions/);
+assert.match(tui,/filtered_code/);
+assert.match(tui,/fn fuzzy_positions/);
+assert.match(tui,/\/jump-message/);
+assert.match(browser,/url\.pathname === "\/jump-message"/);
+assert.match(browser,/pagesReadingAttachmentHistory\.add\(page\)/);
+assert.match(browser,/scrollChatHistoryUp\(page\)/);
+console.log('watch TUI integration source checks passed');
