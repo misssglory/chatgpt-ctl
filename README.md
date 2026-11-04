@@ -906,3 +906,15 @@ completed before its attachment can trigger an automatic hook.
 ### v0.1.33 — scoped attachment preview retrieval
 
 `ctl files` only clicks Download controls belonging to the newly opened file preview (never a global body button). If the preview's Download action is blocked or no download occurs, it attempts to extract the text/code preview instead. Preview cleanup runs in `finally`, followed by the existing chat scroll restoration even on failure.
+
+### v0.1.34 — attachment download event synchronization
+
+`ctl files` retains download listeners on the conversation and preview popup pages throughout retrieval instead of timing out after 1.8–2.5 seconds. It awaits `Download.saveAs()` and checks the saved file before acknowledging success, gives delayed download events precedence over text preview fallback, and always disposes listeners and closes previews. History-scroll restoration and suppression of automatic hooks during file retrieval remain in place.
+
+
+### v0.1.35: file picker and retrieval hardening
+
+* Deduplicate a file's inline `Open Download` link and resource-card `Open preview` control by (message UUID, displayed filename).
+* Prefer the attachment-specific inline download control; fall back to the resource-card path.
+* Suppress previously persisted duplicate rows in the CLI picker, and clean up duplicate identities when the watcher reindexes a message.
+* Restore chat scroll position even after failed retrieval, including subsequent virtualized layout reflow.

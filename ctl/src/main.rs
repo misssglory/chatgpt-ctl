@@ -1081,6 +1081,12 @@ async fn browse_files(client: &Client, database_url: &str, chat: Option<&str>, c
            JOIN chats c ON c.id = f.chat_id
            LEFT JOIN messages m ON m.id::text = f.message_id
            WHERE ($1::uuid IS NULL OR f.chat_id = $1)
+             AND f.id = (SELECT other.id FROM chatgpt_watcher_files other
+                         WHERE other.chat_id = f.chat_id
+                           AND other.message_id IS NOT DISTINCT FROM f.message_id
+                           AND other.label = f.label
+                         ORDER BY (other.identity = concat(other.message_id, '|', other.label, '|0')) DESC,
+                                  other.id DESC LIMIT 1)
            ORDER BY COALESCE(m.completed_at, m.created_at, f.discovered_at) DESC,
                     f.message_order DESC NULLS LAST, f.position DESC, f.id DESC"#,
         &[&chat_id],

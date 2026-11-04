@@ -1,0 +1,13 @@
+import { readFileSync } from 'node:fs';
+import assert from 'node:assert/strict';
+const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+const cli = readFileSync(new URL('../ctl/src/main.rs', import.meta.url), 'utf8');
+assert(source.includes('const unique = new Map<string, ChatFile & { priority: number }>()'));
+assert(source.includes('identity: `${key}|0`'));
+assert(source.includes('unique.set(key, next)'));
+assert(source.includes('trying explicit download link'));
+assert(source.includes('invoked matching resource-card Download'));
+assert(source.includes('AND label = ${file.label} AND identity <> ${file.identity}'));
+assert(cli.includes('other.identity = concat(other.message_id'));
+assert(source.includes('setTimeout(restore, 650)'));
+console.log('v35 file identity and restoration regression checks passed');

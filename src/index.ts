@@ -12,7 +12,7 @@
 import { TOML } from "bun";
 import { chromium, type BrowserContext, type Download, type Page } from "playwright-core";
 import { Logger } from "tslog";
-import { access, constants, lstat, mkdir, mkdtemp, readdir, rename, rm, readFile, writeFile, open } from "node:fs/promises";
+import { access, constants, lstat, mkdir, mkdtemp, readdir, rename, rm, readFile, writeFile, open, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -1807,12 +1807,14 @@ async function findChatFiles(page: Page, messages: ScrapedMessage[]): Promise<Ch
     }
     const label = [download, aria, title, text].find((value) => /\.[A-Za-z\d]{1,10}(?:$|\s)/.test(value)) ||
       [aria, title, text, download].find(Boolean) || href || "file";
-    return { index, selector, messageId: messageId.toLowerCase() || null,
+    return { index, selector, aria, messageId: messageId.toLowerCase() || null,
       messageOrder, label: label.replace(/^Open\s+Download\s+/i, "").replace(/^Open\s+preview\s+of\s+/i, "").replace(/^Open\s+/i, "").trim().slice(0, 300),
       isCard, isDownload, testId };
   }).filter(Boolean));
-  const result: ChatFile[] = [];
-  const occurrences = new Map<string, number>();
+  // One attachment can be represented by an inline "Open Download" link AND
+  // a resource card with "Open preview" + "Download file" controls. Index the
+  // attachment, not its UI controls. Prefer its explicit download link.
+  const unique = new Map<string, ChatFile & { priority: number }>();
   for (const entry of observed) {
     if (!entry) continue;
     const owner = messages.find((m) => entry.messageId && m.id.toLowerCase() === entry.messageId) ||
@@ -1820,24 +1822,27 @@ async function findChatFiles(page: Page, messages: ScrapedMessage[]): Promise<Ch
     if (!owner || !["assistant", "user"].includes(owner.role)) continue;
     if (owner.role === "assistant" && !entry.isDownload) continue;
     if (owner.role === "user" && !entry.isCard && !entry.isDownload) continue;
-    // Ownership is determined from the enclosing message, not the filename.
     const role = owner.role as "assistant" | "user";
-    const rawLabel = entry.label.replace(/^Preview\s+/i, "").trim();
-    // Global DOM indices change when earlier messages mount or unmount.
-    // Use the occurrence number inside a stable message/label pair instead.
+    const rawLabel = entry.label.replace(/^Preview\s+/i, '').replace(/^Download\s+/i, '').trim();
+    // Generic card buttons are not attachment identities; their neighbouring
+    // named preview button already represents the actual file.
+    if (!rawLabel || /^(?:file|download|preview)$/i.test(rawLabel)) continue;
     const key = `${owner.id.toLowerCase()}|${rawLabel}`;
-    const occurrence = occurrences.get(key) ?? 0;
-    occurrences.set(key, occurrence + 1);
-    const identity = `${key}|${occurrence}`;
     const user = messages.filter((m) => m.role === "user" && m.sequence <= owner.sequence).at(-1);
-    result.push({
-      identity, label: rawLabel, role, messageId: owner.id.toLowerCase(),
+    const priority = /^Open\s+Download\s+/i.test((entry as any).aria || '') ? 4 :
+      /^Open\s+preview\s+of\s+/i.test((entry as any).aria || '') ? 2 :
+      entry.isDownload ? 3 : 1;
+    const next = {
+      identity: `${key}|0`, label: rawLabel, role, messageId: owner.id.toLowerCase(),
       messageOrder: entry.messageOrder ?? owner.turnOrder ?? null, position: entry.index,
       selector: entry.selector, index: entry.index,
-      userExcerpt: (owner.role === "user" ? owner.content : user?.content || "")
-        .replace(/\s+/g, " ").slice(0, 180),
-    });
+      userExcerpt: (owner.role === "user" ? owner.content : user?.content || '')
+        .replace(/\s+/g, ' ').slice(0, 180), priority,
+    };
+    const previous = unique.get(key);
+    if (!previous || priority > previous.priority) unique.set(key, next);
   }
+  const result: ChatFile[] = Array.from(unique.values()).map(({ priority: _priority, ...file }) => file);
   return result;
 }
 
@@ -1872,6 +1877,11 @@ async function indexChatFiles(sql: Sql, page: Page, chat: ScrapedChat): Promise<
        ON CONFLICT (chat_id, identity) DO UPDATE SET
          label = EXCLUDED.label, user_excerpt = EXCLUDED.user_excerpt,
          message_order = EXCLUDED.message_order, position = EXCLUDED.position`;
+    // Remove stale rows produced by earlier scans of the same attachment's
+    // inline link and preview card. Don't delete unseen historical attachments.
+    await sql`DELETE FROM chatgpt_watcher_files
+      WHERE chat_id = ${chat.id} AND message_id = ${file.messageId}
+        AND label = ${file.label} AND identity <> ${file.identity}`;
   }
   indexedFileSignatures.set(chat.id, signature);
 }
@@ -1914,57 +1924,110 @@ async function readFilePreview(viewer: Page, previousDialogs: number, isPopup: b
   }, { previousCount: previousDialogs, popup: isPopup }).catch(() => null);
 }
 
+/** Collect downloads across the originating chat and any preview popup. A download
+ * can be emitted *after* the click promise resolves or on a popup Page rather
+ * than the original conversation Page. Listeners stay active until retrieval
+ * finishes; short waitForEvent timeouts previously discarded successful files. */
+function watchAttachmentDownloads(page: Page) {
+  const context = page.context();
+  const downloads: Download[] = [];
+  const watched = new Set<Page>();
+  let wake: (() => void) | undefined;
+  const onDownload = (download: Download) => {
+    downloads.push(download);
+    wake?.();
+    wake = undefined;
+  };
+  const watch = (p: Page) => {
+    if (!watched.has(p)) {
+      watched.add(p);
+      p.on('download', onDownload);
+    }
+  };
+  for (const p of context.pages()) watch(p);
+  context.on('page', watch);
+  return {
+    async next(timeoutMs: number): Promise<Download | null> {
+      if (downloads.length) return downloads.shift()!;
+      await new Promise<void>(resolve => {
+        const timer = setTimeout(() => { if (wake === finish) wake = undefined; resolve(); }, timeoutMs);
+        const finish = () => { clearTimeout(timer); resolve(); };
+        wake = finish;
+      });
+      return downloads.shift() || null;
+    },
+    stop() {
+      context.off('page', watch);
+      for (const p of watched) p.off('download', onDownload);
+      wake?.();
+      wake = undefined;
+    },
+  };
+}
+
 /** Click an indexed attachment and retrieve the actual download or its text preview. */
 async function retrieveFileFromControl(page: Page, file: ChatFile, directory: string): Promise<string> {
   const locator = page.locator(file.selector).nth(file.index);
   const previewSelectors = '[role="dialog"], [data-radix-dialog-content], [data-testid*="file-preview"], [data-testid*="preview-panel"]';
   const dialogsBefore = await page.locator(previewSelectors).filter({ visible: true }).count();
   const existingPages = new Set(page.context().pages());
-  // Listen before clicking so downloads/popups cannot race the event listeners.
-  const directDownload = page.waitForEvent('download', { timeout: 1800 }).catch(() => null);
-  const popupPromise = page.context().waitForEvent('page', { timeout: 1800 }).catch(() => null);
-  await locator.click({ timeout: 5000 });
-  let download: Download | null = await directDownload;
-  const popup = await popupPromise;
-  const viewer = popup && !existingPages.has(popup) ? popup : page;
-  const isPopup = viewer !== page;
+  const collector = watchAttachmentDownloads(page);
+  let viewer = page;
   let previewOpened = false;
   try {
+    // Prefer the file-specific inline download link; a separate resource card
+    // may open a preview rather than download and must not be treated as a
+    // distinct file. Restrict matching to this message to avoid same-name files.
+    const messageSelector = file.messageId ? `[data-dil-message-id="${file.messageId}"]` : '';
+    const messageRegion = messageSelector ? page.locator(messageSelector).first() : page.locator('body');
+    const directLink = messageRegion.getByRole('link', {
+      name: `Open Download ${file.label}`, exact: true,
+    }).first();
+    const hasDirect = await directLink.count() > 0;
+    if (hasDirect) {
+      log.debug(`[files] trying explicit download link for '${file.label}'`);
+      await directLink.click({ timeout: 5000 }).catch(error =>
+        log.debug(`[files] inline download control click failed: ${String(error)}`));
+    } else await locator.click({ timeout: 5000 });
+    // First check downloads generated by the initial click. Do not assume a
+    // download event must arrive within 1800 ms to be legitimate.
+    let download = await collector.next(1100);
+    const popup = page.context().pages().find(p => !existingPages.has(p) && !p.isClosed());
+    if (popup) viewer = popup;
+    const isPopup = viewer !== page;
     const previewRoot = await openedFilePreviewRoot(viewer, isPopup ? 0 : dialogsBefore, isPopup);
     previewOpened = !!previewRoot;
     if (!download && previewRoot) {
-      // The preview toolbar might have its own Download action. It MUST be
-      // scoped to the preview root, never body or a random attachment card.
       const action = previewRoot.getByRole('button', { name: /^download(?: file)?$/i }).first();
       const link = previewRoot.getByRole('link', { name: /^download(?: file)?$/i }).first();
       const target = await action.isVisible().catch(() => false) ? action : link;
       if (await target.isVisible().catch(() => false)) {
-        const event = viewer.waitForEvent('download', { timeout: 2500 }).catch(() => null);
         try {
-          // ChatGPT sometimes places a transparent preview layer over toolbar
-          // elements; a force click avoids the intercepted-pointer timeout.
-          await target.click({ timeout: 1500, force: true });
-          download = await event;
+          await target.click({ timeout: 2000, force: true });
+          download = await collector.next(12_000);
         } catch (error) {
-          log.debug(`[files] preview Download control unavailable for '${file.label}': ${String(error)}`);
+          log.debug(`[files] preview Download click failed for '${file.label}': ${String(error)}`);
+          // A click can throw after starting a download; don't discard it.
+          download = await collector.next(1500);
         }
       }
     }
     if (!download && !isPopup) {
-      // The file card itself can expose a Download file button beneath its
-      // transparent "Open preview" overlay. Scope this to the SELECTED card:
-      // a page-wide button query can choose a different attachment entirely.
-      const cardDownload = locator.locator(
-        'xpath=ancestor::*[.//button[@aria-label="Download file"]][1]'
-      ).getByRole('button', { name: /^download(?: file)?$/i }).first();
-      if (await cardDownload.count() && await cardDownload.isVisible().catch(() => false)) {
-        const event = page.waitForEvent('download', { timeout: 2500 }).catch(() => null);
-        try {
-          await cardDownload.click({ timeout: 1500, force: true });
-          download = await event;
-        } catch (error) {
-          log.debug(`[files] file-card Download unavailable for '${file.label}': ${String(error)}`);
-        }
+      // A resource card has a full-size transparent preview overlay over its
+      // toolbar. Resolve the card by exact filename, then dispatch the toolbar
+      // button directly in the browser DOM to avoid Playwright hit-test races.
+      const cardWasClicked = await page.evaluate((name) => {
+        const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>('button[aria-label^="Open preview of "]'));
+        const preview = buttons.find(button => button.getAttribute('aria-label') === `Open preview of ${name}`);
+        const row = preview?.parentElement;
+        const target = row?.querySelector<HTMLButtonElement>('button[aria-label="Download file"]');
+        if (!target || target.disabled) return false;
+        target.click();
+        return true;
+      }, file.label).catch(() => false);
+      if (cardWasClicked) {
+        log.debug(`[files] invoked matching resource-card Download for '${file.label}'`);
+        download = await collector.next(12_000);
       }
     }
     await mkdir(directory, { recursive: true });
@@ -1973,28 +2036,35 @@ async function retrieveFileFromControl(page: Page, file: ChatFile, directory: st
       const dest = path.join(directory, filename);
       return existsSync(dest) ? path.join(directory, `${crypto.randomUUID().slice(0, 8)}-${filename}`) : dest;
     };
-    if (download) {
-      const target = chooseTarget(download.suggestedFilename() || file.label);
-      await download.saveAs(target);
-      log.info(`[files] downloaded chat-file name='${file.label}' path=${target}`);
+    const save = async (event: Download) => {
+      const target = chooseTarget(event.suggestedFilename() || file.label);
+      await event.saveAs(target); // Wait for completed bytes, not just click.
+      const info = await stat(target);
+      if (!info.isFile()) throw new Error(`download target is not a file: ${target}`);
+      log.info(`[files] downloaded chat-file name='${file.label}' path=${target} bytes=${info.size}`);
       return target;
-    }
-    // If ChatGPT provided code/text rather than a file download, save the
-    // preview contents. This also recovers a blocked/unavailable Download button.
+    };
+    if (download) return await save(download);
     const text = await readFilePreview(viewer, isPopup ? 0 : dialogsBefore, isPopup);
     if (text !== null) {
+      // A late download still takes precedence over a text approximation.
+      download = await collector.next(350);
+      if (download) return await save(download);
       const label = /\.[a-z\d]{1,12}$/i.test(file.label) ? file.label : `${file.label}.txt`;
       const target = chooseTarget(label);
       await writeFile(target, text, 'utf8');
       log.info(`[files] saved preview text name='${file.label}' path=${target} chars=${text.length}`);
       return target;
     }
-    throw new Error(`'${file.label}' yielded neither a browser download nor readable file preview`);
+    // Some preview/download controls dispatch the event asynchronously while
+    // the browser itself has already begun saving the attachment.
+    download = await collector.next(5000);
+    if (download) return await save(download);
+    throw new Error(`'${file.label}' yielded neither a captured browser download nor readable file preview`);
   } finally {
-    if (isPopup) await viewer.close().catch(() => {});
+    collector.stop();
+    if (viewer !== page) await viewer.close().catch(() => {});
     else if (previewOpened) {
-      // Dismiss the preview even if downloading/reading failed, allowing the
-      // outer caller to restore its conversation scroll position in finally.
       const active = await openedFilePreviewRoot(page, dialogsBefore, false);
       const close = active?.getByRole('button', { name: /close|dismiss/i }).first();
       if (close && await close.isVisible().catch(() => false)) {
@@ -2099,7 +2169,10 @@ async function downloadChatFile(page: Page, expectedChatId: string, identity: st
   // Restore in finally even if a download, preview or history search fails.
   await page.evaluate(() => {
     const root = document.querySelector('main');
-    const elements = [document.scrollingElement, root, ...Array.from(root?.querySelectorAll('*') || [])]
+    const message = document.querySelector('[data-chatgpt-search-message-ids]');
+    const ancestors: Element[] = [];
+    for (let el = message?.parentElement; el; el = el.parentElement) ancestors.push(el);
+    const elements = [document.scrollingElement, ...ancestors, root, ...Array.from(root?.querySelectorAll('*') || [])]
       .filter((el): el is Element => !!el);
     const state = elements.filter(el => (el as HTMLElement).scrollHeight > (el as HTMLElement).clientHeight + 100)
       .map(el => ({ element: el, top: (el as HTMLElement).scrollTop,
@@ -2116,7 +2189,12 @@ async function downloadChatFile(page: Page, expectedChatId: string, identity: st
       const store = window as unknown as { __ctlFileScrollState?: Array<{ element: Element; top: number; nearBottom: boolean }> };
       for (const position of store.__ctlFileScrollState || []) {
         const el = position.element as HTMLElement;
-        if (el?.isConnected) el.scrollTop = position.nearBottom ? el.scrollHeight : position.top;
+        if (!el?.isConnected) continue;
+        const restore = () => { if (el.isConnected) el.scrollTop = position.nearBottom ? el.scrollHeight : position.top; };
+        restore();
+        // Virtualized thread content can reflow after the first restoration.
+        // Reapply only for elements originally near the bottom.
+        if (position.nearBottom) { setTimeout(restore, 200); setTimeout(restore, 650); }
       }
       delete store.__ctlFileScrollState;
     }).catch(() => {});

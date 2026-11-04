@@ -1,0 +1,12 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+assert.match(source, /function watchAttachmentDownloads\(page: Page\)/);
+assert.match(source, /context\.on\('page', watch\)/);
+assert.match(source, /p\.on\('download', onDownload\)/);
+assert.match(source, /collector\.next\(12_000\)/);
+assert.match(source, /await event\.saveAs\(target\)/);
+assert.match(source, /await stat\(target\)/);
+assert.match(source, /collector\.stop\(\)/);
+assert.doesNotMatch(source, /page\.waitForEvent\('download', \{ timeout: 1800 \}\)/);
+console.log('v34 attachment download listener regression checks passed');
