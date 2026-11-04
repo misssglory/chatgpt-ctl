@@ -860,7 +860,7 @@ async function upsertSidebarChats(sql: Sql, chats: SidebarChat[], browserName = 
  * RETURNING clause identifies that transition for this statement only; unlike
  * comparing it with first_seen_at, the condition cannot stay true forever.
  */
-async function upsertMessage(sql: Sql, chatId: string, msg: ScrapedMessage): Promise<"inserted" | "updated" | "completed"> {
+async function upsertMessage(sql: Sql, chatId: string, msg: ScrapedMessage, reindexSequence = false): Promise<"inserted" | "updated" | "completed"> {
   const mid = normalizeUuid(msg.id);
   const cid = normalizeUuid(chatId);
   if (!mid || !cid) {
@@ -881,7 +881,7 @@ async function upsertMessage(sql: Sql, chatId: string, msg: ScrapedMessage): Pro
     )
     ON CONFLICT (id) DO UPDATE SET
       content = EXCLUDED.content,
-      sequence = EXCLUDED.sequence,
+      sequence = CASE WHEN ${reindexSequence} THEN EXCLUDED.sequence ELSE messages.sequence END,
       completed = messages.completed OR EXCLUDED.completed,
       completed_at = CASE
         WHEN messages.completed = false AND EXCLUDED.completed = true THEN statement_timestamp()
@@ -890,7 +890,7 @@ async function upsertMessage(sql: Sql, chatId: string, msg: ScrapedMessage): Pro
     -- Avoid touching the same completed history rows on every poll. This also
     -- prevents needless WAL/index churn for long conversations.
     WHERE messages.content IS DISTINCT FROM EXCLUDED.content
-       OR messages.sequence IS DISTINCT FROM EXCLUDED.sequence
+       OR (${reindexSequence} AND messages.sequence IS DISTINCT FROM EXCLUDED.sequence)
        OR (messages.completed = false AND EXCLUDED.completed = true)
     RETURNING
       (xmax = 0) AS inserted,
@@ -1202,6 +1202,27 @@ async function scrapeCurrentChat(page: Page): Promise<ScrapedChat | null> {
       );
       const candidate = (role === "user" ? preWrap || bubble : markdown || preWrap) || node;
       content = (candidate.textContent || "").trim();
+      // ChatGPT renders fenced code as a visual CodeBlock (pre > code), not
+      // literal Markdown fences. Persist the exact code and its language in
+      // a machine-readable form so the PostgreSQL/Ratatui code tab can find it.
+      // Exclude non-code "pre" decorations and do not serialize toolbar text.
+      const blocks: string[] = [];
+      for (const code of Array.from(candidate.querySelectorAll('pre > code'))) {
+        const pre = code.parentElement;
+        if (!pre) continue;
+        const value = (code.textContent || '').replace(/\r\n/g, '\n').trimEnd();
+        if (!value) continue;
+        const pane = pre.closest('[class*="InlineCodePane"], [class*="CodeBlock"], [class*="code-block"]')?.parentElement?.parentElement || pre.parentElement;
+        const header = pane?.querySelector('[class*="ActionBar"] [class*="truncate"], [data-code-language]');
+        const hint = header?.getAttribute('data-code-language') || header?.textContent ||
+          Array.from(code.classList).find(x => x.startsWith('language-'))?.replace(/^language-/, '') || '';
+        const language = hint.trim().toLowerCase().replace(/[^a-z0-9+#._-]/g, '').slice(0, 32);
+        // Delimiter length > longest backtick run found in code.
+        const longest = Math.max(3, ...Array.from(value.matchAll(/`+/g), m => m[0].length + 1));
+        const fence = '`'.repeat(longest);
+        blocks.push(`${fence}${language}\n${value}\n${fence}`);
+      }
+      if (blocks.length) content += '\n\n' + blocks.join('\n\n');
 
       // Drop UI chrome noise that often prefixes assistant blocks
       content = content.replace(/^ChatGPT said:\s*/i, "").trim();
@@ -1518,7 +1539,7 @@ async function dump(cfg: Config, configPath: string) {
     log.info(`[dump] chat=${chat.id} title="${chat.title}" messages=${chat.messages.length}`);
     await upsertChat(sql, chat);
     for (const msg of chat.messages) {
-      const status = await upsertMessage(sql, chat.id, msg);
+      const status = await upsertMessage(sql, chat.id, msg, reindexSequence);
       log.info(
         `[dump] ${status} ${msg.role} seq=${msg.sequence} id=${msg.id.slice(0, 8)}… ` +
           `completed=${msg.completed} chars=${msg.content.length}`
@@ -1530,7 +1551,7 @@ async function dump(cfg: Config, configPath: string) {
   }
 }
 
-async function persistChat(sql: Sql, chat: ScrapedChat, settleMs: number, prevIncomplete: Map<string, number>, browserName = "default"): Promise<Set<string>> {
+async function persistChat(sql: Sql, chat: ScrapedChat, settleMs: number, prevIncomplete: Map<string, number>, browserName = "default", reindexSequence = false): Promise<Set<string>> {
   await upsertChat(sql, chat, browserName);
   const newlyCompletedAssistantMessages = new Set<string>();
   for (const msg of chat.messages) {
@@ -1548,7 +1569,7 @@ async function persistChat(sql: Sql, chat: ScrapedChat, settleMs: number, prevIn
       prevIncomplete.delete(msg.id);
     }
 
-    const status = await upsertMessage(sql, chat.id, msg);
+    const status = await upsertMessage(sql, chat.id, msg, reindexSequence);
     if (msg.role === "assistant" && msg.completed && (status === "inserted" || status === "completed")) {
       newlyCompletedAssistantMessages.add(msg.id);
     }
@@ -2108,6 +2129,18 @@ async function scrollChatHistoryUp(page: Page): Promise<{ moved: boolean; top: b
 /** A read-only file traversal must never be interpreted as a new ZIP event. */
 const pagesReadingAttachmentHistory = new WeakSet<Page>();
 
+/**
+ * A rescan discovers historical assistant ZIPs, sometimes across multiple
+ * virtualized DOM windows. Never interpret any of those files as new output.
+ *
+ * Page-level suppression ends when scrolling finishes; chat-level quarantine
+ * deliberately survives it until an actual NEW user message is observed.
+ * The Set contains IDs of every user message seen during that rescan, so a
+ * window changing to an older user message cannot release the quarantine.
+ * An empty Set means the rescan is still running (fail closed).
+ */
+const rescanHookQuarantine = new Map<string, Set<string>>();
+
 /** Recover an indexed link from ChatGPT's virtualized history. */
 async function findIndexedFileInHistory(page: Page, chatId: string, identity: string): Promise<ChatFile | null> {
   const scan = async (): Promise<ChatFile | null> => {
@@ -2200,6 +2233,93 @@ async function downloadChatFile(page: Page, expectedChatId: string, identity: st
     }).catch(() => {});
   }
   } finally {
+    pagesReadingAttachmentHistory.delete(page);
+  }
+}
+
+/** Refresh a chat's complete history, including code and attachments.
+ * Do not fire ZIP hooks: scrolling is for historical reads, not new output.
+ * Accumulate mounted message windows before updating sequence numbers.
+ */
+async function rescanChatHistory(sql: Sql, page: Page, chatId: string, browserName: string): Promise<{messages: number; files: number; steps: number}> {
+  pagesReadingAttachmentHistory.add(page);
+  await page.evaluate(() => {
+    const msg = document.querySelector('[data-chatgpt-search-message-ids]');
+    const ancestors: Element[] = [];
+    for (let e = msg?.parentElement; e; e = e.parentElement) ancestors.push(e);
+    const state = [document.scrollingElement, ...ancestors].filter((e): e is Element => !!e)
+      .filter(e => (e as HTMLElement).scrollHeight > (e as HTMLElement).clientHeight + 40)
+      .map(e => ({el: e, top: (e as HTMLElement).scrollTop,
+        bottom: (e as HTMLElement).scrollHeight - (e as HTMLElement).clientHeight - (e as HTMLElement).scrollTop < 100}));
+    (window as any).__ctlRescanScrollState = state;
+  });
+  try {
+    const seen = new Map<string, ScrapedMessage>();
+    const orderedIds: string[] = [];
+    const allFiles = new Map<string, ChatFile>();
+    let steps = 0;
+    let stagnant = 0;
+    let lastCount = -1;
+    for (let i = 0; i <= 180; i++) {
+      const chat = await scrapeCurrentChat(page);
+      if (!chat || chat.id !== chatId) throw new Error(`rescan chat mismatch: expected ${chatId}, got ${chat?.id}`);
+      // Current window is chronologically ordered. New older messages go in
+      // front; already-seen message IDs retain their relative position.
+      const fresh = chat.messages.filter(m => !seen.has(m.id));
+      orderedIds.unshift(...fresh.map(m => m.id));
+      for (const m of chat.messages) seen.set(m.id, m);
+      for (const f of await findChatFiles(page, chat.messages)) allFiles.set(f.identity, f);
+      if (i === 180) break;
+      const moved = await scrollChatHistoryUp(page);
+      steps++;
+      log.debug(`[rescan] chat=${chatId} step=${steps} scroller=${moved.kind} top=${moved.before}->${moved.after} moved=${moved.moved} messages=${seen.size} files=${allFiles.size}`);
+      if (!moved.moved) {
+        const element = page.locator('[data-chatgpt-search-message-ids]:visible').first();
+        const box = await element.boundingBox().catch(() => null);
+        if (box) {
+          await page.mouse.move(box.x + Math.min(box.width / 2, 80), box.y + Math.min(box.height / 2, 40));
+          await page.mouse.wheel(0, -700);
+        }
+      }
+      await page.waitForTimeout(moved.moved ? 350 : 700);
+      if (moved.top || !moved.moved) {
+        if (seen.size === lastCount) stagnant++; else stagnant = 0;
+      } else stagnant = 0;
+      lastCount = seen.size;
+      if (stagnant >= 6) break;
+    }
+    // Stable normalized order across all virtualized windows, not per-window seq.
+    const messages = orderedIds.map(id => seen.get(id)!).filter(Boolean);
+    const snapshot = await scrapeCurrentChat(page);
+    if (!snapshot) throw new Error('chat unloaded during rescan');
+    const complete: ScrapedChat = { ...snapshot, messages: messages.map((m, sequence) => ({...m, sequence})) };
+    await persistChat(sql, complete, 0, new Map(), browserName, true);
+    // Persist all observed file windows, even those now unmounted from the DOM.
+    for (const file of allFiles.values()) {
+      await sql`INSERT INTO chatgpt_watcher_files
+        (chat_id, identity, role, label, message_id, message_order, position, user_excerpt)
+        VALUES (${chatId}, ${file.identity}, ${file.role}, ${file.label}, ${file.messageId},
+          ${file.messageOrder}, ${file.position}, ${file.userExcerpt})
+        ON CONFLICT (chat_id, identity) DO UPDATE SET
+          label=EXCLUDED.label, user_excerpt=EXCLUDED.user_excerpt,
+          message_order=EXCLUDED.message_order, position=EXCLUDED.position`;
+    }
+    // Arm the post-rescan hook barrier BEFORE lifting the page-level guard.
+    // A regular watcher poll may run as soon as this method returns.
+    rescanHookQuarantine.set(chatId, new Set(messages.filter(m => m.role === "user").map(m => m.id)));
+    log.info(`[rescan] complete chat=${chatId} messages=${messages.length} files=${allFiles.size} steps=${steps}; automatic ZIP hooks quarantined until a NEW user turn`);
+    return { messages: messages.length, files: allFiles.size, steps };
+  } finally {
+    await page.evaluate(() => {
+      const state = (window as any).__ctlRescanScrollState || [];
+      for (const p of state as Array<{el: HTMLElement; top: number; bottom: boolean}>) {
+        if (!p.el?.isConnected) continue;
+        const set = () => { if (p.el.isConnected) p.el.scrollTop = p.bottom ? p.el.scrollHeight : p.top; };
+        set();
+        if (p.bottom) { setTimeout(set, 250); setTimeout(set, 800); }
+      }
+      delete (window as any).__ctlRescanScrollState;
+    }).catch(() => {});
     pagesReadingAttachmentHistory.delete(page);
   }
 }
@@ -2762,6 +2882,36 @@ function startControlServer(
           chat_id?: string; message_id?: string; chat?: string; directory?: string; extract_to?: string; identity?: string;
           text?: string; files?: string[]; new_chat?: boolean; draft?: boolean;
         };
+        if (url.pathname === "/rescan") {
+          const requestedId = body.chat_id ? normalizeUuid(body.chat_id) : null;
+          if (body.chat_id && !requestedId) return Response.json({error: 'invalid chat_id'}, {status: 400});
+          const existing = requestedId
+            ? openConversationPages(runtimes).find(item => item.chatId === requestedId)
+            : (() => { try { return getVirtualFocus(focus, runtimes); } catch { return undefined; } })();
+          const chatId = requestedId ?? existing?.chatId;
+          if (!chatId) return Response.json({error:'no chat selected or under virtual focus'}, {status:404});
+          // Guard by chat, not just by page: a poll already in flight, or the
+          // first poll after traversal, must never apply historical archives.
+          rescanHookQuarantine.set(chatId, new Set());
+          const runtime = existing?.runtime ?? await ensureRuntimeForChat(chatId);
+          const temporary = !existing;
+          const page = existing?.page ?? await runtime.context.newPage();
+          try {
+            if (temporary) {
+              configurePage(page,cfg);
+              await page.goto(new URL(`/c/${chatId}`, cfg.chatgpt.url).toString(), {
+                waitUntil:'domcontentloaded', timeout:cfg.browser?.navigation_timeout_ms ?? 45_000
+              });
+              // Suppress hooks before any historical navigation.
+              pagesReadingAttachmentHistory.add(page);
+              await waitForConversationReady(page,chatId,cfg.browser?.navigation_timeout_ms ?? 45_000);
+            }
+            const stats = await rescanChatHistory(sql,page,chatId,runtime.name);
+            return Response.json({ok:true,chat_id:chatId,...stats});
+          } finally {
+            if (temporary) { pagesReadingAttachmentHistory.delete(page); await page.close().catch(() => {}); }
+          }
+        }
         if (url.pathname === "/html") {
           const requestedId = body.chat_id ? normalizeUuid(body.chat_id) : null;
           if (body.chat_id && !requestedId) return Response.json({ error: "invalid chat_id" }, { status: 400 });
@@ -3392,6 +3542,40 @@ async function watch(cfg: Config, configPath: string) {
             const hook = await loadChatHook(sql, chat.id);
             const hookWasInitialized = initializedHookChats.has(chat.id);
             await recordChatBrowser(sql, chat.id, runtime.name);
+            // Historical scans own their DB refresh and must not race the
+            // regular polling path with partial virtualized message windows.
+            if (pagesReadingAttachmentHistory.has(page)) {
+              log.debug(`[watch] skipping ordinary persistence/hooks during history read chat=${chat.id}`);
+              return;
+            }
+            // Rescan is a read-only maintenance operation. Its newly mounted
+            // old ZIPs must not run hooks once the scroll operation finishes.
+            // Do not lift the barrier simply because the visible DOM changes:
+            // virtualized history can reveal an older user turn instead.
+            const quarantinedUserIds = rescanHookQuarantine.get(chat.id);
+            if (quarantinedUserIds) {
+              const genuinelyNewUser = quarantinedUserIds.size > 0 && chat.messages.some(
+                m => m.role === "user" && !quarantinedUserIds.has(m.id)
+              );
+              if (!genuinelyNewUser) {
+                log.debug(`[hook] rescan quarantine chat=${chat.id}; historical ZIPs are never auto-applied`);
+                return;
+              }
+              // A genuinely new user request starts the next generation epoch.
+              // Rebaseline at the currently visible assistant turn so that an
+              // old ZIP is not incorrectly eligible on this transition poll.
+              const visibleTargets = await findZipTargets(page);
+              for (const target of assistantZipTargets(visibleTargets, chat.messages)) {
+                handledHookDownloads.add(`${chat.id}:${target.identity}`);
+              }
+              baselineAssistantTurnByChat.set(chat.id,
+                latestAssistantFromMessages(chat.messages)?.turnOrder ?? null);
+              pendingHookMessages.delete(chat.id);
+              initializedHookChats.add(chat.id);
+              rescanHookQuarantine.delete(chat.id);
+              log.info(`[hook] rescan quarantine released on new user turn chat=${chat.id}; ZIP baseline refreshed`);
+              return;
+            }
             const newAssistantMessages = await persistChat(sql, chat, settleMs, prevIncomplete, runtime.name);
             await indexChatFiles(sql, page, chat);
 
@@ -3493,7 +3677,7 @@ async function watch(cfg: Config, configPath: string) {
                   new Set(associated.filter((target) => handledHookDownloads.has(`${chat.id}:${target.identity}`)).map((target) => target.identity)),
                   savedCursor?.targetIdentity
                 );
-                if (unseen.length && !activeHookChats.has(chat.id)) {
+                if (unseen.length && !activeHookChats.has(chat.id) && !rescanHookQuarantine.has(chat.id)) {
                     const newest = unseen[0]!;
                     const hookKey = `${chat.id}:${newest.identity}`;
                     if (!handledHookDownloads.has(hookKey)) {
@@ -3521,6 +3705,10 @@ async function watch(cfg: Config, configPath: string) {
                       // Older or non-ZIP candidates are not retried every scan;
                       // subsequent newly generated attachments remain eligible.
                       log.info(`[hook] new ZIP in open pane chat=${chat.id} browser=${runtime.name} (virtual focus unchanged)`);
+                      if (rescanHookQuarantine.has(chat.id)) {
+                        log.warn(`[hook] discarded auto ZIP after rescan began chat=${chat.id}; refusing historical build`);
+                        return;
+                      }
                       await runHookForZip(page, chat.id, hook, archive, configPath);
                     } catch (hookError) {
                       log.error(`[hook] chat=${chat.id} failed: ${formatError(hookError)}`);

@@ -936,3 +936,17 @@ Code tab indexes Markdown fenced code (backtick or tilde fences) from user and a
 ## v0.1.37 — Rust build fix
 
 Moved the `mod watch;` declaration below the crate-level `//!` documentation in `ctl/src/main.rs`. This resolves `E0753: expected outer doc comment` when building v0.1.36. No intended behavior changes to `ctl watch`.
+
+
+## v0.1.38 — rescan and code highlighting
+
+`ctl rescan` (or `ctl rescan -c CHAT`) revisits the selected conversation,
+loading historical windows incrementally, and refreshes PostgreSQL messages
+and file records without triggering ZIP hooks. Existing browser scroll is
+restored on exit. `ctl watch` now recognizes actual ChatGPT `<pre><code>`
+blocks persisted as fenced code with language labels and highlights common
+Rust/Bash/Python/JS syntax in the Code tab.
+
+## v0.1.39 — rescan must never run historical ZIP hooks
+
+`ctl rescan` now quarantines automatic hooks **by chat**, before navigation begins and after the history walk completes. Page-level scrolling suppression alone was insufficient: the regular poll reclassified older ZIP controls as fresh as soon as the scan ended. The quarantine survives until a user sends a genuinely new message (not merely an older virtualized DOM window becoming visible). On release, the watcher rebases ZIP identities and ignores that transition poll. Explicit `ctl hook run` remains available. A guard is also checked immediately before an in-flight automatic build.

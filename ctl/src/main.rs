@@ -144,6 +144,16 @@ enum Commands {
         interval_ms: u64,
     },
 
+    /// Refresh persisted questions, answers, code blocks and files from a chat's history.
+    Rescan {
+        /// Chat UUID/title/live pane index; defaults to virtual focus
+        #[arg(allow_hyphen_values = true, conflicts_with = "chat_option")]
+        chat: Option<String>,
+        /// Explicit chat selector (negative pane indices supported)
+        #[arg(short = 'c', long = "chat", value_name = "CHAT", allow_hyphen_values = true, conflicts_with = "chat")]
+        chat_option: Option<String>,
+    },
+
     /// Browse persisted questions/answers and code blocks in a Ratatui interface.
     Watch {
         /// Chat UUID/title/live pane index; defaults to virtual focus
@@ -329,7 +339,7 @@ fi
 # Supply UUID candidates (with titles as descriptions) for chat-taking args.
 local _ctl_wants_chat=0
 case "${words[2]:-}" in
-  open|watch|html)
+  open|watch|rescan|html)
     if (( CURRENT == 3 )) && [[ "${PREFIX}" != -* ]]; then
       _ctl_wants_chat=1
     elif (( CURRENT > 2 )) && [[ "${words[CURRENT-1]:-}" == (-c|--chat) ]]; then
@@ -412,7 +422,7 @@ _chatgpt_ctl_dynamic() {
   local root="${COMP_WORDS[1]:-}" sub="${COMP_WORDS[2]:-}"
   local wants_chat=0
   case "$root" in
-    open|watch|html)
+    open|watch|rescan|html)
       if (( COMP_CWORD == 2 )) && [[ "$cur" != -* ]]; then wants_chat=1; fi
       if [[ "$prev" == "-c" || "$prev" == "--chat" ]]; then wants_chat=1; fi
       ;;
@@ -1336,6 +1346,18 @@ async fn main() -> Result<()> {
                 generate(shell, &mut cmd, "chatgpt-ctl", &mut io::stdout());
             }
             return Ok(());
+        }
+        Commands::Rescan { chat, chat_option } => {
+            let chat_id = match chat_option.or(chat) {
+                Some(spec) => resolve_live_chat_selector(&url, &spec).await?,
+                None => watcher_status().1.context("ctl rescan: no chat under virtual focus; use -c CHAT")?,
+            };
+            let payload = serde_json::json!({"chat_id": chat_id.to_string()}).to_string();
+            let response = watcher_request("POST", "/rescan", Some(&payload))?;
+            let value: serde_json::Value = serde_json::from_str(&response)?;
+            println!("Rescanned {}: {} messages, {} files, {} history steps",
+                chat_id, value["messages"].as_u64().unwrap_or(0),
+                value["files"].as_u64().unwrap_or(0), value["steps"].as_u64().unwrap_or(0));
         }
         Commands::Watch { chat, chat_option } => {
             let chat_id = match chat_option.or(chat) {

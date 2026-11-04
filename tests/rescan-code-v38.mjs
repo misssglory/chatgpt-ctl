@@ -1,0 +1,18 @@
+import {readFileSync} from 'node:fs';
+import assert from 'node:assert/strict';
+const root = new URL('../',import.meta.url);
+const source=readFileSync(new URL('src/index.ts',root),'utf8');
+const cli=readFileSync(new URL('ctl/src/main.rs',root),'utf8');
+const tui=readFileSync(new URL('ctl/src/watch.rs',root),'utf8');
+assert.match(source,/querySelectorAll\('pre > code'\)/);
+assert.match(source,/\[class\*="ActionBar"\] \[class\*="truncate"\]/);
+assert.match(source,/blocks\.push\(`\$\{fence\}\$\{language\}/);
+assert.match(source,/url\.pathname === "\/rescan"/);
+assert.match(source,/pagesReadingAttachmentHistory\.add\(page\)/);
+assert.match(source,/await persistChat\(sql, complete, 0, new Map\(\), browserName, true\)/);
+assert.match(source,/__ctlRescanScrollState/);
+assert.match(cli,/Rescan \{/);
+assert.match(cli,/Commands::Rescan/);
+assert.match(tui,/fn syntax_line\(/);
+assert.match(tui,/syntax_line\(line,&b.language/);
+console.log('rescan and code-block regression checks passed');

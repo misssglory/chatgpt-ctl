@@ -101,6 +101,73 @@ fn emphasis(text: &str, query: &str, max_chars: usize) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Lightweight syntax coloring for common code panes; fuzzy match positions
+/// remain the highest priority visual cue. No new lexer dependencies needed.
+fn syntax_line(source: &str, lang: &str, query: &str, max_chars: usize) -> Line<'static> {
+    let chars: Vec<char> = source.chars().collect();
+    let matches = fuzzy_positions(source, query).map(|(_,p)|p).unwrap_or_default();
+    let first = matches.first().copied().unwrap_or(0);
+    let start = if first >= max_chars { first.saturating_sub(max_chars / 3) } else { 0 };
+    let end = chars.len().min(start + max_chars);
+    let rust = matches!(lang, "rust" | "rs");
+    let shell = matches!(lang, "bash" | "sh" | "shell" | "zsh" | "nix");
+    let python = matches!(lang, "python" | "py");
+    let js = matches!(lang, "javascript" | "js" | "typescript" | "ts" | "tsx" | "jsx");
+    let keywords: &[&str] = if rust { &[
+        "fn","let","mut","pub","use","impl","struct","enum","match","if","else","for","while","loop","return","async","await","self","Self","trait","mod","const","static","true","false","Some","None","Ok","Err","where","in","move","ref"]
+    } else if shell { &["if","then","fi","for","while","do","done","case","esac","function","export","local","return","in","source","echo","sudo"]
+    } else if python { &["def","class","import","from","if","elif","else","for","while","return","async","await","with","as","try","except","None","True","False","lambda","yield","in"]
+    } else if js { &["const","let","var","function","class","return","if","else","for","while","await","async","import","export","from","true","false","null","undefined","new","this"]
+    } else { &[] };
+    let mut spans = Vec::new();
+    if start > 0 { spans.push(Span::raw("…")); }
+    let mut i = start;
+    while i < end {
+        let c=chars[i];
+        let comment = c == '#' && (shell || python) || c == '/' && i+1 < chars.len() && chars[i+1] == '/' && (rust || js);
+        if comment {
+            let mut j=i;
+            while j<end { j+=1; }
+            for k in i..j {
+                let style = if matches.contains(&k) {Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)}
+                    else {Style::default().fg(Color::DarkGray)};
+                spans.push(Span::styled(chars[k].to_string(),style));
+            }
+            i=j;
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            let q=c; let mut j=i+1;let mut escaped=false;
+            while j<end {if chars[j]==q && !escaped {j+=1;break;}if chars[j]=='\\' {escaped=!escaped;}else{escaped=false;}j+=1;}
+            for k in i..j {
+                let style=if matches.contains(&k){Style::default().fg(Color::Black).bg(Color::Yellow)}else{Style::default().fg(Color::Green)};
+                spans.push(Span::styled(chars[k].to_string(),style));
+            }
+            i=j;continue;
+        }
+        if c.is_alphanumeric() || c=='_' {
+            let mut j=i+1;
+            while j<end && (chars[j].is_alphanumeric() || chars[j]=='_') {j+=1;}
+            let token: String=chars[i..j].iter().collect();
+            let foreground=if keywords.contains(&token.as_str()) {Color::Magenta}
+                else if token.chars().next().is_some_and(|v|v.is_ascii_digit()){Color::Yellow}
+                else if j<chars.len() && chars[j]=='(' {Color::Cyan}
+                else {Color::Reset};
+            for k in i..j {
+                let style=if matches.contains(&k){Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)}
+                    else {Style::default().fg(foreground)};
+                spans.push(Span::styled(chars[k].to_string(),style));
+            }
+            i=j;continue;
+        }
+        let style=if matches.contains(&i){Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)}
+            else{Style::default()};
+        spans.push(Span::styled(c.to_string(),style));i+=1;
+    }
+    if end<chars.len(){spans.push(Span::raw("…"));}
+    Line::from(spans)
+}
+
 fn matches_question(turn: &Turn, query: &str) -> Option<i64> {
     let q = fuzzy_positions(&turn.question, query).map(|(s, _)| s);
     let a = fuzzy_positions(&turn.answers, query).map(|(s, _)| s);
@@ -211,7 +278,7 @@ fn draw(frame: &mut ratatui::Frame, m: &Model) {
             let mut shown=0;
             for line in b.body.lines() {
                 if shown >= 4 { break; }
-                lines.push(emphasis(line,&m.query,display_width));
+                lines.push(syntax_line(line,&b.language,&m.query,display_width));
                 shown+=1;
             }
             if b.body.lines().count()>shown {lines.push(Line::raw("…"));}
@@ -292,6 +359,10 @@ mod tests {
     #[test] fn fuzzy_matches_subsequence() {
         assert!(fuzzy_positions("hello world","hwd").is_some());
         assert!(fuzzy_positions("hello world","hzz").is_none());
+    }
+    #[test] fn syntax_rust_and_bash() {
+        assert!(!syntax_line("fn main() { println!(\"ok\"); }", "rust", "main", 90).spans.is_empty());
+        assert!(!syntax_line("echo hello # comment", "bash", "echo", 90).spans.is_empty());
     }
     #[test] fn extracts_multiple_code_blocks() {
         assert_eq!(extract_code("```rust\nfn main() {}\n```\n~~~bash\necho hi\n~~~").len(),2);
