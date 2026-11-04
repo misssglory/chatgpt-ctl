@@ -223,6 +223,12 @@ struct Model {
     tab: Tab,
     query: String,
     searching: bool,
+    cursor: usize, // Unicode-character index within query
+    search_history: Vec<String>,
+    history_index: Option<usize>,
+    history_draft: String,
+    viewer: bool,
+    viewer_scroll: usize,
     index: usize,
     status: String,
     questions: Vec<Turn>,
@@ -244,17 +250,131 @@ impl Model {
     }}
     fn clamp(&mut self) { self.index = self.index.min(self.count().saturating_sub(1)); }
     fn change_tab(&mut self) { self.tab = if self.tab == Tab::Questions {Tab::Code} else {Tab::Questions}; self.index=0; }
+    fn set_query(&mut self, value: String) {
+        self.query = value;
+        self.cursor = self.query.chars().count();
+        self.index = 0;
+    }
+    fn insert_query(&mut self, c: char) {
+        let byte = self.query.char_indices().nth(self.cursor).map(|(i,_)|i).unwrap_or(self.query.len());
+        self.query.insert(byte,c);
+        self.cursor += 1;
+        self.index = 0;
+        self.history_index = None;
+    }
+    fn erase_before_cursor(&mut self) {
+        if self.cursor == 0 { return; }
+        let end = self.query.char_indices().nth(self.cursor).map(|(i,_)|i).unwrap_or(self.query.len());
+        let start = self.query.char_indices().nth(self.cursor-1).map(|(i,_)|i).unwrap_or(0);
+        self.query.replace_range(start..end, "");
+        self.cursor -= 1;
+        self.index = 0;
+        self.history_index = None;
+    }
+    fn erase_at_cursor(&mut self) {
+        let Some((start,_)) = self.query.char_indices().nth(self.cursor) else {return};
+        let end = self.query.char_indices().nth(self.cursor+1).map(|(i,_)|i).unwrap_or(self.query.len());
+        self.query.replace_range(start..end, "");
+        self.index = 0;
+        self.history_index = None;
+    }
+    fn submit_search(&mut self) {
+        if !self.query.trim().is_empty() && self.search_history.last() != Some(&self.query) {
+            self.search_history.push(self.query.clone());
+        }
+        self.searching = false;
+        self.history_index = None;
+    }
+    fn previous_query(&mut self) {
+        if self.search_history.is_empty() {return;}
+        let next = match self.history_index {
+            None => {self.history_draft=self.query.clone();self.search_history.len()-1},
+            Some(0) => 0,
+            Some(n) => n-1,
+        };
+        self.history_index=Some(next);
+        self.set_query(self.search_history[next].clone());
+    }
+    fn next_query(&mut self) {
+        if let Some(n) = self.history_index {
+            if n+1 < self.search_history.len() {
+                self.history_index=Some(n+1);
+                self.set_query(self.search_history[n+1].clone());
+            } else {
+                self.history_index=None;
+                self.set_query(self.history_draft.clone());
+            }
+        }
+    }
+    fn selected_turn(&self) -> Option<&Turn> {
+        if self.tab != Tab::Questions {return None;}
+        filtered_questions(&self.questions,&self.query).get(self.index).map(|&i|&self.questions[i])
+    }
+    fn selected_code(&self) -> Option<&CodeItem> {
+        if self.tab != Tab::Code {return None;}
+        filtered_code(&self.code,&self.query).get(self.index).map(|&i|&self.code[i])
+    }
+}
+
+fn viewer_lines(m: &Model) -> Vec<Line<'static>> {
+    let mut lines=Vec::new();
+    if let Some(t)=m.selected_turn() {
+        lines.push(Line::styled(format!("USER · sequence {} · {}",t.sequence,t.question_id),Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+        for line in t.question.lines() {lines.push(emphasis(line,&m.query,usize::MAX / 2));}
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(format!("ASSISTANT · {}",t.answer_id.map(|v|v.to_string()).unwrap_or_else(||"no answer indexed".into())),Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+        for line in t.answers.lines() {
+            // Preserve code layout while retaining fuzzy match highlighting.
+            lines.push(emphasis(line,&m.query,usize::MAX / 2));
+        }
+    } else if let Some(c)=m.selected_code() {
+        lines.push(Line::styled(format!("{} · block {} · sequence {} · {}",c.language,c.number+1,c.sequence,c.source_id),Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+        lines.push(Line::styled(format!("Q: {}",c.question.lines().next().unwrap_or("")),Style::default().fg(Color::Gray)));
+        lines.push(Line::raw(""));
+        for (n,line) in c.body.lines().enumerate() {
+            let mut spans=vec![Span::styled(format!("{:>4} │ ",n+1),Style::default().fg(Color::DarkGray))];
+            spans.extend(syntax_line(line,&c.language,&m.query,usize::MAX/2).spans);
+            lines.push(Line::from(spans));
+        }
+    }
+    lines
+}
+
+fn draw_viewer(frame: &mut ratatui::Frame, m: &Model) {
+    let parts=Layout::default().direction(Direction::Vertical)
+        .constraints([Constraint::Length(2),Constraint::Min(3),Constraint::Length(2)]).split(frame.area());
+    let title=if m.tab==Tab::Questions {"Question & answer"} else {"Code block"};
+    frame.render_widget(Paragraph::new(format!(" {} · {}",m.title,title)).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),parts[0]);
+    let content=viewer_lines(m);
+    let max_scroll=content.len().saturating_sub(parts[1].height.saturating_sub(2) as usize);
+    let scroll=m.viewer_scroll.min(max_scroll);
+    frame.render_widget(Paragraph::new(content).block(Block::default().borders(Borders::ALL).title(title))
+        .scroll((scroll.min(u16::MAX as usize) as u16,0)),parts[1]);
+    frame.render_widget(Paragraph::new(format!("↑↓/jk scroll   PgUp/PgDn page   Home/End   Esc/Enter back   b browser jump   {}",m.status))
+        .style(Style::default().fg(Color::Gray)),parts[2]);
 }
 
 fn draw(frame: &mut ratatui::Frame, m: &Model) {
+    if m.viewer {draw_viewer(frame,m);return;}
     let parts = Layout::default().direction(Direction::Vertical)
         .constraints([Constraint::Length(2),Constraint::Length(3),Constraint::Min(3),Constraint::Length(2)])
         .split(frame.area());
     let tab_title = format!(" {}   [1] Questions ({})   [2] Code blocks ({}) ", m.title, m.questions.len(), m.code.len());
     frame.render_widget(Paragraph::new(tab_title).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),parts[0]);
     let prompt = if m.searching { "Search (type, Esc to stop): " } else { "Filter (/ to edit): " };
-    frame.render_widget(Paragraph::new(format!("{prompt}{}", m.query))
+    let visible_width=parts[1].width.saturating_sub(2) as usize;
+    let prefix_width=prompt.chars().count();
+    let available=visible_width.saturating_sub(prefix_width).max(1);
+    let query_chars:Vec<char>=m.query.chars().collect();
+    let scroll=if m.searching {m.cursor.saturating_sub(available.saturating_sub(1))} else {0};
+    let shown:String=query_chars.iter().skip(scroll).take(available).collect();
+    let field_text=format!("{prompt}{shown}");
+    frame.render_widget(Paragraph::new(field_text)
         .block(Block::default().borders(Borders::ALL).title("Fuzzy search: questions + answers / code")), parts[1]);
+    if m.searching && visible_width>0 {
+        let x=(prefix_width+m.cursor.saturating_sub(scroll)).min(visible_width-1);
+        frame.set_cursor_position((parts[1].x.saturating_add(1).saturating_add(x as u16),parts[1].y+1));
+    }
     let width = parts[2].width.saturating_sub(9) as usize;
     let display_width = width.clamp(32,180);
     let mut list_state = ListState::default();
@@ -291,15 +411,27 @@ fn draw(frame: &mut ratatui::Frame, m: &Model) {
         .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
     frame.render_stateful_widget(list,parts[2],&mut list_state);
-    frame.render_widget(Paragraph::new(format!("↑↓/jk select   Enter open answer   Tab switch   / filter   Esc clear   q quit   {}",m.status))
+    frame.render_widget(Paragraph::new(format!("↑↓/jk select   Enter view in TUI   b browser jump   Tab switch   / filter   Esc clear   q quit   {}",m.status))
         .wrap(Wrap{trim:true}).style(Style::default().fg(Color::Gray)),parts[3]);
+}
+
+fn browser_jump(m: &mut Model, chat_id: Uuid) {
+    if let Some(message_id)=m.selected() {
+        let payload=serde_json::json!({"chat_id":chat_id.to_string(),"message_id":message_id.to_string()}).to_string();
+        m.status=match watcher_request("POST","/jump-message",Some(&payload)) {
+            Ok(_) => format!("opened {message_id} in browser"),
+            Err(err) => format!("browser jump failed: {err:#}"),
+        };
+    }
 }
 
 pub(crate) async fn run(client: &Client, chat_id: Uuid, title: String) -> Result<()> {
     let messages=fetch_messages(client,chat_id,false,0).await?;
     let (questions,code)=build_items(&messages);
     if questions.is_empty() && code.is_empty() { anyhow::bail!("no persisted messages for chat {chat_id}"); }
-    let mut m=Model { tab:Tab::Questions,query:String::new(),searching:false,index:0,status:String::new(),questions,code,title };
+    let mut m=Model { tab:Tab::Questions,query:String::new(),searching:false,cursor:0,
+        search_history:Vec::new(),history_index:None,history_draft:String::new(),viewer:false,viewer_scroll:0,
+        index:0,status:String::new(),questions,code,title };
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout=io::stdout();
     crossterm::execute!(stdout,crossterm::terminal::EnterAlternateScreen,crossterm::event::EnableMouseCapture)?;
@@ -313,16 +445,38 @@ pub(crate) async fn run(client: &Client, chat_id: Uuid, title: String) -> Result
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code==KeyCode::Char('c') {break;}
             if m.searching {
                 match key.code {
-                    KeyCode::Esc | KeyCode::Enter => m.searching=false,
-                    KeyCode::Backspace => {m.query.pop();m.index=0;},
-                    KeyCode::Char(c) => {m.query.push(c);m.index=0;},
+                    KeyCode::Esc => {m.searching=false;m.history_index=None;},
+                    KeyCode::Enter => m.submit_search(),
+                    KeyCode::Left => m.cursor=m.cursor.saturating_sub(1),
+                    KeyCode::Right => m.cursor=(m.cursor+1).min(m.query.chars().count()),
+                    KeyCode::Home => m.cursor=0,
+                    KeyCode::End => m.cursor=m.query.chars().count(),
+                    KeyCode::Up => m.previous_query(),
+                    KeyCode::Down => m.next_query(),
+                    KeyCode::Backspace => m.erase_before_cursor(),
+                    KeyCode::Delete => m.erase_at_cursor(),
+                    KeyCode::Char(c) => m.insert_query(c),
+                    _ => {}
+                }
+                continue;
+            }
+            if m.viewer {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => {m.viewer=false;m.viewer_scroll=0;},
+                    KeyCode::Down | KeyCode::Char('j') => m.viewer_scroll=m.viewer_scroll.saturating_add(1),
+                    KeyCode::Up | KeyCode::Char('k') => m.viewer_scroll=m.viewer_scroll.saturating_sub(1),
+                    KeyCode::PageDown => m.viewer_scroll=m.viewer_scroll.saturating_add(20),
+                    KeyCode::PageUp => m.viewer_scroll=m.viewer_scroll.saturating_sub(20),
+                    KeyCode::Home => m.viewer_scroll=0,
+                    KeyCode::End => m.viewer_scroll=viewer_lines(&m).len(),
+                    KeyCode::Char('b') | KeyCode::Char('o') => browser_jump(&mut m,chat_id),
                     _ => {}
                 }
                 continue;
             }
             match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => {if m.query.is_empty(){break;}else{m.query.clear();m.index=0;}},
-                KeyCode::Char('/') => m.searching=true,
+                KeyCode::Char('q') | KeyCode::Esc => {if m.query.is_empty(){break;}else{m.set_query(String::new());}},
+                KeyCode::Char('/') => {m.searching=true;m.cursor=m.query.chars().count();},
                 KeyCode::Tab => m.change_tab(),
                 KeyCode::Char('1') => {m.tab=Tab::Questions;m.index=0;},
                 KeyCode::Char('2') => {m.tab=Tab::Code;m.index=0;},
@@ -332,15 +486,8 @@ pub(crate) async fn run(client: &Client, chat_id: Uuid, title: String) -> Result
                 KeyCode::PageUp => m.index=m.index.saturating_sub(10),
                 KeyCode::Home => m.index=0,
                 KeyCode::End => m.index=m.count().saturating_sub(1),
-                KeyCode::Enter => {
-                    if let Some(message_id)=m.selected() {
-                        let payload=serde_json::json!({"chat_id":chat_id.to_string(),"message_id":message_id.to_string()}).to_string();
-                        m.status=match watcher_request("POST","/jump-message",Some(&payload)) {
-                            Ok(_) => format!("opened {message_id}"),
-                            Err(err) => format!("open failed: {err:#}"),
-                        };
-                    }
-                }
+                KeyCode::Enter => {if m.selected().is_some(){m.viewer=true;m.viewer_scroll=0;}},
+                KeyCode::Char('b') | KeyCode::Char('o') => browser_jump(&mut m,chat_id),
                 _=>{}
             }
             m.clamp();
@@ -363,6 +510,17 @@ mod tests {
     #[test] fn syntax_rust_and_bash() {
         assert!(!syntax_line("fn main() { println!(\"ok\"); }", "rust", "main", 90).spans.is_empty());
         assert!(!syntax_line("echo hello # comment", "bash", "echo", 90).spans.is_empty());
+    }
+    #[test] fn search_history_and_unicode_cursor() {
+        let mut m=Model {tab:Tab::Questions,query:String::new(),searching:true,cursor:0,
+            search_history:Vec::new(),history_index:None,history_draft:String::new(),viewer:false,viewer_scroll:0,
+            index:0,status:String::new(),questions:Vec::new(),code:Vec::new(),title:String::new()};
+        m.insert_query('Ж');m.insert_query('x');m.cursor=1;m.insert_query('и');
+        assert_eq!(m.query,"Жиx");m.erase_before_cursor();assert_eq!(m.query,"Жx");
+        m.submit_search();m.set_query("second".into());m.submit_search();
+        m.set_query("draft".into());m.previous_query();assert_eq!(m.query,"second");
+        m.previous_query();assert_eq!(m.query,"Жx");
+        m.next_query();assert_eq!(m.query,"second");m.next_query();assert_eq!(m.query,"draft");
     }
     #[test] fn extracts_multiple_code_blocks() {
         assert_eq!(extract_code("```rust\nfn main() {}\n```\n~~~bash\necho hi\n~~~").len(),2);

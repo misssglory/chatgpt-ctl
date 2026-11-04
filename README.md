@@ -1,4 +1,12 @@
-## v0.1.40 — quiet rescan quarantine and reliable bottom restoration
+## v0.1.41 — interactive `ctl watch` viewer and search history
+
+- `Enter`: opens the selected question/answer or full syntax-colored code block **inside Ratatui**, without changing the browser.
+- `b` (alias `o`): opens the associated message in ChatGPT and scrolls to it, from either list or viewer.
+- Viewer: arrows or `j/k` scroll; PageUp/PageDown, Home/End, Escape/Enter to return to list.
+- Fuzzy search: visible Unicode-aware editing cursor, Left/Right/Home/End, Backspace/Delete; Up/Down browse previous submitted queries. Going past the newest history entry restores the unsent draft.
+- Search history persists for the current `ctl watch` session; submit a search with Enter.
+
+## v0.1.41 — quiet rescan quarantine and reliable bottom restoration
 
 - The expected post-rescan hook quarantine is no longer logged on every polling tick. The initial `rescan complete` log and eventual `quarantine released` log remain.
 - `ctl rescan` now returns the actual (possibly remounted) conversation transcript scroller to the newest messages, irrespective of its initial position, and waits for virtualization/layout to settle before removing history-read hook suppression.

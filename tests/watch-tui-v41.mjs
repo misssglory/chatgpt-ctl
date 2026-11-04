@@ -1,0 +1,13 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+const src=readFileSync(new URL('../ctl/src/watch.rs', import.meta.url),'utf8');
+assert.match(src, /KeyCode::Enter => \{if m\.selected\(\)\.is_some\(\)\{m\.viewer=true/);
+assert.match(src, /KeyCode::Char\('b'\) \| KeyCode::Char\('o'\) => browser_jump/);
+assert.match(src, /fn draw_viewer\(/);
+assert.match(src, /fn previous_query\(/);
+assert.match(src, /fn next_query\(/);
+assert.match(src, /KeyCode::Up => m\.previous_query\(\)/);
+assert.match(src, /KeyCode::Down => m\.next_query\(\)/);
+assert.match(src, /frame\.set_cursor_position/);
+assert.match(src, /fn search_history_and_unicode_cursor\(/);
+console.log('watch-v41 TUI mappings/source regression passed');
