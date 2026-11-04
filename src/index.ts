@@ -2126,6 +2126,54 @@ async function scrollChatHistoryUp(page: Page): Promise<{ moved: boolean; top: b
   });
 }
 
+/** Return a virtualized chat to its newest message after a historical read.
+ * ChatGPT frequently replaces its transcript scroller while prepending history,
+ * so saved Element references and old scrollHeight values cannot be trusted.
+ * Resolve the live thread each pass and anchor to its bottom until layout settles.
+ */
+async function scrollChatHistoryToBottom(page: Page): Promise<void> {
+  let lastKind = 'no-thread-scroller';
+  let remaining = Infinity;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const state = await page.evaluate(() => {
+      const visible = (el: Element) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+      const message = Array.from(document.querySelectorAll<HTMLElement>('[data-chatgpt-search-message-ids]')).find(visible);
+      const main = message?.closest('main') || Array.from(document.querySelectorAll('main')).find(visible);
+      const candidates: HTMLElement[] = [];
+      // Prefer the actual transcript scroller over an independently scrolling code block.
+      for (const el of document.querySelectorAll<HTMLElement>('.thread-scroll-container')) {
+        if (visible(el)) candidates.push(el);
+      }
+      for (let el = message?.parentElement || main; el; el = el.parentElement) {
+        if (el instanceof HTMLElement && visible(el) && !candidates.includes(el)) candidates.push(el);
+      }
+      if (document.scrollingElement instanceof HTMLElement) candidates.push(document.scrollingElement);
+      const scroller = candidates.find(el => el.scrollHeight > el.clientHeight + 40 &&
+        (el === document.scrollingElement || /auto|scroll|overlay/.test(getComputedStyle(el).overflowY)));
+      if (!scroller) return { remaining: 0, kind: 'no-thread-scroller' };
+      scroller.scrollTop = scroller.scrollHeight;
+      return {
+        remaining: Math.max(0, scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop),
+        kind: scroller.tagName.toLowerCase() + (typeof scroller.className === 'string' ? '.' + scroller.className.split(/\s+/).slice(0, 2).join('.') : '')
+      };
+    });
+    lastKind = state.kind;
+    remaining = state.remaining;
+    // Give React/virtualization a chance to remount the latest transcript window.
+    await page.waitForTimeout(attempt < 3 ? 180 : 300);
+    if (attempt >= 3 && remaining <= 3) {
+      // Reapply once after the settling delay, in case scrollHeight grew.
+      await page.evaluate(() => {
+        const el = Array.from(document.querySelectorAll<HTMLElement>('.thread-scroll-container'))
+          .find(node => node.getClientRects().length > 0);
+        if (el) el.scrollTop = el.scrollHeight;
+      });
+      break;
+    }
+  }
+  log.debug(`[rescan] restored chat viewport to bottom scroller=${lastKind} remaining=${remaining}`);
+}
+
 /** A read-only file traversal must never be interpreted as a new ZIP event. */
 const pagesReadingAttachmentHistory = new WeakSet<Page>();
 
@@ -2243,16 +2291,6 @@ async function downloadChatFile(page: Page, expectedChatId: string, identity: st
  */
 async function rescanChatHistory(sql: Sql, page: Page, chatId: string, browserName: string): Promise<{messages: number; files: number; steps: number}> {
   pagesReadingAttachmentHistory.add(page);
-  await page.evaluate(() => {
-    const msg = document.querySelector('[data-chatgpt-search-message-ids]');
-    const ancestors: Element[] = [];
-    for (let e = msg?.parentElement; e; e = e.parentElement) ancestors.push(e);
-    const state = [document.scrollingElement, ...ancestors].filter((e): e is Element => !!e)
-      .filter(e => (e as HTMLElement).scrollHeight > (e as HTMLElement).clientHeight + 40)
-      .map(e => ({el: e, top: (e as HTMLElement).scrollTop,
-        bottom: (e as HTMLElement).scrollHeight - (e as HTMLElement).clientHeight - (e as HTMLElement).scrollTop < 100}));
-    (window as any).__ctlRescanScrollState = state;
-  });
   try {
     const seen = new Map<string, ScrapedMessage>();
     const orderedIds: string[] = [];
@@ -2310,17 +2348,15 @@ async function rescanChatHistory(sql: Sql, page: Page, chatId: string, browserNa
     log.info(`[rescan] complete chat=${chatId} messages=${messages.length} files=${allFiles.size} steps=${steps}; automatic ZIP hooks quarantined until a NEW user turn`);
     return { messages: messages.length, files: allFiles.size, steps };
   } finally {
-    await page.evaluate(() => {
-      const state = (window as any).__ctlRescanScrollState || [];
-      for (const p of state as Array<{el: HTMLElement; top: number; bottom: boolean}>) {
-        if (!p.el?.isConnected) continue;
-        const set = () => { if (p.el.isConnected) p.el.scrollTop = p.bottom ? p.el.scrollHeight : p.top; };
-        set();
-        if (p.bottom) { setTimeout(set, 250); setTimeout(set, 800); }
-      }
-      delete (window as any).__ctlRescanScrollState;
-    }).catch(() => {});
-    pagesReadingAttachmentHistory.delete(page);
+    // Rescan explicitly returns to the NEWEST messages, regardless of where
+    // the user was before scanning. Keep hooks suppressed throughout cleanup.
+    try {
+      await scrollChatHistoryToBottom(page);
+    } catch (error) {
+      log.warn(`[rescan] failed to restore chat to bottom: ${formatError(error)}`);
+    } finally {
+      pagesReadingAttachmentHistory.delete(page);
+    }
   }
 }
 
@@ -3558,7 +3594,8 @@ async function watch(cfg: Config, configPath: string) {
                 m => m.role === "user" && !quarantinedUserIds.has(m.id)
               );
               if (!genuinelyNewUser) {
-                log.debug(`[hook] rescan quarantine chat=${chat.id}; historical ZIPs are never auto-applied`);
+                // Quarantine is normal idle state, not a per-poll diagnostic.
+                // Its activation was already logged once by rescanChatHistory.
                 return;
               }
               // A genuinely new user request starts the next generation epoch.

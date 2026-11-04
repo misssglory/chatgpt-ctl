@@ -1,0 +1,15 @@
+import { readFileSync } from 'node:fs';
+import assert from 'node:assert/strict';
+const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+const rescan = source.slice(source.indexOf('async function rescanChatHistory('), source.indexOf('type AssistantZipIdentity'));
+assert.match(rescan, /finally\s*\{[\s\S]*await scrollChatHistoryToBottom\(page\)/);
+assert.match(rescan, /await scrollChatHistoryToBottom\(page\);[\s\S]*pagesReadingAttachmentHistory\.delete\(page\)/);
+assert.doesNotMatch(rescan, /__ctlRescanScrollState/);
+const restore = source.slice(source.indexOf('async function scrollChatHistoryToBottom('), source.indexOf('/** A read-only file traversal'));
+assert.match(restore, /thread-scroll-container/);
+assert.match(restore, /scroller\.scrollTop = scroller\.scrollHeight/);
+assert.match(restore, /page\.waitForTimeout/);
+const poll = source.slice(source.indexOf('const quarantinedUserIds = rescanHookQuarantine.get('), source.indexOf('const newAssistantMessages = await persistChat('));
+assert.doesNotMatch(poll, /log\.debug\(`\[hook\] rescan quarantine/);
+assert.match(poll, /rescanHookQuarantine\.delete\(chat\.id\)/);
+console.log('rescan bottom / quiet quarantine checks passed');

@@ -1,3 +1,9 @@
+## v0.1.40 — quiet rescan quarantine and reliable bottom restoration
+
+- The expected post-rescan hook quarantine is no longer logged on every polling tick. The initial `rescan complete` log and eventual `quarantine released` log remain.
+- `ctl rescan` now returns the actual (possibly remounted) conversation transcript scroller to the newest messages, irrespective of its initial position, and waits for virtualization/layout to settle before removing history-read hook suppression.
+- Errors during rescan still attempt to restore the viewport to the bottom in `finally`.
+
 ## v0.1.29 — `ctl files` preview and older-history retrieval
 
 - If an indexed file click opens a preview instead of downloading, attempt its Download action, then save readable text/code from the preview as a local file (same `--copy`, `--edit`, and `--download` modes).

@@ -10,7 +10,7 @@ assert.match(source,/blocks\.push\(`\$\{fence\}\$\{language\}/);
 assert.match(source,/url\.pathname === "\/rescan"/);
 assert.match(source,/pagesReadingAttachmentHistory\.add\(page\)/);
 assert.match(source,/await persistChat\(sql, complete, 0, new Map\(\), browserName, true\)/);
-assert.match(source,/__ctlRescanScrollState/);
+assert.match(source,/await scrollChatHistoryToBottom\(page\)/);
 assert.match(cli,/Rescan \{/);
 assert.match(cli,/Commands::Rescan/);
 assert.match(tui,/fn syntax_line\(/);
