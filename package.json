@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-history-watcher",
-  "version": "0.1.26",
+  "version": "0.1.29",
   "private": true,
   "type": "module",
   "scripts": {

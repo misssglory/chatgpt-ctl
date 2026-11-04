@@ -59,3 +59,22 @@ CREATE TABLE IF NOT EXISTS chatgpt_watcher_open_chats (
 
 CREATE INDEX IF NOT EXISTS chatgpt_watcher_open_chats_focus_idx
     ON chatgpt_watcher_open_chats (focused_at DESC);
+
+
+-- File picker index, populated from assistant download links and user file
+-- controls when a conversation is observed by the watcher.
+CREATE TABLE IF NOT EXISTS chatgpt_watcher_files (
+    id bigserial PRIMARY KEY,
+    chat_id uuid NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    identity text NOT NULL,
+    role text NOT NULL,
+    label text NOT NULL,
+    message_id text,
+    message_order integer,
+    position integer NOT NULL DEFAULT 0,
+    user_excerpt text NOT NULL DEFAULT '',
+    discovered_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (chat_id, identity)
+);
+CREATE INDEX IF NOT EXISTS chatgpt_watcher_files_fresh_idx
+    ON chatgpt_watcher_files (discovered_at DESC, id DESC);

@@ -1345,6 +1345,7 @@ async function syncChatsCommand(cfg: Config, configPath: string, quiet = false) 
   let total = 0;
   try {
     await ensureBrowserSchema(sql);
+  await ensureChatFilesSchema(sql);
     for (const profile of profiles) {
       const allowed = await browserStartupEnabled(sql, profile.name);
       await registerBrowser(sql, profile);
@@ -1501,6 +1502,7 @@ async function login(cfg: Config, configPath: string, browserName = "default") {
 async function dump(cfg: Config, configPath: string) {
   const sql = openDb(cfg);
   await ensureBrowserSchema(sql);
+  await ensureChatFilesSchema(sql);
   const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false);
   try {
     const page = await getPage(context);
@@ -1562,6 +1564,7 @@ async function persistChat(sql: Sql, chat: ScrapedChat, settleMs: number, prevIn
 async function once(cfg: Config, configPath: string) {
   const sql = openDb(cfg);
   await ensureBrowserSchema(sql);
+  await ensureChatFilesSchema(sql);
   const context = await launchContext(cfg, configPath, cfg.browser?.headless ?? false);
   const settleMs = cfg.chatgpt.complete_settle_ms ?? 800;
   try {
@@ -1744,6 +1747,289 @@ async function downloadZipTarget(page: Page, targetInfo: ZipTarget, directory: s
   }
   log.info(`[download] saved verified ZIP ${target}`);
   return target;
+}
+
+/** Any message-owned file: assistant-generated download or user upload. */
+type ChatFile = {
+  identity: string;
+  label: string;
+  role: "assistant" | "user";
+  messageId: string | null;
+  messageOrder: number | null;
+  position: number;
+  selector: string;
+  index: number;
+  userExcerpt: string;
+};
+
+function fileNameForDownload(raw: string): string {
+  const leaf = path.basename(raw.replace(/\\/g, "/"))
+    .replace(/[^\p{L}\p{N}._ -]/gu, "_").trim();
+  return leaf && leaf !== "." && leaf !== ".." ? leaf : "chatgpt-file";
+}
+
+/** Index assistant download links and user-owned upload cards, never chat navigation. */
+async function findChatFiles(page: Page, messages: ScrapedMessage[]): Promise<ChatFile[]> {
+  const selector = 'a[href], [role="link"], button[aria-label], button[data-testid*="file"], button[data-testid*="attachment"], [data-testid*="file"][role="button"]';
+  const observed = await page.locator(selector).evaluateAll((elements) => elements.map((element, index) => {
+    const el = element as HTMLElement;
+    const aria = el.getAttribute("aria-label") || "";
+    const text = (el.innerText || "").replace(/\s+/g, " ").trim();
+    const title = el.getAttribute("title") || "";
+    const download = el.getAttribute("download") || "";
+    const testId = el.getAttribute("data-testid") || "";
+    const href = el instanceof HTMLAnchorElement ? el.getAttribute("href") || "" : "";
+    // Exclude navigation and buttons which merely contain the word 'file'.
+    const isDownload = /^Open\s+Download\b/i.test(aria) || Boolean(download) ||
+      /(?:^|\s)Download\s+.+/i.test(text) ||
+      /\.(?:zip|patch|txt|md|pdf|png|jpe?g|webp|mp4|mov|csv|json|py|rs|ts|js|toml|xlsx?|docx?|pptx?)(?:$|[?#\s])/i.test(`${aria} ${title} ${text} ${href}`);
+    const isCard = /file|attachment|resource/i.test(testId) ||
+      /^(?:Open|Preview|Download)\s+(?:file|attachment)\b/i.test(aria);
+    if ((!isDownload && !isCard) || !el.getClientRects().length || getComputedStyle(el).visibility === "hidden") return null;
+    const ancestor = el.closest('[data-chatgpt-search-message-ids], [data-content-search-unit-key], [data-chatgpt-search-unit-key], [data-message-author-role]');
+    let messageId = (ancestor?.getAttribute("data-chatgpt-search-message-ids") || "")
+      .match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)?.[0] || "";
+    let messageOrder: number | null = null;
+    let node: HTMLElement | null = el;
+    while (node) {
+      if (!messageId) {
+        const raw = node.getAttribute("data-dil-message-id") || node.getAttribute("data-dil-source-message-id") ||
+          node.getAttribute("data-chatgpt-selection-message-id") || node.getAttribute("data-chatgpt-search-message-ids") || "";
+        messageId = raw.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)?.[0] || "";
+      }
+      if (messageOrder === null) {
+        const key = node.getAttribute("data-content-search-unit-key") || node.getAttribute("data-chatgpt-search-unit-key") || "";
+        const found = key.match(/(?:fallback-)?turn[-_](\d+)/i);
+        if (found) messageOrder = Number(found[1]);
+      }
+      node = node.parentElement;
+    }
+    const label = [download, aria, title, text].find((value) => /\.[A-Za-z\d]{1,10}(?:$|\s)/.test(value)) ||
+      [aria, title, text, download].find(Boolean) || href || "file";
+    return { index, selector, messageId: messageId.toLowerCase() || null,
+      messageOrder, label: label.replace(/^Open\s+Download\s+/i, "").replace(/^Open\s+/i, "").trim().slice(0, 300),
+      isCard, isDownload, testId };
+  }).filter(Boolean));
+  const result: ChatFile[] = [];
+  const occurrences = new Map<string, number>();
+  for (const entry of observed) {
+    if (!entry) continue;
+    const owner = messages.find((m) => entry.messageId && m.id.toLowerCase() === entry.messageId) ||
+      messages.find((m) => entry.messageOrder !== null && m.turnOrder === entry.messageOrder);
+    if (!owner || !["assistant", "user"].includes(owner.role)) continue;
+    if (owner.role === "assistant" && !entry.isDownload) continue;
+    if (owner.role === "user" && !entry.isCard && !entry.isDownload) continue;
+    // Ownership is determined from the enclosing message, not the filename.
+    const role = owner.role as "assistant" | "user";
+    const rawLabel = entry.label.replace(/^Preview\s+/i, "").trim();
+    // Global DOM indices change when earlier messages mount or unmount.
+    // Use the occurrence number inside a stable message/label pair instead.
+    const key = `${owner.id.toLowerCase()}|${rawLabel}`;
+    const occurrence = occurrences.get(key) ?? 0;
+    occurrences.set(key, occurrence + 1);
+    const identity = `${key}|${occurrence}`;
+    const user = messages.filter((m) => m.role === "user" && m.sequence <= owner.sequence).at(-1);
+    result.push({
+      identity, label: rawLabel, role, messageId: owner.id.toLowerCase(),
+      messageOrder: entry.messageOrder ?? owner.turnOrder ?? null, position: entry.index,
+      selector: entry.selector, index: entry.index,
+      userExcerpt: (owner.role === "user" ? owner.content : user?.content || "")
+        .replace(/\s+/g, " ").slice(0, 180),
+    });
+  }
+  return result;
+}
+
+async function ensureChatFilesSchema(sql: Sql): Promise<void> {
+  await sql`CREATE TABLE IF NOT EXISTS chatgpt_watcher_files (
+    id bigserial PRIMARY KEY,
+    chat_id uuid NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    identity text NOT NULL,
+    role text NOT NULL,
+    label text NOT NULL,
+    message_id text,
+    message_order integer,
+    position integer NOT NULL DEFAULT 0,
+    user_excerpt text NOT NULL DEFAULT '',
+    discovered_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE(chat_id, identity)
+  )`;
+  await sql`CREATE INDEX IF NOT EXISTS chatgpt_watcher_files_fresh_idx
+    ON chatgpt_watcher_files (discovered_at DESC, id DESC)`;
+}
+
+const indexedFileSignatures = new Map<string, string>();
+async function indexChatFiles(sql: Sql, page: Page, chat: ScrapedChat): Promise<void> {
+  const files = await findChatFiles(page, chat.messages);
+  const signature = files.map((file) => `${file.identity}:${file.userExcerpt}`).join("\n");
+  if (indexedFileSignatures.get(chat.id) === signature) return;
+  for (const file of files) {
+    await sql`INSERT INTO chatgpt_watcher_files
+       (chat_id, identity, role, label, message_id, message_order, position, user_excerpt)
+       VALUES (${chat.id}, ${file.identity}, ${file.role}, ${file.label}, ${file.messageId},
+         ${file.messageOrder}, ${file.position}, ${file.userExcerpt})
+       ON CONFLICT (chat_id, identity) DO UPDATE SET
+         label = EXCLUDED.label, user_excerpt = EXCLUDED.user_excerpt,
+         message_order = EXCLUDED.message_order, position = EXCLUDED.position`;
+  }
+  indexedFileSignatures.set(chat.id, signature);
+}
+
+/** Extract displayed text from a file viewer, never from the entire conversation. */
+async function readFilePreview(viewer: Page, previousDialogs: number): Promise<string | null> {
+  return viewer.evaluate((previousCount) => {
+    const dialogs = Array.from(document.querySelectorAll<HTMLElement>(
+      '[role="dialog"], [data-radix-dialog-content], [data-state="open"][role="dialog"]'
+    )).filter(el => el.getClientRects().length > 0);
+    const isExternalViewer = !document.querySelector('[data-chatgpt-search-message-ids], [data-content-search-unit-key]');
+    const root = dialogs.at(-1) || (isExternalViewer ? document.querySelector<HTMLElement>('main') : null);
+    if (!root || (dialogs.length <= previousCount && !isExternalViewer)) return null;
+    const content = root.querySelector<HTMLElement>(
+      '[data-testid*="file-preview"], [data-testid*="preview-content"], .monaco-editor .view-lines, '
+      + '[role="code"], pre code, pre, [data-language], textarea, [contenteditable="true"], article'
+    );
+    // In a preview dialog, plain text may be inside a scrollable div rather than <pre>.
+    const target = content || root;
+    const value = target instanceof HTMLTextAreaElement ? target.value : (target.innerText || target.textContent || '');
+    // Avoid silently saving a toolbar/title alone as the contents of a file.
+    const cleaned = value.replace(/\r\n/g, '\n').trim();
+    const controls = Array.from(root.querySelectorAll('button')).map(e => (e.getAttribute('aria-label') || e.textContent || '').trim());
+    if (!content && (cleaned.length < 40 || (controls.length && cleaned.length < 100))) return null;
+    return cleaned.length ? cleaned + '\n' : null;
+  }, previousDialogs).catch(() => null);
+}
+
+/** Click a file and consume either a download, a preview's Download control, or preview text. */
+async function retrieveFileFromControl(page: Page, file: ChatFile, directory: string): Promise<string> {
+  const locator = page.locator(file.selector).nth(file.index);
+  const dialogsBefore = await page.locator('[role="dialog"], [data-radix-dialog-content]').count();
+  const existingPages = new Set(page.context().pages());
+  // Start both listeners before clicking, otherwise the popup/download may be lost.
+  const directDownload = page.waitForEvent('download', { timeout: 3500 }).catch(() => null);
+  const popupPromise = page.context().waitForEvent('page', { timeout: 3500 }).catch(() => null);
+  await locator.click({ timeout: 5000 });
+  let download: Download | null = await directDownload;
+  const popup = await popupPromise;
+  const viewer = popup && !existingPages.has(popup) ? popup : page;
+  try {
+    if (!download) {
+      const modal = viewer.locator('[role="dialog"], [data-radix-dialog-content]').last();
+      const search = viewer === page && await modal.isVisible().catch(() => false) ? modal : viewer.locator('body');
+      const action = search.getByRole('button', { name: /^download(?: file)?$/i }).first();
+      const link = search.getByRole('link', { name: /^download(?: file)?$/i }).first();
+      const target = await action.isVisible().catch(() => false) ? action : link;
+      if (await target.isVisible().catch(() => false)) {
+        const event = viewer.waitForEvent('download', { timeout: 5000 }).catch(() => null);
+        await target.click({ timeout: 3000 });
+        download = await event;
+      }
+    }
+    await mkdir(directory, { recursive: true });
+    const chooseTarget = (raw: string) => {
+      const filename = fileNameForDownload(raw);
+      const dest = path.join(directory, filename);
+      return existsSync(dest) ? path.join(directory, `${crypto.randomUUID().slice(0, 8)}-${filename}`) : dest;
+    };
+    if (download) {
+      const target = chooseTarget(download.suggestedFilename() || file.label);
+      await download.saveAs(target);
+      log.info(`[files] downloaded chat-file name='${file.label}' path=${target}`);
+      return target;
+    }
+    // Some attachments show their actual text/code in a viewer without any
+    // download button or Playwright download event. Preserve that text verbatim.
+    const text = await readFilePreview(viewer, viewer === page ? dialogsBefore : 0);
+    if (text !== null) {
+      const label = /\.[a-z\d]{1,12}$/i.test(file.label) ? file.label : `${file.label}.txt`;
+      const target = chooseTarget(label);
+      await writeFile(target, text, 'utf8');
+      log.info(`[files] saved preview text name='${file.label}' path=${target} chars=${text.length}`);
+      return target;
+    }
+    throw new Error(`'${file.label}' yielded neither a browser download nor readable file preview`);
+  } finally {
+    if (viewer !== page) await viewer.close().catch(() => {});
+    else {
+      // Close only a viewer opened by this request, not an existing user dialog.
+      const dialogsNow = viewer.locator('[role="dialog"], [data-radix-dialog-content]');
+      if (await dialogsNow.count() > dialogsBefore) {
+        const close = dialogsNow.last().getByRole('button', { name: /close|dismiss/i }).first();
+        if (await close.isVisible().catch(() => false)) await close.click().catch(() => {});
+        else await page.keyboard.press('Escape').catch(() => {});
+      }
+    }
+  }
+}
+
+/** Load virtualized older messages without changing the currently selected pane. */
+async function findIndexedFileInHistory(page: Page, chatId: string, identity: string): Promise<ChatFile | null> {
+  const scan = async (): Promise<ChatFile | null> => {
+    const snapshot = await scrapeCurrentChat(page);
+    if (!snapshot || snapshot.id !== chatId) throw new Error('file download chat mismatch');
+    return (await findChatFiles(page, snapshot.messages)).find(f => f.identity === identity) || null;
+  };
+  const immediate = await scan();
+  if (immediate) return immediate;
+  // ChatGPT only mounts a subset of long conversations. Move progressively up
+  // so React has a chance to render and fetch earlier chunks between scans.
+  for (let step = 0; step < 90; step++) {
+    const moved = await page.evaluate(() => {
+      const main = document.querySelector('main');
+      const candidates = [document.scrollingElement, main, ...Array.from(main?.querySelectorAll('*') || [])]
+        .filter((v): v is Element => !!v);
+      const scrollers = candidates.filter(el => {
+        const h = el as HTMLElement;
+        return h.scrollHeight > h.clientHeight + 100 &&
+          (el === document.scrollingElement || /auto|scroll/.test(getComputedStyle(el).overflowY));
+      });
+      const target = scrollers.sort((a, b) => {
+        const ax = a as HTMLElement, bx = b as HTMLElement;
+        return (bx.scrollHeight - bx.clientHeight) - (ax.scrollHeight - ax.clientHeight);
+      })[0] as HTMLElement | undefined;
+      if (!target) return false;
+      const before = target.scrollTop;
+      target.scrollTop = Math.max(0, before - Math.max(400, target.clientHeight * 0.85));
+      return before !== target.scrollTop;
+    });
+    await page.waitForTimeout(moved ? 300 : 700);
+    const found = await scan();
+    if (found) {
+      log.info(`[files] recovered archived attachment after scrolling upward steps=${step + 1} chat=${chatId}`);
+      return found;
+    }
+    // At the top, allow asynchronous history loading before declaring failure.
+    if (!moved && step > 3) break;
+  }
+  return null;
+}
+
+async function downloadChatFile(page: Page, expectedChatId: string, identity: string, directory: string): Promise<string> {
+  // Remember scroll positions of the document and any inner thread scrollers.
+  // Restore in finally even if a download, preview or history search fails.
+  await page.evaluate(() => {
+    const root = document.querySelector('main');
+    const elements = [document.scrollingElement, root, ...Array.from(root?.querySelectorAll('*') || [])]
+      .filter((el): el is Element => !!el);
+    const state = elements.filter(el => (el as HTMLElement).scrollHeight > (el as HTMLElement).clientHeight + 100)
+      .map(el => ({ element: el, top: (el as HTMLElement).scrollTop,
+        nearBottom: (el as HTMLElement).scrollHeight - (el as HTMLElement).clientHeight - (el as HTMLElement).scrollTop < 80 }));
+    // Keep element references inside the browser, not in serialized Playwright results.
+    (window as unknown as { __ctlFileScrollState?: typeof state }).__ctlFileScrollState = state;
+  });
+  try {
+    const file = await findIndexedFileInHistory(page, expectedChatId, identity);
+    if (!file) throw new Error(`indexed attachment '${identity}' not found after incremental history loading`);
+    return await retrieveFileFromControl(page, file, directory);
+  } finally {
+    await page.evaluate(() => {
+      const store = window as unknown as { __ctlFileScrollState?: Array<{ element: Element; top: number; nearBottom: boolean }> };
+      for (const position of store.__ctlFileScrollState || []) {
+        const el = position.element as HTMLElement;
+        if (el?.isConnected) el.scrollTop = position.nearBottom ? el.scrollHeight : position.top;
+      }
+      delete store.__ctlFileScrollState;
+    }).catch(() => {});
+  }
 }
 
 type AssistantZipIdentity = Pick<ScrapedMessage, "id" | "turnOrder">;
@@ -2301,7 +2587,7 @@ function startControlServer(
       if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
       try {
         const body = await request.json().catch(() => ({})) as {
-          chat_id?: string; chat?: string; directory?: string; extract_to?: string;
+          chat_id?: string; chat?: string; directory?: string; extract_to?: string; identity?: string;
           text?: string; files?: string[]; new_chat?: boolean; draft?: boolean;
         };
         if (url.pathname === "/sync-chats") {
@@ -2407,7 +2693,7 @@ function startControlServer(
           if (!text.trim() && files.length === 0) return Response.json({ error: "text or at least one file is required" }, { status: 400 });
           if (draft && body.new_chat) return Response.json({ error: "--draft cannot be combined with --new-chat; open a blank chat first" }, { status: 400 });
           for (const file of files) await access(file, constants.R_OK);
-          const requestedChatId = normalizeUuid(body.chat_id || "");
+        const requestedChatId = normalizeUuid(body.chat_id || "");
           let runtime: BrowserRuntime;
           let page: Page;
           if (requestedChatId) {
@@ -2472,6 +2758,34 @@ function startControlServer(
           return Response.json({ ok: true, chat_id: acquiredChatId, browser_name: runtime.name, url: page.url(), new_chat: Boolean(body.new_chat), draft, submitted: !draft });
         }
 
+          if (url.pathname === "/files/download") {
+          const chatId = normalizeUuid(body.chat_id || "");
+          const identity = typeof (body as { identity?: unknown }).identity === "string"
+            ? (body as { identity: string }).identity : "";
+          if (!chatId || !identity || !body.directory) return Response.json({ error: "chat_id, identity and directory are required" }, { status: 400 });
+          const existing = openConversationPages(runtimes).find((item) => item.chatId === chatId);
+          const runtime = existing?.runtime ?? await ensureRuntimeForChat(chatId);
+          // A temporary page must not steal virtual focus or stay open afterwards.
+          const temporary = !existing;
+          const targetPage = existing?.page ?? await runtime.context.newPage();
+          try {
+            if (temporary) {
+              configurePage(targetPage, cfg);
+              const target = new URL(`/c/${chatId}`, cfg.chatgpt.url).toString();
+              await targetPage.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
+              await waitForConversationReady(targetPage, chatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
+            }
+            const current = await scrapeCurrentChat(targetPage);
+            if (current?.id === chatId) {
+              await upsertChat(sql, current, runtime.name);
+              await indexChatFiles(sql, targetPage, current);
+            }
+            const saved = await downloadChatFile(targetPage, chatId, identity, path.resolve(body.directory));
+            return Response.json({ ok: true, chat_id: chatId, path: saved });
+          } finally {
+            if (temporary) await targetPage.close().catch(() => {});
+          }
+        }
         const requestedChatId = normalizeUuid(body.chat_id || "");
         // Resolve virtual focus once per request; this preserves the exact page
         // selected across browser profiles and avoids a second fallback decision.
@@ -2575,6 +2889,7 @@ async function watch(cfg: Config, configPath: string) {
   await ensureHookSchema(sql);
   await ensureRetrySchema(sql);
   await ensureBrowserSchema(sql);
+  await ensureChatFilesSchema(sql);
   const pollMs = Math.max(500, cfg.chatgpt.poll_ms ?? 1500);
   const settleMs = cfg.chatgpt.complete_settle_ms ?? 800;
   const profiles = await discoverBrowserProfiles(cfg, configPath);
@@ -2814,6 +3129,7 @@ async function watch(cfg: Config, configPath: string) {
                 page, chat.id, cfg.browser?.navigation_timeout_ms ?? 45_000
               );
               await persistChat(sql, readySnapshot, settleMs, prevIncomplete, runtime.name);
+              await indexChatFiles(sql, page, readySnapshot);
               const lastAssistant = [...readySnapshot.messages].reverse().find((message) => message.role === "assistant");
               const lastUser = [...readySnapshot.messages].reverse().find((message) => message.role === "user");
               baselineAssistantTurnByChat.set(chat.id, lastAssistant?.turnOrder ?? null);
@@ -2841,6 +3157,7 @@ async function watch(cfg: Config, configPath: string) {
             const hookWasInitialized = initializedHookChats.has(chat.id);
             await recordChatBrowser(sql, chat.id, runtime.name);
             const newAssistantMessages = await persistChat(sql, chat, settleMs, prevIncomplete, runtime.name);
+            await indexChatFiles(sql, page, chat);
 
             // Delivery-timeout recovery is automatic, even when the optional
             // generic per-chat Retry setting is off. Bound attempts per failure

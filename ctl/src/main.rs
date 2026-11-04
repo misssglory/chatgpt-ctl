@@ -38,8 +38,11 @@ enum Commands {
     /// Print the CLI version (same as --version).
     Version,
 
-    /// List chats (most recently updated first)
+    /// List chats (most recently updated first); --open shows only live open panes
     Chats {
+        /// Show only chats currently open in watcher browser panes (live OPEN# order)
+        #[arg(short = 'o', long = "open")]
+        open_only: bool,
         /// Max rows (0 = all chats across all browser profiles)
         #[arg(short, long, default_value_t = 0)]
         limit: i64,
@@ -137,6 +140,26 @@ enum Commands {
         /// Follow poll interval in milliseconds
         #[arg(long, default_value_t = 1500)]
         interval_ms: u64,
+    },
+
+    /// Browse assistant downloads and user uploads with fzf (newest first).
+    #[command(alias = "file")]
+    Files {
+        /// Limit to a chat UUID, title, or live pane index (-1 = last)
+        #[arg(short = 'c', long = "chat", value_name = "CHAT", allow_hyphen_values = true)]
+        chat: Option<String>,
+        /// Copy downloaded file contents to the Wayland clipboard (wl-copy)
+        #[arg(long, conflicts_with_all = ["edit", "download"])]
+        copy: bool,
+        /// Open the downloaded file in $EDITOR (or --editor)
+        #[arg(long, conflicts_with = "download")]
+        edit: bool,
+        /// Editor command (default: $EDITOR, fallback: vi)
+        #[arg(long, value_name = "COMMAND", requires = "edit")]
+        editor: Option<String>,
+        /// Download selected file into this folder (without opening it)
+        #[arg(short = 'd', long = "download", value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
+        download: Option<PathBuf>,
     },
 
     /// Print one message by id
@@ -291,7 +314,7 @@ case "${words[2]:-}" in
   close|history|retry)
     (( CURRENT == 3 )) && _ctl_wants_chat=1
     ;;
-  send|download-last-zip)
+  send|download-last-zip|files|file)
     if (( CURRENT > 2 )) && [[ "${words[CURRENT-1]:-}" == (-c|--chat) ]]; then
       _ctl_wants_chat=1
     fi
@@ -371,7 +394,7 @@ _chatgpt_ctl_dynamic() {
     close|history|retry)
       if (( COMP_CWORD == 2 )) && [[ "$cur" != -* ]]; then wants_chat=1; fi
       ;;
-    send|download-last-zip)
+    send|download-last-zip|files|file)
       if [[ "$prev" == "-c" || "$prev" == "--chat" ]]; then wants_chat=1; fi
       ;;
     hook)
@@ -1030,6 +1053,100 @@ async fn interactive_open(client: &Client) -> Result<Option<Uuid>> {
     Ok(Some(Uuid::parse_str(id).context("fzf returned an invalid chat ID")?))
 }
 
+/// Select a previously observed file. The hidden first column is a stable database ID.
+/// Records survive closed browser panes; the watcher reopens the chat for download.
+async fn browse_files(client: &Client, database_url: &str, chat: Option<&str>, copy: bool, edit: bool, editor: Option<&str>, download: Option<PathBuf>) -> Result<()> {
+    let chat_id = match chat {
+        Some(spec) => Some(resolve_live_chat_selector(database_url, spec).await?),
+        None => None,
+    };
+    let rows = client.query(
+        r#"SELECT f.id, f.chat_id, f.identity, f.label, f.role,
+                  COALESCE(f.user_excerpt, ''), COALESCE(c.title, ''),
+                  f.discovered_at, f.message_order
+           FROM chatgpt_watcher_files f
+           JOIN chats c ON c.id = f.chat_id
+           LEFT JOIN messages m ON m.id::text = f.message_id
+           WHERE ($1::uuid IS NULL OR f.chat_id = $1)
+           ORDER BY COALESCE(m.completed_at, m.created_at, f.discovered_at) DESC,
+                    f.message_order DESC NULLS LAST, f.position DESC, f.id DESC"#,
+        &[&chat_id],
+    ).await.context("query indexed chat files; restart the v0.1.27 watcher to create/populate chatgpt_watcher_files")?;
+    if rows.is_empty() {
+        println!("No indexed files yet. Open the desired conversation in the v0.1.27 watcher and let it scan once.");
+        return Ok(());
+    }
+    let live = watcher_open_chats();
+    let mut child = Command::new("fzf")
+        .args(["--ansi", "--delimiter=\t", "--with-nth=2..", "--layout=reverse", "--height=85%",
+               "--prompt=file> ", "--header=Newest first | NAME | USER MESSAGE | CHAT TITLE | CHAT ID | OPEN# | OWNER"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn().context("start fzf; install fzf to browse files")?;
+    {
+        let mut input = child.stdin.take().context("fzf input missing")?;
+        for row in &rows {
+            let file_id: i64 = row.get(0);
+            let chat_id: Uuid = row.get(1);
+            let label: String = row.get(3);
+            let role: String = row.get(4);
+            let excerpt: String = row.get(5);
+            let title: String = row.get(6);
+            let index = live.iter().position(|id| *id == chat_id).map(|n| n.to_string()).unwrap_or_else(|| "-".into());
+            let sanitize = |s: String| s.replace('\t', " " ).replace('\n', " " ).replace('\r', " " );
+            let line = format!("{file_id}\t{}\t{}\t{}\t{chat_id}\t{index}\t{role}\n",
+                               sanitize(label), sanitize(excerpt), sanitize(title));
+            if input.write_all(line.as_bytes()).is_err() { break; }
+        }
+    }
+    let selected = child.wait_with_output().context("wait for fzf file selection")?;
+    if !selected.status.success() { return Ok(()); }
+    let file_id: i64 = String::from_utf8(selected.stdout)?.split('\t').next().unwrap_or("").trim().parse()
+        .context("invalid selected file ID")?;
+    let row = rows.iter().find(|row| row.get::<_, i64>(0) == file_id).context("selected file disappeared")?;
+    let chat_id: Uuid = row.get(1);
+    let identity: String = row.get(2);
+    let download_only = download.is_some();
+    let destination = download.unwrap_or_else(|| {
+        let dir = std::env::temp_dir().join("chatgpt-ctl-files");
+        dir
+    });
+    std::fs::create_dir_all(&destination)?;
+    let folder = destination.canonicalize()?;
+    let response = watcher_request("POST", "/files/download", Some(&serde_json::json!({
+        "chat_id": chat_id, "identity": identity, "directory": folder,
+    }).to_string()))?;
+    let value: serde_json::Value = serde_json::from_str(&response)?;
+    let local_path = value.get("path").and_then(|v| v.as_str()).context("watcher did not return downloaded file path")?;
+    if copy {
+        let mime = match std::path::Path::new(local_path).extension().and_then(|ext| ext.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+            "png" => "image/png", "jpg" | "jpeg" => "image/jpeg", "webp" => "image/webp",
+            "pdf" => "application/pdf", "zip" => "application/zip", "json" => "application/json",
+            "txt" | "md" | "rs" | "py" | "ts" | "js" | "toml" | "csv" | "patch" => "text/plain;charset=utf-8",
+            _ => "application/octet-stream",
+        };
+        let source = std::fs::File::open(local_path)?;
+        let status = Command::new("wl-copy").arg("--type").arg(mime)
+            .stdin(std::process::Stdio::from(source)).status().context("run wl-copy")?;
+        anyhow::ensure!(status.success(), "wl-copy failed");
+        println!("copied file contents ({mime}) from {local_path}");
+    } else if edit {
+        let editor = editor.map(str::to_owned).or_else(|| std::env::var("EDITOR").ok()).unwrap_or_else(|| "vi".into());
+        // Support commands such as 'code --wait' without involving a shell.
+        let mut parts = editor.split_whitespace();
+        let program = parts.next().context("editor command is empty")?;
+        let status = Command::new(program).args(parts).arg(local_path).status()?;
+        anyhow::ensure!(status.success(), "editor exited unsuccessfully: {status}");
+    } else if !download_only {
+        // Default action: open downloaded file in desktop application.
+        Command::new("xdg-open").arg(local_path).spawn().context("start xdg-open")?;
+        println!("opened {local_path}");
+    } else {
+        println!("{local_path}");
+    }
+    Ok(())
+}
+
 async fn follow_history(
     client: &Client,
     chat_id: Uuid,
@@ -1189,7 +1306,7 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
-        Commands::Chats { limit, query, refresh } => {
+        Commands::Chats { limit, query, refresh, open_only } => {
             if refresh {
                 // Prefer the already-running watcher so profile locks are never
                 // contended by a second Chromium process. Fall back to a one-shot
@@ -1202,9 +1319,28 @@ async fn main() -> Result<()> {
                     Err(error) => return Err(error),
                 }
             }
+            // --open is a live snapshot; limit AFTER filtering the DB history.
+            let (open_chats, focused_chat) = if open_only {
+                let response = watcher_request("GET", "/status", None)
+                    .context("--open requires a running watcher (bun run watch)")?;
+                let status: serde_json::Value = serde_json::from_str(&response)
+                    .context("parse watcher status for --open")?;
+                let ids: Vec<Uuid> = status.get("chat_ids").and_then(|v| v.as_array())
+                    .context("watcher status missing chat_ids")?.iter()
+                    .filter_map(|v| v.as_str().and_then(|s| s.parse().ok())).collect();
+                let focus = status.get("chat_id").and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok());
+                (ids, focus)
+            } else {
+                watcher_status()
+            };
             let client = connect(&url).await?;
-            let chats = list_chats(&client, limit, query.as_deref()).await?;
-            let (open_chats, focused_chat) = watcher_status();
+            let chats = list_chats(&client, if open_only { 0 } else { limit }, query.as_deref()).await?;
+            let chats: Vec<ChatRow> = if open_only {
+                // Preserve the live OPEN# order and historical DB# values.
+                open_chats.iter().filter_map(|id| chats.iter().find(|c| c.id == *id).cloned())
+                    .take(if limit > 0 { limit as usize } else { usize::MAX }).collect()
+            } else { chats };
             println!("OPEN#  DB#  BROWSER       STATE     CHAT ID                                  MSGS  UPDATED          TITLE");
             for c in chats.iter() {
                 let ts = c.updated_at
@@ -1222,6 +1358,10 @@ async fn main() -> Result<()> {
                     println!("  {line}");
                 }
             }
+        }
+        Commands::Files { chat, copy, edit, editor, download } => {
+            let client = connect(&url).await?;
+            browse_files(&client, &url, chat.as_deref(), copy, edit, editor.as_deref(), download).await?;
         }
         Commands::Current { verbose } => {
             let (open, focused) = watcher_status();

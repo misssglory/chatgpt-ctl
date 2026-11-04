@@ -1,3 +1,9 @@
+## v0.1.29 — `ctl files` preview and older-history retrieval
+
+- If an indexed file click opens a preview instead of downloading, attempt its Download action, then save readable text/code from the preview as a local file (same `--copy`, `--edit`, and `--download` modes).
+- If an indexed file is missing from the mounted chat DOM, scan incrementally upward through virtualized chat history, then restore the original scroll position (including bottom anchoring).
+- The scan is bounded at 90 iterations; files deleted remotely or inaccessible through ChatGPT still report an error. Binary previews without a download control cannot be reconstructed from text.
+
 # chatgpt-ctl
 
 CLI (+ optional Bun scraper) for **ChatGPT conversation history** stored in **PostgreSQL**.
@@ -145,7 +151,7 @@ nix build
 ## CLI usage
 
 ```text
-chatgpt-ctl chats [--limit N] [-q substring] [--refresh]
+chatgpt-ctl chats [--open] [--limit N] [-q substring] [--refresh]
 chatgpt-ctl send "message text" [--chat CHAT | --new-chat] [-f PATH]...  # focused, targeted, or new chat
 chatgpt-ctl open [CHAT|current]              # UUID/title; new pane unless already open
 chatgpt-ctl close <CHAT|INDEX>               # close by UUID/title or 0-based chats index
@@ -811,3 +817,56 @@ and runs `wcc build` inside `ctl`.
 If a hook downloads the wrong project ZIP, the log now identifies the actual
 archive and destination **before any build command runs**. Build failures caused
 by unrelated commands inside a custom stage are separate from extraction.
+
+## v0.1.27 — interactive file browser
+
+`chatgpt-ctl files` (or `ctl files`) opens **fzf** over files observed in
+conversation panes. Both generated assistant downloads and user-uploaded file
+controls are indexed in PostgreSQL. The picker shows the link/card display name,
+the beginning of the associated user message, chat title, UUID, live open-pane
+index (`-` when closed), and file owner. Rows are ordered by conversation-file
+freshness (message timestamps, then message/attachment order).
+
+```bash
+ctl files                         # select, download to temp, open with xdg-open
+ctl files -c 0                    # filter to first open chat
+ctl files -c -1                   # last open chat
+ctl files -c "Watcher project"    # filter by title
+ctl files --download ~/Downloads # save the selected file to a directory
+ctl files --copy                 # download and put file CONTENTS in wl-copy
+ctl files --edit                 # download and open with $EDITOR or vi
+ctl files --edit --editor 'code --wait'
+ctl files --help
+```
+
+`fzf`, `xdg-open`, and optionally `wl-copy` / `$EDITOR` must be installed. The
+watcher must be running to download from ChatGPT, including for previously
+observed, currently closed conversations. A closed conversation is opened in a
+temporary watcher page for download, then that page is closed. The separate
+file-index table is created automatically at watcher startup.
+
+**Index coverage:** Files are added as the watcher observes each conversation
+in its browser panes. Preexisting *unvisited* chats are not backfilled by the
+PostgreSQL message-history table because that table stores text, not attachment
+references. Open an older chat once to index its downloadable controls. ChatGPT
+may change how its user-upload file preview exposes the Download button; when
+no download event can be obtained the command returns an error rather than
+clicking an unrelated page control. File actions don't run project ZIP hooks.
+
+
+## v0.1.28 — list only currently opened chats
+
+`chatgpt-ctl chats --open` (or `chatgpt-ctl chats -o`) displays only
+conversations currently open in watcher browser panes, in the watcher's
+live `OPEN#` order. The existing `chats` default still includes history.
+The `--limit N` option limits **open rows after filtering**, not the first N
+rows of history. `--query` filters chat titles/UUIDs; `--refresh` remains
+available. The `--open` variant requires the watcher control server running
+so a connection error is reported rather than silently showing an empty list.
+
+```bash
+chatgpt-ctl chats --open
+chatgpt-ctl chats -o -l 3
+chatgpt-ctl chats --open --query watcher
+chatgpt-ctl chats --open --refresh
+```
