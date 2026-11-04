@@ -1,0 +1,11 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+const html = '<button aria-label="Open preview of diagnose_pons_pool_checked.sh"></button>';
+assert.match(html, /aria-label="Open preview of diagnose_pons_pool_checked\.sh"/);
+assert.match(source, /Open\\s\+preview\\s\+of/);
+assert.match(source, /js\|sh\|bash\|zsh\|fish/);
+assert.match(source, /scrollChatHistoryUp\(page: Page\)/);
+assert.match(source, /const message = Array\.from\(document\.querySelectorAll<HTMLElement>\('\[data-chatgpt-search-message-ids\]'\)\)/);
+assert.match(source, /log\.debug\(`\[files\] history scan/);
+console.log('file resource preview and history recovery source regressions pass');

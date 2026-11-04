@@ -870,3 +870,39 @@ chatgpt-ctl chats -o -l 3
 chatgpt-ctl chats --open --query watcher
 chatgpt-ctl chats --open --refresh
 ```
+
+
+### v0.1.30: `ctl files` indexed attachment recovery
+
+Recognizes ChatGPT resource buttons such as `Open preview of example.sh`
+(including shell scripts and other development artifacts). The previous
+scanner missed these controls entirely, so retries incorrectly reported
+that the file was missing. If an indexed attachment is outside the mounted
+message range, the watcher now scrolls the conversation's message viewport
+upward in bounded increments, logs each scroll attempt at DEBUG level,
+and restores the original conversation scroll position afterwards.
+
+### Live HTML snapshot (`ctl html`, v0.1.32)
+
+```bash
+ctl html > chat.html
+ctl html -c -1 -o /tmp/chat.html
+ctl html 0 -o /tmp/first-chat.html
+ctl html 6ae588eb-c258-83eb-a545-7681d9b1b082 > /tmp/watcher.html
+```
+
+Without a selector the command captures the virtually focused open chat. The HTML comes directly from Playwright's currently mounted DOM. The command does not scroll, navigate, open tabs, or alter virtual focus. An explicitly selected chat must already be open. HTML snapshots can contain private conversation content and account identifiers.
+
+
+### v0.1.32 — history scrolling does not trigger hooks
+
+`ctl files` may scroll through old assistant messages to recover an indexed file.
+The watcher suppresses ZIP automation during such scans and rejects previously
+unseen ZIP controls belonging to assistant turns older than the most recently
+observed assistant turn. Late attachments from the current turn and actual new
+turns continue to work. A message without a stable turn number must be newly
+completed before its attachment can trigger an automatic hook.
+
+### v0.1.33 — scoped attachment preview retrieval
+
+`ctl files` only clicks Download controls belonging to the newly opened file preview (never a global body button). If the preview's Download action is blocked or no download occurs, it attempts to extract the text/code preview instead. Preview cleanup runs in `finally`, followed by the existing chat scroll restoration even on failure.

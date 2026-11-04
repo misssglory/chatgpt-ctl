@@ -19,6 +19,7 @@ import { createHash } from "node:crypto";
 import postgres from "postgres";
 import { zipTargetsAfterCursor, zipTargetIsAfterCursor } from "./zip-cursor.mjs";
 import { autoZipCandidates } from "./auto-zip-candidates.mjs";
+import { freshZipCandidates } from "./fresh-zip-candidates.mjs";
 
 const log = new Logger({
   type: "pretty",
@@ -1782,9 +1783,9 @@ async function findChatFiles(page: Page, messages: ScrapedMessage[]): Promise<Ch
     // Exclude navigation and buttons which merely contain the word 'file'.
     const isDownload = /^Open\s+Download\b/i.test(aria) || Boolean(download) ||
       /(?:^|\s)Download\s+.+/i.test(text) ||
-      /\.(?:zip|patch|txt|md|pdf|png|jpe?g|webp|mp4|mov|csv|json|py|rs|ts|js|toml|xlsx?|docx?|pptx?)(?:$|[?#\s])/i.test(`${aria} ${title} ${text} ${href}`);
+      /\.(?:zip|patch|diff|txt|md|pdf|png|jpe?g|webp|mp4|mov|csv|json|py|rs|ts|js|sh|bash|zsh|fish|nix|yaml|yml|toml|html|css|sql|log|xml|ini|conf|cfg|env|xlsx?|docx?|pptx?)(?:$|[?#\s])/i.test(`${aria} ${title} ${text} ${href}`);
     const isCard = /file|attachment|resource/i.test(testId) ||
-      /^(?:Open|Preview|Download)\s+(?:file|attachment)\b/i.test(aria);
+      /^(?:Open\s+preview\s+of|Preview|Download|Open\s+(?:file|attachment))\b/i.test(aria);
     if ((!isDownload && !isCard) || !el.getClientRects().length || getComputedStyle(el).visibility === "hidden") return null;
     const ancestor = el.closest('[data-chatgpt-search-message-ids], [data-content-search-unit-key], [data-chatgpt-search-unit-key], [data-message-author-role]');
     let messageId = (ancestor?.getAttribute("data-chatgpt-search-message-ids") || "")
@@ -1807,7 +1808,7 @@ async function findChatFiles(page: Page, messages: ScrapedMessage[]): Promise<Ch
     const label = [download, aria, title, text].find((value) => /\.[A-Za-z\d]{1,10}(?:$|\s)/.test(value)) ||
       [aria, title, text, download].find(Boolean) || href || "file";
     return { index, selector, messageId: messageId.toLowerCase() || null,
-      messageOrder, label: label.replace(/^Open\s+Download\s+/i, "").replace(/^Open\s+/i, "").trim().slice(0, 300),
+      messageOrder, label: label.replace(/^Open\s+Download\s+/i, "").replace(/^Open\s+preview\s+of\s+/i, "").replace(/^Open\s+/i, "").trim().slice(0, 300),
       isCard, isDownload, testId };
   }).filter(Boolean));
   const result: ChatFile[] = [];
@@ -1875,53 +1876,95 @@ async function indexChatFiles(sql: Sql, page: Page, chat: ScrapedChat): Promise<
   indexedFileSignatures.set(chat.id, signature);
 }
 
-/** Extract displayed text from a file viewer, never from the entire conversation. */
-async function readFilePreview(viewer: Page, previousDialogs: number): Promise<string | null> {
-  return viewer.evaluate((previousCount) => {
-    const dialogs = Array.from(document.querySelectorAll<HTMLElement>(
-      '[role="dialog"], [data-radix-dialog-content], [data-state="open"][role="dialog"]'
-    )).filter(el => el.getClientRects().length > 0);
-    const isExternalViewer = !document.querySelector('[data-chatgpt-search-message-ids], [data-content-search-unit-key]');
-    const root = dialogs.at(-1) || (isExternalViewer ? document.querySelector<HTMLElement>('main') : null);
-    if (!root || (dialogs.length <= previousCount && !isExternalViewer)) return null;
-    const content = root.querySelector<HTMLElement>(
-      '[data-testid*="file-preview"], [data-testid*="preview-content"], .monaco-editor .view-lines, '
-      + '[role="code"], pre code, pre, [data-language], textarea, [contenteditable="true"], article'
-    );
-    // In a preview dialog, plain text may be inside a scrollable div rather than <pre>.
-    const target = content || root;
-    const value = target instanceof HTMLTextAreaElement ? target.value : (target.innerText || target.textContent || '');
-    // Avoid silently saving a toolbar/title alone as the contents of a file.
-    const cleaned = value.replace(/\r\n/g, '\n').trim();
-    const controls = Array.from(root.querySelectorAll('button')).map(e => (e.getAttribute('aria-label') || e.textContent || '').trim());
-    if (!content && (cleaned.length < 40 || (controls.length && cleaned.length < 100))) return null;
-    return cleaned.length ? cleaned + '\n' : null;
-  }, previousDialogs).catch(() => null);
+/** Identify a file preview opened by this request. Never search the entire chat
+ * for an unqualified "Download file" button: attachment cards have their own
+ * controls and overlays which intercept clicks on unrelated buttons. */
+async function openedFilePreviewRoot(viewer: Page, previousDialogs: number, isPopup: boolean) {
+  const selectors = '[role="dialog"], [data-radix-dialog-content], [data-testid*="file-preview"], [data-testid*="preview-panel"]';
+  const roots = viewer.locator(selectors).filter({ visible: true });
+  const count = await roots.count();
+  if (count > previousDialogs) return roots.last();
+  // A separate popup is already scoped to the opened file, unlike the chat page.
+  return isPopup ? viewer.locator('body') : null;
 }
 
-/** Click a file and consume either a download, a preview's Download control, or preview text. */
+/** Extract displayed text only from a newly opened preview, not the chat itself. */
+async function readFilePreview(viewer: Page, previousDialogs: number, isPopup: boolean): Promise<string | null> {
+  return viewer.evaluate(({ previousCount, popup }) => {
+    const visible = (el: HTMLElement) => el.getClientRects().length > 0 &&
+      getComputedStyle(el).visibility !== 'hidden';
+    const dialogs = Array.from(document.querySelectorAll<HTMLElement>(
+      '[role="dialog"], [data-radix-dialog-content], [data-testid*="file-preview"], [data-testid*="preview-panel"]'
+    )).filter(visible);
+    const root = dialogs.length > previousCount ? dialogs.at(-1) :
+      (popup ? document.querySelector<HTMLElement>('main') || document.body : null);
+    if (!root) return null;
+    const content = root.querySelector<HTMLElement>(
+      '[data-testid*="file-preview"] pre, [data-testid*="preview-content"], .monaco-editor .view-lines, '
+      + '[role="code"], pre code, pre, [data-language], textarea, article'
+    );
+    const target = content || root;
+    const value = target instanceof HTMLTextAreaElement ? target.value :
+      (target.innerText || target.textContent || '');
+    const cleaned = value.replace(/\r\n/g, '\n').trim();
+    const controls = Array.from(root.querySelectorAll('button')).map(e =>
+      (e.getAttribute('aria-label') || e.textContent || '').trim());
+    if (!content && (cleaned.length < 40 || (controls.length && cleaned.length < 100))) return null;
+    return cleaned.length ? cleaned + '\n' : null;
+  }, { previousCount: previousDialogs, popup: isPopup }).catch(() => null);
+}
+
+/** Click an indexed attachment and retrieve the actual download or its text preview. */
 async function retrieveFileFromControl(page: Page, file: ChatFile, directory: string): Promise<string> {
   const locator = page.locator(file.selector).nth(file.index);
-  const dialogsBefore = await page.locator('[role="dialog"], [data-radix-dialog-content]').count();
+  const previewSelectors = '[role="dialog"], [data-radix-dialog-content], [data-testid*="file-preview"], [data-testid*="preview-panel"]';
+  const dialogsBefore = await page.locator(previewSelectors).filter({ visible: true }).count();
   const existingPages = new Set(page.context().pages());
-  // Start both listeners before clicking, otherwise the popup/download may be lost.
-  const directDownload = page.waitForEvent('download', { timeout: 3500 }).catch(() => null);
-  const popupPromise = page.context().waitForEvent('page', { timeout: 3500 }).catch(() => null);
+  // Listen before clicking so downloads/popups cannot race the event listeners.
+  const directDownload = page.waitForEvent('download', { timeout: 1800 }).catch(() => null);
+  const popupPromise = page.context().waitForEvent('page', { timeout: 1800 }).catch(() => null);
   await locator.click({ timeout: 5000 });
   let download: Download | null = await directDownload;
   const popup = await popupPromise;
   const viewer = popup && !existingPages.has(popup) ? popup : page;
+  const isPopup = viewer !== page;
+  let previewOpened = false;
   try {
-    if (!download) {
-      const modal = viewer.locator('[role="dialog"], [data-radix-dialog-content]').last();
-      const search = viewer === page && await modal.isVisible().catch(() => false) ? modal : viewer.locator('body');
-      const action = search.getByRole('button', { name: /^download(?: file)?$/i }).first();
-      const link = search.getByRole('link', { name: /^download(?: file)?$/i }).first();
+    const previewRoot = await openedFilePreviewRoot(viewer, isPopup ? 0 : dialogsBefore, isPopup);
+    previewOpened = !!previewRoot;
+    if (!download && previewRoot) {
+      // The preview toolbar might have its own Download action. It MUST be
+      // scoped to the preview root, never body or a random attachment card.
+      const action = previewRoot.getByRole('button', { name: /^download(?: file)?$/i }).first();
+      const link = previewRoot.getByRole('link', { name: /^download(?: file)?$/i }).first();
       const target = await action.isVisible().catch(() => false) ? action : link;
       if (await target.isVisible().catch(() => false)) {
-        const event = viewer.waitForEvent('download', { timeout: 5000 }).catch(() => null);
-        await target.click({ timeout: 3000 });
-        download = await event;
+        const event = viewer.waitForEvent('download', { timeout: 2500 }).catch(() => null);
+        try {
+          // ChatGPT sometimes places a transparent preview layer over toolbar
+          // elements; a force click avoids the intercepted-pointer timeout.
+          await target.click({ timeout: 1500, force: true });
+          download = await event;
+        } catch (error) {
+          log.debug(`[files] preview Download control unavailable for '${file.label}': ${String(error)}`);
+        }
+      }
+    }
+    if (!download && !isPopup) {
+      // The file card itself can expose a Download file button beneath its
+      // transparent "Open preview" overlay. Scope this to the SELECTED card:
+      // a page-wide button query can choose a different attachment entirely.
+      const cardDownload = locator.locator(
+        'xpath=ancestor::*[.//button[@aria-label="Download file"]][1]'
+      ).getByRole('button', { name: /^download(?: file)?$/i }).first();
+      if (await cardDownload.count() && await cardDownload.isVisible().catch(() => false)) {
+        const event = page.waitForEvent('download', { timeout: 2500 }).catch(() => null);
+        try {
+          await cardDownload.click({ timeout: 1500, force: true });
+          download = await event;
+        } catch (error) {
+          log.debug(`[files] file-card Download unavailable for '${file.label}': ${String(error)}`);
+        }
       }
     }
     await mkdir(directory, { recursive: true });
@@ -1936,9 +1979,9 @@ async function retrieveFileFromControl(page: Page, file: ChatFile, directory: st
       log.info(`[files] downloaded chat-file name='${file.label}' path=${target}`);
       return target;
     }
-    // Some attachments show their actual text/code in a viewer without any
-    // download button or Playwright download event. Preserve that text verbatim.
-    const text = await readFilePreview(viewer, viewer === page ? dialogsBefore : 0);
+    // If ChatGPT provided code/text rather than a file download, save the
+    // preview contents. This also recovers a blocked/unavailable Download button.
+    const text = await readFilePreview(viewer, isPopup ? 0 : dialogsBefore, isPopup);
     if (text !== null) {
       const label = /\.[a-z\d]{1,12}$/i.test(file.label) ? file.label : `${file.label}.txt`;
       const target = chooseTarget(label);
@@ -1948,62 +1991,110 @@ async function retrieveFileFromControl(page: Page, file: ChatFile, directory: st
     }
     throw new Error(`'${file.label}' yielded neither a browser download nor readable file preview`);
   } finally {
-    if (viewer !== page) await viewer.close().catch(() => {});
-    else {
-      // Close only a viewer opened by this request, not an existing user dialog.
-      const dialogsNow = viewer.locator('[role="dialog"], [data-radix-dialog-content]');
-      if (await dialogsNow.count() > dialogsBefore) {
-        const close = dialogsNow.last().getByRole('button', { name: /close|dismiss/i }).first();
-        if (await close.isVisible().catch(() => false)) await close.click().catch(() => {});
-        else await page.keyboard.press('Escape').catch(() => {});
-      }
+    if (isPopup) await viewer.close().catch(() => {});
+    else if (previewOpened) {
+      // Dismiss the preview even if downloading/reading failed, allowing the
+      // outer caller to restore its conversation scroll position in finally.
+      const active = await openedFilePreviewRoot(page, dialogsBefore, false);
+      const close = active?.getByRole('button', { name: /close|dismiss/i }).first();
+      if (close && await close.isVisible().catch(() => false)) {
+        await close.click({ timeout: 1000, force: true }).catch(() => page.keyboard.press('Escape').catch(() => {}));
+      } else await page.keyboard.press('Escape').catch(() => {});
     }
   }
 }
 
-/** Load virtualized older messages without changing the currently selected pane. */
+/** Scroll the actual conversation viewport rather than the largest scrollable
+ * descendant (which may be a hidden sidebar or another unrelated pane). */
+async function scrollChatHistoryUp(page: Page): Promise<{ moved: boolean; top: boolean; before: number; after: number; kind: string }> {
+  return page.evaluate(() => {
+    const visible = (el: Element) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== "hidden";
+    const message = Array.from(document.querySelectorAll<HTMLElement>('[data-chatgpt-search-message-ids]'))
+      .find(visible);
+    const main = message?.closest('main') || Array.from(document.querySelectorAll('main')).find(visible);
+    const candidates: HTMLElement[] = [];
+    // Ancestors of a mounted message are much more reliable than searching all
+    // scrollable elements under main: internal cards can be independently scrollable.
+    for (let node = message?.parentElement || main; node; node = node.parentElement) {
+      if (node instanceof HTMLElement && visible(node)) candidates.push(node);
+    }
+    if (main && !candidates.includes(main)) candidates.push(main);
+    if (document.scrollingElement instanceof HTMLElement) candidates.push(document.scrollingElement);
+    const scrollers = candidates.filter(el => el.scrollHeight > el.clientHeight + 40 &&
+      (el === document.scrollingElement || /auto|scroll|overlay/.test(getComputedStyle(el).overflowY)));
+    // The innermost scrollable ancestor encompassing message units is the thread
+    // scroller; avoid body/document if a dedicated thread scroller exists.
+    const target = scrollers[0];
+    if (!target) return { moved: false, top: false, before: 0, after: 0, kind: 'no-thread-scroller' };
+    const before = target.scrollTop;
+    const amount = Math.max(500, Math.round(target.clientHeight * 0.8));
+    target.scrollTop = Math.max(0, before - amount);
+    const after = target.scrollTop;
+    return { moved: after < before, top: after <= 1, before, after,
+      kind: target.tagName.toLowerCase() + (target.className && typeof target.className === 'string' ? '.' + target.className.split(/\s+/).slice(0, 2).join('.') : '') };
+  });
+}
+
+/** A read-only file traversal must never be interpreted as a new ZIP event. */
+const pagesReadingAttachmentHistory = new WeakSet<Page>();
+
+/** Recover an indexed link from ChatGPT's virtualized history. */
 async function findIndexedFileInHistory(page: Page, chatId: string, identity: string): Promise<ChatFile | null> {
   const scan = async (): Promise<ChatFile | null> => {
     const snapshot = await scrapeCurrentChat(page);
     if (!snapshot || snapshot.id !== chatId) throw new Error('file download chat mismatch');
-    return (await findChatFiles(page, snapshot.messages)).find(f => f.identity === identity) || null;
+    const files = await findChatFiles(page, snapshot.messages);
+    const exact = files.find(f => f.identity === identity);
+    if (exact) return exact;
+    // Earlier versions indexed some labels with a different prefix. Only permit
+    // fallback when message UUID and normalized filename uniquely identify a link.
+    const parts = identity.split('|');
+    const messageId = parts[0]?.toLowerCase();
+    const label = parts.slice(1, -1).join('|');
+    const equivalent = files.filter(f => f.messageId === messageId &&
+      f.label.replace(/^Open\s+preview\s+of\s+/i, '').trim() === label);
+    return equivalent.length === 1 ? equivalent[0]! : null;
   };
   const immediate = await scan();
   if (immediate) return immediate;
-  // ChatGPT only mounts a subset of long conversations. Move progressively up
-  // so React has a chance to render and fetch earlier chunks between scans.
-  for (let step = 0; step < 90; step++) {
-    const moved = await page.evaluate(() => {
-      const main = document.querySelector('main');
-      const candidates = [document.scrollingElement, main, ...Array.from(main?.querySelectorAll('*') || [])]
-        .filter((v): v is Element => !!v);
-      const scrollers = candidates.filter(el => {
-        const h = el as HTMLElement;
-        return h.scrollHeight > h.clientHeight + 100 &&
-          (el === document.scrollingElement || /auto|scroll/.test(getComputedStyle(el).overflowY));
-      });
-      const target = scrollers.sort((a, b) => {
-        const ax = a as HTMLElement, bx = b as HTMLElement;
-        return (bx.scrollHeight - bx.clientHeight) - (ax.scrollHeight - ax.clientHeight);
-      })[0] as HTMLElement | undefined;
-      if (!target) return false;
-      const before = target.scrollTop;
-      target.scrollTop = Math.max(0, before - Math.max(400, target.clientHeight * 0.85));
-      return before !== target.scrollTop;
-    });
-    await page.waitForTimeout(moved ? 300 : 700);
+  let stagnant = 0;
+  for (let step = 0; step < 120; step++) {
+    const state = await scrollChatHistoryUp(page);
+    log.debug(`[files] history scan chat=${chatId} step=${step + 1} scroller=${state.kind} top=${state.before}->${state.after} moved=${state.moved}`);
+    if (!state.moved) {
+      // Wheel events can trigger lazy history loaders whose DOM doesn't respond
+      // to direct scrollTop assignment. Target the thread instead of the sidebar.
+      const message = page.locator('[data-chatgpt-search-message-ids]:visible').first();
+      if (await message.count()) {
+        await message.evaluate(el => el.scrollIntoView({ block: 'center' })).catch(() => {});
+        const box = await message.boundingBox();
+        if (box) {
+          await page.mouse.move(box.x + Math.min(box.width / 2, 80), box.y + Math.min(box.height / 2, 40));
+          await page.mouse.wheel(0, -700);
+        }
+      }
+    }
+    await page.waitForTimeout(state.moved ? 380 : 750);
     const found = await scan();
     if (found) {
-      log.info(`[files] recovered archived attachment after scrolling upward steps=${step + 1} chat=${chatId}`);
+      log.info(`[files] recovered indexed attachment after upward history scan steps=${step + 1} chat=${chatId}`);
       return found;
     }
-    // At the top, allow asynchronous history loading before declaring failure.
-    if (!moved && step > 3) break;
+    if (state.top || !state.moved) stagnant++;
+    else stagnant = 0;
+    if (stagnant >= 8) {
+      log.warn(`[files] history search exhausted at top chat=${chatId} identity=${identity} steps=${step + 1}`);
+      break;
+    }
   }
   return null;
 }
 
 async function downloadChatFile(page: Page, expectedChatId: string, identity: string, directory: string): Promise<string> {
+  // The main watcher polls concurrently. A history retrieval may mount old ZIP
+  // controls that must never trigger an auto-hook (even if new to the DOM).
+  pagesReadingAttachmentHistory.add(page);
+  try {
   // Remember scroll positions of the document and any inner thread scrollers.
   // Restore in finally even if a download, preview or history search fails.
   await page.evaluate(() => {
@@ -2029,6 +2120,9 @@ async function downloadChatFile(page: Page, expectedChatId: string, identity: st
       }
       delete store.__ctlFileScrollState;
     }).catch(() => {});
+  }
+  } finally {
+    pagesReadingAttachmentHistory.delete(page);
   }
 }
 
@@ -2590,6 +2684,22 @@ function startControlServer(
           chat_id?: string; chat?: string; directory?: string; extract_to?: string; identity?: string;
           text?: string; files?: string[]; new_chat?: boolean; draft?: boolean;
         };
+        if (url.pathname === "/html") {
+          const requestedId = body.chat_id ? normalizeUuid(body.chat_id) : null;
+          if (body.chat_id && !requestedId) return Response.json({ error: "invalid chat_id" }, { status: 400 });
+          // Snapshot only an existing page; do not open, focus, navigate or scroll.
+          const target = requestedId
+            ? openConversationPages(runtimes).find((item) => item.chatId === requestedId)
+            : (() => { try { return getVirtualFocus(focus, runtimes); } catch { return undefined; } })();
+          if (!target || target.page.isClosed()) {
+            return Response.json({ error: requestedId
+              ? `chat ${requestedId} is not currently open; use ctl open first`
+              : "no virtually focused open chat; use ctl open first" }, { status: 404 });
+          }
+          const html = await target.page.content();
+          log.info(`[ctl] html snapshot chat=${normalizeUuid(target.page.url()) ?? "unknown"} browser=${target.runtime.name} bytes=${Buffer.byteLength(html)}`);
+          return Response.json({ ok: true, chat_id: normalizeUuid(target.page.url()), browser_name: target.runtime.name, html });
+        }
         if (url.pathname === "/sync-chats") {
           const counts: Array<{ browser_name: string; count: number }> = [];
           for (const runtime of runtimes) {
@@ -3206,11 +3316,22 @@ async function watch(cfg: Config, configPath: string) {
 
             if (hook && hook.enabled) {
               const targets = await findZipTargets(page);
+              // File browsing traverses older messages while the polling loop is
+              // active. Record what appeared, but never auto-run a hook for it.
+              if (pagesReadingAttachmentHistory.has(page)) {
+                for (const target of assistantZipTargets(targets, chat.messages)) {
+                  handledHookDownloads.add(`${chat.id}:${target.identity}`);
+                }
+                log.debug(`[hook] suppressed ZIP detection during ctl files history scan chat=${chat.id}`);
+                return;
+              }
               if (!hookWasInitialized) {
                 // Opening/navigating to an existing chat is not a hook event.
                 // Establish a baseline before accepting any new message IDs.
                 for (const target of assistantZipTargets(targets, chat.messages)) handledHookDownloads.add(`${chat.id}:${target.identity}`);
                 initializedHookChats.add(chat.id);
+                baselineAssistantTurnByChat.set(chat.id,
+                  latestAssistantFromMessages(chat.messages)?.turnOrder ?? null);
                 pendingHookMessages.delete(chat.id);
                 log.info(`[hook] initialized ZIP baseline for chat=${chat.id} (${targets.length} existing attachments; no hook run)`);
               } else {
@@ -3219,7 +3340,21 @@ async function watch(cfg: Config, configPath: string) {
                 // receive them while virtual focus belongs to a different pane.
                 // The baseline above prevents processing existing attachments
                 // merely because a pane was opened or the watcher restarted.
-                const associated = assistantZipTargets(targets, chat.messages).sort(newestZipFirst);
+                const observed = assistantZipTargets(targets, chat.messages).sort(newestZipFirst);
+                // A scroll mounts previously unseen OLD controls. Their appearance
+                // is not a new assistant artifact. Compare stable turn numbers,
+                // not volatile DOM positions or database insertion timestamps.
+                const baselineTurn = baselineAssistantTurnByChat.get(chat.id) ?? null;
+                const associated = freshZipCandidates(observed, baselineTurn, newAssistantMessages);
+                for (const historical of observed) {
+                  if (!associated.includes(historical)) {
+                    handledHookDownloads.add(`${chat.id}:${historical.identity}`);
+                  }
+                }
+                const newestVisibleTurn = chat.messages
+                  .filter((message) => message.role === "assistant" && message.turnOrder !== undefined)
+                  .reduce<number | null>((max, message) => max === null ? message.turnOrder! : Math.max(max, message.turnOrder!), baselineTurn);
+                if (newestVisibleTurn !== null) baselineAssistantTurnByChat.set(chat.id, newestVisibleTurn);
                 // The in-memory baseline records what was already rendered when
                 // this chat became ready. A new assistant-owned attachment is
                 // an event even when it appears later in an existing assistant

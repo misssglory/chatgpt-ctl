@@ -142,6 +142,19 @@ enum Commands {
         interval_ms: u64,
     },
 
+    /// Output the live HTML DOM of an opened chat (stdout by default).
+    Html {
+        /// Chat UUID, title, or live open-pane index (negative counts from the end); defaults to virtual focus
+        #[arg(allow_hyphen_values = true, conflicts_with = "chat_option")]
+        chat: Option<String>,
+        /// Explicit chat selector
+        #[arg(short = 'c', long = "chat", value_name = "CHAT", allow_hyphen_values = true, conflicts_with = "chat")]
+        chat_option: Option<String>,
+        /// Save HTML to this file instead of stdout
+        #[arg(short = 'o', long = "output", value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
+        output: Option<PathBuf>,
+    },
+
     /// Browse assistant downloads and user uploads with fzf (newest first).
     #[command(alias = "file")]
     Files {
@@ -1359,6 +1372,28 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Commands::Html { chat, chat_option, output } => {
+            let spec = chat_option.or(chat);
+            let chat_id = match spec {
+                Some(spec) => Some(resolve_live_chat_selector(&url, &spec).await?),
+                None => None,
+            };
+            let body = serde_json::json!({ "chat_id": chat_id.map(|id| id.to_string()) }).to_string();
+            let response = watcher_request("POST", "/html", Some(&body))?;
+            let value: serde_json::Value = serde_json::from_str(&response)
+                .context("parse watcher HTML response")?;
+            let html = value.get("html").and_then(|v| v.as_str())
+                .context("watcher HTML response has no html content")?;
+            if let Some(file) = output {
+                std::fs::write(&file, html.as_bytes())
+                    .with_context(|| format!("write HTML snapshot to {}", file.display()))?;
+                eprintln!("saved {} bytes of chat HTML to {}", html.len(), file.display());
+            } else {
+                let mut stdout = io::stdout().lock();
+                stdout.write_all(html.as_bytes())?;
+                stdout.flush()?;
+            }
+        }
         Commands::Files { chat, copy, edit, editor, download } => {
             let client = connect(&url).await?;
             browse_files(&client, &url, chat.as_deref(), copy, edit, editor.as_deref(), download).await?;
@@ -1561,6 +1596,19 @@ mod cli_completion_tests {
         assert!(script.contains("__complete-chat"));
         assert!(script.contains("_chatgpt-ctl"));
         assert!(script.contains("complete -F _chatgpt_ctl_dynamic"));
+    }
+
+    #[test]
+    fn html_accepts_negative_index_and_output() {
+        let cli = Cli::try_parse_from(["chatgpt-ctl", "html", "-c", "-1", "-o", "/tmp/chat.html"]).unwrap();
+        match cli.command {
+            Commands::Html { chat, chat_option, output } => {
+                assert!(chat.is_none());
+                assert_eq!(chat_option.as_deref(), Some("-1"));
+                assert_eq!(output.unwrap(), PathBuf::from("/tmp/chat.html"));
+            }
+            _ => panic!("expected html command"),
+        }
     }
 
     #[test]

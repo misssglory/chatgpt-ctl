@@ -1,0 +1,14 @@
+import { readFileSync } from 'node:fs';
+import assert from 'node:assert/strict';
+const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+const start = source.indexOf('async function retrieveFileFromControl(');
+const end = source.indexOf('/** Scroll the actual conversation viewport', start);
+assert(start >= 0 && end > start);
+const retrieve = source.slice(start, end);
+assert(!retrieve.includes("viewer.locator('body').getByRole"), 'must not click global Download buttons');
+assert(retrieve.includes('openedFilePreviewRoot(viewer,'), 'must inspect scoped preview root');
+assert(retrieve.includes('ancestor::*[.//button[@aria-label="Download file"]][1]'), 'must scope fallback to selected file card');
+assert(retrieve.includes('force: true'), 'overlay-intercepted actions require scoped fallback');
+assert(retrieve.includes('readFilePreview(viewer,'), 'must retain preview text fallback');
+assert(retrieve.includes('finally {'), 'must clean preview up even on failure');
+console.log('file-preview-scoped v0.1.33 source regressions passed');
