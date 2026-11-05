@@ -1,0 +1,14 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+const root = new URL('../', import.meta.url);
+const ts = readFileSync(new URL('src/index.ts', root), 'utf8');
+const rust = readFileSync(new URL('ctl/src/watch.rs', root), 'utf8');
+assert.match(ts, /\[data-code-block="true"\]/);
+assert.match(ts, /CodeContent/);
+assert.match(ts, /processed = new Set<Element>\(\)/);
+assert.match(ts, /pre > code/);
+assert.match(rust, /fn language_query\(/);
+assert.match(rust, /fn canonical_language\(/);
+assert.match(rust, /fn exact_language_filter_only_matches_language\(/);
+assert.match(rust, /fn code_search_text(?:<[^>]+>)?\(/);
+console.log('code language/source selectors checked');

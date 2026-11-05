@@ -1207,20 +1207,37 @@ async function scrapeCurrentChat(page: Page): Promise<ScrapedChat | null> {
       // a machine-readable form so the PostgreSQL/Ratatui code tab can find it.
       // Exclude non-code "pre" decorations and do not serialize toolbar text.
       const blocks: string[] = [];
-      for (const code of Array.from(candidate.querySelectorAll('pre > code'))) {
-        const pre = code.parentElement;
-        if (!pre) continue;
+      // Two currently observed ChatGPT layouts:
+      //   Rust/Bash: <pre><code>...</code></pre>
+      //   TOML:      <div data-code-block="true">...<code>...</code></div>
+      // Index the outer code-block once; do not include inline prose <code> or
+      // duplicate the same block through both selectors.
+      const codeRoots = Array.from(candidate.querySelectorAll('[data-code-block="true"], [class*="CodeBlock-"]'))
+        .filter(root => !root.parentElement?.closest('[data-code-block="true"], [class*="CodeBlock-"]'));
+      const processed = new Set<Element>();
+      const appendCode = (code: Element, root: Element) => {
+        if (processed.has(code)) return;
         const value = (code.textContent || '').replace(/\r\n/g, '\n').trimEnd();
-        if (!value) continue;
-        const pane = pre.closest('[class*="InlineCodePane"], [class*="CodeBlock"], [class*="code-block"]')?.parentElement?.parentElement || pre.parentElement;
-        const header = pane?.querySelector('[class*="ActionBar"] [class*="truncate"], [data-code-language]');
+        if (!value.trim()) return;
+        const header = root.querySelector('[class*="ActionBar"] [class*="truncate"], [data-code-language]');
         const hint = header?.getAttribute('data-code-language') || header?.textContent ||
           Array.from(code.classList).find(x => x.startsWith('language-'))?.replace(/^language-/, '') || '';
         const language = hint.trim().toLowerCase().replace(/[^a-z0-9+#._-]/g, '').slice(0, 32);
-        // Delimiter length > longest backtick run found in code.
         const longest = Math.max(3, ...Array.from(value.matchAll(/`+/g), m => m[0].length + 1));
         const fence = '`'.repeat(longest);
         blocks.push(`${fence}${language}\n${value}\n${fence}`);
+        processed.add(code);
+      };
+      for (const root of codeRoots) {
+        const code = root.querySelector('pre > code, [class*="CodeContent"], .chatgpt-code-scrollport code');
+        if (code) appendCode(code, root);
+      }
+      // Legacy ChatGPT markup has no code-block wrapper, only pre > code.
+      for (const code of Array.from(candidate.querySelectorAll('pre > code'))) {
+        if (processed.has(code)) continue;
+        const pre = code.parentElement;
+        const root = pre?.closest('[class*="InlineCodePane"], [class*="CodeBlock"], [data-code-block]')?.parentElement?.parentElement || pre?.parentElement;
+        if (root) appendCode(code, root);
       }
       if (blocks.length) content += '\n\n' + blocks.join('\n\n');
 

@@ -112,6 +112,7 @@ fn syntax_line(source: &str, lang: &str, query: &str, max_chars: usize) -> Line<
     let rust = matches!(lang, "rust" | "rs");
     let shell = matches!(lang, "bash" | "sh" | "shell" | "zsh" | "nix");
     let python = matches!(lang, "python" | "py");
+    let toml = matches!(lang, "toml");
     let js = matches!(lang, "javascript" | "js" | "typescript" | "ts" | "tsx" | "jsx");
     let keywords: &[&str] = if rust { &[
         "fn","let","mut","pub","use","impl","struct","enum","match","if","else","for","while","loop","return","async","await","self","Self","trait","mod","const","static","true","false","Some","None","Ok","Err","where","in","move","ref"]
@@ -124,7 +125,7 @@ fn syntax_line(source: &str, lang: &str, query: &str, max_chars: usize) -> Line<
     let mut i = start;
     while i < end {
         let c=chars[i];
-        let comment = c == '#' && (shell || python) || c == '/' && i+1 < chars.len() && chars[i+1] == '/' && (rust || js);
+        let comment = c == '#' && (shell || python || toml) || c == '/' && i+1 < chars.len() && chars[i+1] == '/' && (rust || js);
         if comment {
             let mut j=i;
             while j<end { j+=1; }
@@ -149,7 +150,8 @@ fn syntax_line(source: &str, lang: &str, query: &str, max_chars: usize) -> Line<
             let mut j=i+1;
             while j<end && (chars[j].is_alphanumeric() || chars[j]=='_') {j+=1;}
             let token: String=chars[i..j].iter().collect();
-            let foreground=if keywords.contains(&token.as_str()) {Color::Magenta}
+            let foreground=if toml && (source.trim_start().starts_with('[') || source.trim_start().starts_with(&token)) {Color::Cyan}
+                else if keywords.contains(&token.as_str()) {Color::Magenta}
                 else if token.chars().next().is_some_and(|v|v.is_ascii_digit()){Color::Yellow}
                 else if j<chars.len() && chars[j]=='(' {Color::Cyan}
                 else {Color::Reset};
@@ -208,7 +210,35 @@ fn filtered_questions(turns: &[Turn], query: &str) -> Vec<usize> {
     if !query.is_empty() { matches.sort_by(|a,b| b.1.cmp(&a.1).then(a.0.cmp(&b.0))); }
     matches.into_iter().map(|(i,_)| i).collect()
 }
+/// An exact language name (or lang:NAME) is a language-only query.
+/// Other searches continue to match question text and code contents.
+fn language_query(query: &str) -> Option<&str> {
+    let value = query.trim().strip_prefix("lang:").unwrap_or(query.trim());
+    let value = value.trim();
+    if ["rust","rs","bash","sh","shell","zsh","toml","python","py","javascript","js","typescript","ts","json","yaml","yml","nix","html","css","sql","go","c","cpp","c++","java"].contains(&value.to_ascii_lowercase().as_str()) {
+        Some(value)
+    } else if query.trim().starts_with("lang:") && !value.is_empty() {
+        Some(value)
+    } else { None }
+}
+fn canonical_language(lang: &str) -> &str {
+    match lang.trim().to_ascii_lowercase().as_str() {
+        "rs" | "rust" => "rust",
+        "bash" | "sh" | "shell" | "zsh" => "bash",
+        "py" | "python" => "python",
+        "js" | "javascript" => "javascript",
+        "ts" | "typescript" => "typescript",
+        "yml" | "yaml" => "yaml",
+        _ => lang,
+    }
+}
 fn filtered_code(blocks: &[CodeItem], query: &str) -> Vec<usize> {
+    if let Some(lang) = language_query(query) {
+        let expected = canonical_language(lang).to_ascii_lowercase();
+        return blocks.iter().enumerate().filter_map(|(i, c)|
+            (canonical_language(&c.language).to_ascii_lowercase() == expected).then_some(i)
+        ).collect();
+    }
     let mut matches: Vec<(usize, i64)> = blocks.iter().enumerate().filter_map(|(i,c)| {
         let a = fuzzy_positions(&c.question,query).map(|x| x.0);
         let b = fuzzy_positions(&c.body,query).map(|x| x.0);
@@ -217,6 +247,9 @@ fn filtered_code(blocks: &[CodeItem], query: &str) -> Vec<usize> {
     }).collect();
     if !query.is_empty() { matches.sort_by(|a,b| b.1.cmp(&a.1).then(a.0.cmp(&b.0))); }
     matches.into_iter().map(|(i,_)| i).collect()
+}
+fn code_search_text<'a>(query: &'a str) -> &'a str {
+    if language_query(query).is_some() { "" } else { query }
 }
 
 struct Model {
@@ -229,6 +262,8 @@ struct Model {
     history_draft: String,
     viewer: bool,
     viewer_scroll: usize,
+    word_wrap: bool,
+    viewer_page_height: usize,
     index: usize,
     status: String,
     questions: Vec<Turn>,
@@ -316,28 +351,66 @@ impl Model {
     }
 }
 
+/// Render an assistant answer with code-fence-aware syntax coloring.
+/// The persisted watcher text uses Markdown fences for HTML code blocks.
+fn assistant_answer_lines(answer: &str, query: &str) -> Vec<Line<'static>> {
+    let mut output = Vec::new();
+    let mut fence: Option<(char, usize, String)> = None;
+    for source in answer.lines() {
+        let trimmed = source.trim_start();
+        let marker = trimmed.chars().next().unwrap_or(' ');
+        let length = if marker == '`' || marker == '~' {
+            trimmed.chars().take_while(|&c| c == marker).count()
+        } else { 0 };
+        if let Some((opening, minimum, language)) = &fence {
+            if marker == *opening && length >= *minimum && trimmed[length..].trim().is_empty() {
+                output.push(Line::styled(source.to_string(), Style::default().fg(Color::DarkGray)));
+                fence = None;
+            } else {
+                output.push(syntax_line(source, language, query, usize::MAX / 2));
+            }
+        } else if length >= 3 {
+            let lang = trimmed[length..].trim().to_owned();
+            output.push(Line::styled(source.to_string(), Style::default().fg(Color::Cyan)));
+            fence = Some((marker, length, lang));
+        } else {
+            output.push(emphasis(source, query, usize::MAX / 2));
+        }
+    }
+    output
+}
+
 fn viewer_lines(m: &Model) -> Vec<Line<'static>> {
     let mut lines=Vec::new();
     if let Some(t)=m.selected_turn() {
         lines.push(Line::styled(format!("USER · sequence {} · {}",t.sequence,t.question_id),Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
-        for line in t.question.lines() {lines.push(emphasis(line,&m.query,usize::MAX / 2));}
+        lines.extend(t.question.lines().map(|line|emphasis(line,&m.query,usize::MAX / 2)));
         lines.push(Line::raw(""));
         lines.push(Line::styled(format!("ASSISTANT · {}",t.answer_id.map(|v|v.to_string()).unwrap_or_else(||"no answer indexed".into())),Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
-        for line in t.answers.lines() {
-            // Preserve code layout while retaining fuzzy match highlighting.
-            lines.push(emphasis(line,&m.query,usize::MAX / 2));
-        }
+        lines.extend(assistant_answer_lines(&t.answers,&m.query));
     } else if let Some(c)=m.selected_code() {
         lines.push(Line::styled(format!("{} · block {} · sequence {} · {}",c.language,c.number+1,c.sequence,c.source_id),Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
         lines.push(Line::styled(format!("Q: {}",c.question.lines().next().unwrap_or("")),Style::default().fg(Color::Gray)));
         lines.push(Line::raw(""));
         for (n,line) in c.body.lines().enumerate() {
             let mut spans=vec![Span::styled(format!("{:>4} │ ",n+1),Style::default().fg(Color::DarkGray))];
-            spans.extend(syntax_line(line,&c.language,&m.query,usize::MAX/2).spans);
+            spans.extend(syntax_line(line,&c.language,code_search_text(&m.query),usize::MAX/2).spans);
             lines.push(Line::from(spans));
         }
     }
     lines
+}
+
+/// Approximate the number of terminal rows after wrapping, so End can reach
+/// the bottom of a long paragraph instead of stopping at the last logical line.
+/// Ratatui wraps at word boundaries, so this is a conservative upper estimate.
+fn viewer_visual_rows(lines: &[Line<'_>], width: usize, wrap: bool) -> usize {
+    if !wrap { return lines.len(); }
+    let width = width.max(1);
+    lines.iter().map(|line| {
+        let count = line.width();
+        if count == 0 { 1 } else { (count.saturating_add(width - 1) / width).max(1) }
+    }).sum()
 }
 
 fn draw_viewer(frame: &mut ratatui::Frame, m: &Model) {
@@ -346,11 +419,14 @@ fn draw_viewer(frame: &mut ratatui::Frame, m: &Model) {
     let title=if m.tab==Tab::Questions {"Question & answer"} else {"Code block"};
     frame.render_widget(Paragraph::new(format!(" {} · {}",m.title,title)).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),parts[0]);
     let content=viewer_lines(m);
-    let max_scroll=content.len().saturating_sub(parts[1].height.saturating_sub(2) as usize);
+    let content_width = parts[1].width.saturating_sub(2) as usize;
+    let content_height = parts[1].height.saturating_sub(2) as usize;
+    let max_scroll=viewer_visual_rows(&content,content_width,m.word_wrap).saturating_sub(content_height);
     let scroll=m.viewer_scroll.min(max_scroll);
-    frame.render_widget(Paragraph::new(content).block(Block::default().borders(Borders::ALL).title(title))
-        .scroll((scroll.min(u16::MAX as usize) as u16,0)),parts[1]);
-    frame.render_widget(Paragraph::new(format!("↑↓/jk scroll   PgUp/PgDn page   Home/End   Esc/Enter back   b browser jump   {}",m.status))
+    let mut paragraph = Paragraph::new(content).block(Block::default().borders(Borders::ALL).title(title));
+    if m.word_wrap { paragraph = paragraph.wrap(Wrap { trim: false }); }
+    frame.render_widget(paragraph.scroll((scroll.min(u16::MAX as usize) as u16,0)),parts[1]);
+    frame.render_widget(Paragraph::new(format!("↑↓/jk scroll   PgUp/PgDn page   Home/End   w wrap:{}   Esc/Enter back   b browser jump   {}",if m.word_wrap {"ON"} else {"OFF"},m.status))
         .style(Style::default().fg(Color::Gray)),parts[2]);
 }
 
@@ -394,11 +470,11 @@ fn draw(frame: &mut ratatui::Frame, m: &Model) {
         Tab::Code => filtered_code(&m.code,&m.query).into_iter().map(|i| {
             let b=&m.code[i];
             let mut lines=vec![Line::styled(format!("seq {}  {} #{}  · {}", b.sequence, b.language, b.number+1,b.source_id),Style::default().fg(Color::Blue)),
-                emphasis(&format!("Q: {}",b.question),&m.query,display_width)];
+                emphasis(&format!("Q: {}",b.question),code_search_text(&m.query),display_width)];
             let mut shown=0;
             for line in b.body.lines() {
                 if shown >= 4 { break; }
-                lines.push(syntax_line(line,&b.language,&m.query,display_width));
+                lines.push(syntax_line(line,&b.language,code_search_text(&m.query),display_width));
                 shown+=1;
             }
             if b.body.lines().count()>shown {lines.push(Line::raw("…"));}
@@ -430,7 +506,7 @@ pub(crate) async fn run(client: &Client, chat_id: Uuid, title: String) -> Result
     let (questions,code)=build_items(&messages);
     if questions.is_empty() && code.is_empty() { anyhow::bail!("no persisted messages for chat {chat_id}"); }
     let mut m=Model { tab:Tab::Questions,query:String::new(),searching:false,cursor:0,
-        search_history:Vec::new(),history_index:None,history_draft:String::new(),viewer:false,viewer_scroll:0,
+        search_history:Vec::new(),history_index:None,history_draft:String::new(),viewer:false,viewer_scroll:0,word_wrap:true,viewer_page_height:20,
         index:0,status:String::new(),questions,code,title };
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout=io::stdout();
@@ -461,14 +537,20 @@ pub(crate) async fn run(client: &Client, chat_id: Uuid, title: String) -> Result
                 continue;
             }
             if m.viewer {
+                if let Ok(size) = terminal.size() { m.viewer_page_height = size.height.saturating_sub(6).max(1) as usize; }
                 match key.code {
                     KeyCode::Esc | KeyCode::Enter => {m.viewer=false;m.viewer_scroll=0;},
                     KeyCode::Down | KeyCode::Char('j') => m.viewer_scroll=m.viewer_scroll.saturating_add(1),
                     KeyCode::Up | KeyCode::Char('k') => m.viewer_scroll=m.viewer_scroll.saturating_sub(1),
-                    KeyCode::PageDown => m.viewer_scroll=m.viewer_scroll.saturating_add(20),
-                    KeyCode::PageUp => m.viewer_scroll=m.viewer_scroll.saturating_sub(20),
+                    KeyCode::PageDown => m.viewer_scroll=m.viewer_scroll.saturating_add(m.viewer_page_height),
+                    KeyCode::PageUp => m.viewer_scroll=m.viewer_scroll.saturating_sub(m.viewer_page_height),
                     KeyCode::Home => m.viewer_scroll=0,
-                    KeyCode::End => m.viewer_scroll=viewer_lines(&m).len(),
+                    KeyCode::End => {
+                        let width = terminal.size().map(|s| s.width.saturating_sub(2) as usize).unwrap_or(80);
+                        m.viewer_scroll=viewer_visual_rows(&viewer_lines(&m), width, m.word_wrap)
+                            .saturating_sub(m.viewer_page_height);
+                    },
+                    KeyCode::Char('w') => {m.word_wrap=!m.word_wrap;m.viewer_scroll=0;},
                     KeyCode::Char('b') | KeyCode::Char('o') => browser_jump(&mut m,chat_id),
                     _ => {}
                 }
@@ -503,6 +585,17 @@ pub(crate) async fn run(client: &Client, chat_id: Uuid, title: String) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn exact_language_filter_only_matches_language() {
+        let make = |lang: &str| CodeItem { question: "rust mentioned in question".into(),
+            body: "bash appears as code text".into(),language:lang.into(),
+            source_id:Uuid::nil(),sequence:1,number:0 };
+        let blocks = vec![make("toml"),make("rust"),make("Bash"),make("shell")];
+        assert_eq!(filtered_code(&blocks,"toml"),vec![0]);
+        assert_eq!(filtered_code(&blocks,"rust"),vec![1]);
+        assert_eq!(filtered_code(&blocks,"bash"),vec![2,3]);
+        assert_eq!(filtered_code(&blocks,"lang:toml"),vec![0]);
+        assert_eq!(code_search_text("toml"),"");
+    }
     #[test] fn fuzzy_matches_subsequence() {
         assert!(fuzzy_positions("hello world","hwd").is_some());
         assert!(fuzzy_positions("hello world","hzz").is_none());
@@ -513,7 +606,7 @@ mod tests {
     }
     #[test] fn search_history_and_unicode_cursor() {
         let mut m=Model {tab:Tab::Questions,query:String::new(),searching:true,cursor:0,
-            search_history:Vec::new(),history_index:None,history_draft:String::new(),viewer:false,viewer_scroll:0,
+            search_history:Vec::new(),history_index:None,history_draft:String::new(),viewer:false,viewer_scroll:0,word_wrap:true,viewer_page_height:20,
             index:0,status:String::new(),questions:Vec::new(),code:Vec::new(),title:String::new()};
         m.insert_query('Ж');m.insert_query('x');m.cursor=1;m.insert_query('и');
         assert_eq!(m.query,"Жиx");m.erase_before_cursor();assert_eq!(m.query,"Жx");
@@ -521,6 +614,17 @@ mod tests {
         m.set_query("draft".into());m.previous_query();assert_eq!(m.query,"second");
         m.previous_query();assert_eq!(m.query,"Жx");
         m.next_query();assert_eq!(m.query,"second");m.next_query();assert_eq!(m.query,"draft");
+    }
+    #[test] fn answer_preview_colors_fenced_code() {
+        let lines=assistant_answer_lines("Explanation\n```rust\nfn main() {}\n```\n```bash\necho done\n```","");
+        assert_eq!(lines.len(),7);
+        assert!(lines[2].spans.iter().any(|s| s.style.fg == Some(Color::Magenta)));
+        assert!(lines[5].spans.iter().any(|s| s.style.fg == Some(Color::Magenta)));
+    }
+    #[test] fn wrapping_counts_visual_lines() {
+        let lines=vec![Line::raw("1234567890"),Line::raw("short")];
+        assert_eq!(viewer_visual_rows(&lines,5,false),2);
+        assert_eq!(viewer_visual_rows(&lines,5,true),3);
     }
     #[test] fn extracts_multiple_code_blocks() {
         assert_eq!(extract_code("```rust\nfn main() {}\n```\n~~~bash\necho hi\n~~~").len(),2);

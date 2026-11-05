@@ -1,4 +1,25 @@
-## v0.1.41 — interactive `ctl watch` viewer and search history
+## v0.1.43 — wrapped TUI preview and syntax-colored assistant code
+
+- `ctl watch` **Enter** opens the in-terminal question/answer or code-block viewer with **word wrapping enabled by default**. Press `w` while viewing to toggle wrap on/off. Wrapping preserves indentation (`Wrap { trim: false }`), and the mode is shown in the footer. The setting is retained when switching between previews in a watch session.
+- Assistant answers in the question/answer preview now recognize Markdown code fences (backticks or tildes), extract language tags, and apply the same lightweight Rust/Bash/TOML/Python/JS/TS syntax colors as the Code tab. Prose remains ordinary text with fuzzy-search highlighting.
+- Viewer `End`, `PgUp`, and `PgDn` account for wrapped content to improve navigating long code and answers. The browse-in-browser shortcut `b` is unchanged.
+- No database schema changes or watcher rescan required when code blocks are already indexed.
+
+## v0.1.42 — TOML extraction and exact code-language filters
+
+- `ctl rescan` now extracts both legacy `<pre><code>` blocks and modern
+  `[data-code-block="true"]` containers with standalone `<code>` nodes. The latter
+  is used for TOML in the current ChatGPT UI; each block is indexed once.
+- In the Code tab (`ctl watch`, key `2`), filtering with just `rust`, `bash`,
+  or `toml` shows **only** matching-language blocks, not text mentions in
+  code or questions. Common aliases are recognized (`rs`, `sh`, `shell`, etc.).
+  `lang:toml` explicitly filters a language as well. All other queries still
+  use fuzzy matching across code, language, and the preceding question.
+- TOML receives lightweight code coloring in the viewer.
+- Re-run `ctl rescan -c "Bollinger viewer update"` after restarting watcher
+  to replace previously stored messages with newly captured TOML blocks.
+
+## v0.1.42 — interactive `ctl watch` viewer and search history
 
 - `Enter`: opens the selected question/answer or full syntax-colored code block **inside Ratatui**, without changing the browser.
 - `b` (alias `o`): opens the associated message in ChatGPT and scrolls to it, from either list or viewer.
@@ -6,7 +27,7 @@
 - Fuzzy search: visible Unicode-aware editing cursor, Left/Right/Home/End, Backspace/Delete; Up/Down browse previous submitted queries. Going past the newest history entry restores the unsent draft.
 - Search history persists for the current `ctl watch` session; submit a search with Enter.
 
-## v0.1.41 — quiet rescan quarantine and reliable bottom restoration
+## v0.1.42 — quiet rescan quarantine and reliable bottom restoration
 
 - The expected post-rescan hook quarantine is no longer logged on every polling tick. The initial `rescan complete` log and eventual `quarantine released` log remain.
 - `ctl rescan` now returns the actual (possibly remounted) conversation transcript scroller to the newest messages, irrespective of its initial position, and waits for virtualization/layout to settle before removing history-read hook suppression.
