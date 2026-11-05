@@ -1,3 +1,12 @@
+## v0.1.46 — per-browser default projects and resumable project rescans
+
+- `ctl default-project Dima` sets the default ChatGPT project for the virtually focused browser profile. `ctl default-project -b NAME Dima` selects a named browser, `ctl default-project` shows its current project, `ctl default-project clear` disables it. A ChatGPT project URL or `g-p-*` ID is also accepted.
+- `ctl new-chat` and `ctl send --new-chat ...` open the configured project home page before composing, so new chats belong to that project. If no project is configured, they use the usual ChatGPT root.
+- `ctl rescan-all [PROJECT] [--browser NAME] [--jobs N] [--force]` opens the project page in a temporary browser tab, expands its scoped chat list with `Show more`, persists the complete ordered inventory (newest first) in PostgreSQL, and rescans pending conversations. `--jobs` (default 2, max 8) controls parallel temporary tabs; existing tabs are reused and left open. Scan progress is persisted per browser, project and chat as each chat completes. A rerun skips completed chats; `--force` rescans them. Project inventory order is kept in `chatgpt_watcher_project_scans.project_order` (zero-based). A standalone `ctl rescan` also updates the per-project scan marker.
+- Rescan keeps automatic historical ZIP hooks quarantined. Temporary tabs are closed afterward without taking virtual focus. Failed scans are not marked complete, and can resume on a subsequent run.
+- Project extraction uses `a[href*="/g/g-p-"][href$="/project"]` to resolve project names and the project's `role=list[aria-label^="Chats in "]` for message-safe `Show more` clicks. Supplied ChatGPT DOM confirmed these selectors.
+- New metadata is created by `ensureBrowserSchema`; old databases migrate on watcher startup without a manual reset.
+
 ## v0.1.45 — owner-scoped attachment downloads and unavailable-preview diagnostics
 
 `ctl files` now clicks resource-card Download controls only inside the selected attachment’s original message. If ChatGPT shows “Couldn’t load this file”, the CLI reports that failure rather than treating the error banner as file contents. This change cannot restore an attachment no longer served by ChatGPT.

@@ -1,0 +1,18 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+const source = readFileSync(new URL('../src/index.ts', import.meta.url),'utf8');
+const rust = readFileSync(new URL('../ctl/src/main.rs', import.meta.url),'utf8');
+assert.match(source, /ALTER TABLE chatgpt_watcher_browsers ADD COLUMN IF NOT EXISTS default_project/);
+assert.match(source, /CREATE TABLE IF NOT EXISTS chatgpt_watcher_project_scans/);
+assert.match(source, /PRIMARY KEY \(browser_name, project_id, chat_id\)/);
+assert.match(source, /\/rescan-all\/list/);
+assert.match(source, /\/project\/default/);
+assert.match(source, /role="listitem"\] button/);
+assert.match(source, /aria-label\^="Chats in "/);
+assert.match(source, /ON CONFLICT\(browser_name,project_id,chat_id\) DO UPDATE SET scanned_at=NOW\(\)/);
+assert.match(source, /await newChatTarget\(runtime\)/);
+assert.match(source, /pagesReadingAttachmentHistory\.add\(listingPage\)/);
+assert.match(rust, /DefaultProject \{/);
+assert.match(rust, /RescanAll \{/);
+assert.match(rust, /std::thread::scope/);
+console.log('per-browser project, persistent progress, parallel rescans source checks passed');

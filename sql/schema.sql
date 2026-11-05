@@ -78,3 +78,21 @@ CREATE TABLE IF NOT EXISTS chatgpt_watcher_files (
 );
 CREATE INDEX IF NOT EXISTS chatgpt_watcher_files_fresh_idx
     ON chatgpt_watcher_files (discovered_at DESC, id DESC);
+
+-- Per-profile project preference; new ctl chats inherit this project.
+ALTER TABLE chatgpt_watcher_browsers ADD COLUMN IF NOT EXISTS default_project text;
+
+-- Ordered project inventory and resumable scan state, newest project row = 0.
+CREATE TABLE IF NOT EXISTS chatgpt_watcher_project_scans (
+    browser_name text NOT NULL,
+    project_id text NOT NULL,
+    chat_id uuid NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    project_order integer NOT NULL,
+    scanned_at timestamptz,
+    last_error text,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (browser_name, project_id, chat_id)
+);
+CREATE INDEX IF NOT EXISTS watcher_project_scans_pending
+    ON chatgpt_watcher_project_scans (browser_name, project_id, project_order)
+    WHERE scanned_at IS NULL;

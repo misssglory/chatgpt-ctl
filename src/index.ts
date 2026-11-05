@@ -328,6 +328,20 @@ async function ensureBrowserSchema(sql: Sql): Promise<void> {
     )
   `);
   await sql.unsafe(`ALTER TABLE chatgpt_watcher_browsers ADD COLUMN IF NOT EXISTS auto_open boolean NOT NULL DEFAULT true`);
+  await sql.unsafe(`ALTER TABLE chatgpt_watcher_browsers ADD COLUMN IF NOT EXISTS default_project text`);
+  await sql.unsafe(`CREATE TABLE IF NOT EXISTS chatgpt_watcher_project_scans (
+    browser_name text NOT NULL,
+    project_id text NOT NULL,
+    chat_id uuid NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    project_order integer NOT NULL,
+    scanned_at timestamptz,
+    last_error text,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (browser_name, project_id, chat_id)
+  )`);
+  await sql.unsafe(`CREATE INDEX IF NOT EXISTS watcher_project_scans_pending
+    ON chatgpt_watcher_project_scans (browser_name, project_id, project_order) WHERE scanned_at IS NULL`);
+
   // Continuously persisted watcher pane snapshot, restored on the next launch.
   // One row represents one open conversation pane; focused_at preserves the
   // virtual-focus choice across browser contexts.
@@ -2957,6 +2971,67 @@ async function installFocusTracking(runtime: BrowserRuntime, focus: VirtualFocus
   for (const page of runtime.context.pages()) attachPage(page);
 }
 
+type ProjectChat = { id: string; title: string; order: number };
+const projectSlugPattern = /^g-p-[a-z0-9]+$/i;
+const projectFromUrl = (url: string): string | null => url.match(/\/g\/(g-p-[a-z0-9]+)(?:\/|$)/i)?.[1] ?? null;
+
+async function projectForBrowser(sql: Sql, browserName: string): Promise<string | null> {
+  const rows = await sql`SELECT default_project FROM chatgpt_watcher_browsers WHERE name=${browserName}`;
+  return rows[0]?.default_project ? String(rows[0].default_project) : null;
+}
+
+// Project selection is restricted to genuine ChatGPT /g/ links. A title is
+// resolved through the currently rendered project links, not URL guesswork.
+async function resolveProject(page: Page, selector: string): Promise<{id:string; name:string}> {
+  const candidate = selector.trim();
+  const fromUrl = projectFromUrl(candidate);
+  const slug = projectSlugPattern.test(candidate) ? candidate : fromUrl;
+  const links = await page.locator('a[href*="/g/g-p-"][href$="/project"]').evaluateAll(nodes =>
+    nodes.filter(node => (node as HTMLElement).getClientRects().length > 0).map(node => ({
+      href: (node as HTMLAnchorElement).getAttribute('href') || '',
+      name: (node.textContent || '').trim(),
+    }))
+  );
+  const match = links.find(link => projectFromUrl(link.href) === slug) ||
+    links.find(link => link.name.toLowerCase() === candidate.toLowerCase());
+  if (match) return {id: projectFromUrl(match.href)!, name: match.name || candidate};
+  if (slug) return {id: slug, name: candidate};
+  throw new Error(`Project '${selector}' not found in visible project links. Open that project in ChatGPT first, or supply its /g/.../project URL.`);
+}
+
+async function enumerateProjectChats(page: Page, projectId: string, baseUrl: string): Promise<ProjectChat[]> {
+  const route = `/g/${projectId}/project`;
+  await page.goto(new URL(route, baseUrl).toString(), {waitUntil:'domcontentloaded', timeout:45000});
+  const list = page.locator('[role="list"][aria-label^="Chats in "]:visible').first();
+  await list.waitFor({state:'visible',timeout:30000});
+  await list.locator(`a[href*="/g/${projectId}/c/"], [role="listitem"] button`).first()
+    .waitFor({state:'attached',timeout:15000}).catch(()=>{});
+  let stalled = 0;
+  let oldCount = -1;
+  for (let step=0;step<2000;step++) {
+    const more = list.locator('[role="listitem"] button').filter({hasText:/^Show more$/i}).first();
+    if (!await more.count() || !await more.isVisible()) break;
+    await more.click();
+    await page.waitForTimeout(300);
+    const count = await list.locator(`a[href*="/g/${projectId}/c/"]`).count();
+    if (count === oldCount) stalled++; else stalled=0;
+    oldCount=count;
+    if (stalled >= 8) throw new Error(`Project list stuck at ${count} chats after Show more; refusing incomplete inventory`);
+  }
+  const rows = await list.locator(`a[href*="/g/${projectId}/c/"]`).evaluateAll(anchors => anchors.map(a => ({
+    url:(a as HTMLAnchorElement).getAttribute('href')||'', title:(a.getAttribute('aria-label')||a.textContent||'').trim()
+  })));
+  const result:ProjectChat[]=[];
+  const ids=new Set<string>();
+  for (const row of rows) {
+    const id=row.url.match(/\/c\/([0-9a-f-]{36})(?:\/|$)/i)?.[1];
+    if (!id || ids.has(id)) continue;
+    ids.add(id);
+    result.push({id,title:row.title,order:result.length});
+  }
+  return result;
+}
+
 function startControlServer(
   runtimes: BrowserRuntime[],
   focus: VirtualFocus,
@@ -2972,6 +3047,10 @@ function startControlServer(
     attachNetworkDebug(page, cfg);
     runtime.activePage = page;
     return page;
+  };
+  const newChatTarget = async (runtime: BrowserRuntime): Promise<string> => {
+    const project = await projectForBrowser(sql,runtime.name);
+    return new URL(project ? `/g/${project}/project` : '/', cfg.chatgpt.url).toString();
   };
   const server = Bun.serve({
     hostname: CONTROL_HOST,
@@ -2994,26 +3073,76 @@ function startControlServer(
       try {
         const body = await request.json().catch(() => ({})) as {
           chat_id?: string; message_id?: string; chat?: string; directory?: string; extract_to?: string; identity?: string;
-          text?: string; files?: string[]; new_chat?: boolean; draft?: boolean;
+          text?: string; files?: string[]; new_chat?: boolean; draft?: boolean; browser_name?: string; project?: string; project_id?: string; project_order?: number;
         };
+        if (url.pathname === "/project/default") {
+          const browserName = body.browser_name || focus.runtime?.name || chooseDefaultRuntime()?.name;
+          const runtime = runtimes.find(r => r.name === browserName);
+          if (!runtime) return Response.json({error:`browser '${browserName}' not running`},{status:404});
+          if (typeof body.project === 'string') {
+            if (!body.project.trim() || body.project.toLowerCase()==='none' || body.project.toLowerCase()==='clear') {
+              await sql`UPDATE chatgpt_watcher_browsers SET default_project=NULL WHERE name=${runtime.name}`;
+            } else {
+              const source = focus.runtime===runtime && focus.page && !focus.page.isClosed()
+                ? focus.page : runtime.context.pages().find(p=>!p.isClosed()) || await makePage(runtime);
+              const selected = await resolveProject(source,body.project);
+              await sql`UPDATE chatgpt_watcher_browsers SET default_project=${selected.id}, updated_at=NOW() WHERE name=${runtime.name}`;
+            }
+          }
+          return Response.json({ok:true,browser_name:runtime.name,default_project:await projectForBrowser(sql,runtime.name)});
+        }
+        if (url.pathname === "/rescan-all/list") {
+          const runtime = body.browser_name
+            ? runtimes.find(r=>r.name===body.browser_name)
+            : focus.runtime || chooseDefaultRuntime();
+          if (!runtime) return Response.json({error:'browser not available'},{status:404});
+          const selector = body.project || await projectForBrowser(sql,runtime.name);
+          if (!selector) return Response.json({error:'No project specified or configured; run ctl default-project PROJECT first'},{status:400});
+          const listingPage = await runtime.context.newPage();
+          configurePage(listingPage,cfg);
+          pagesReadingAttachmentHistory.add(listingPage);
+          try {
+            const landing = focus.runtime===runtime && focus.page && !focus.page.isClosed()
+              ? focus.page : runtime.context.pages().find(p=>p!==listingPage && !p.isClosed());
+            // Project slugs and URLs are accepted even when the sidebar is collapsed.
+            const resolved = await resolveProject(landing || listingPage,selector);
+            const chats = await enumerateProjectChats(listingPage,resolved.id,cfg.chatgpt.url);
+            // Persist the complete inventory BEFORE starting individual scans.
+            for (const item of chats) {
+              await sql`INSERT INTO chats(id,title,url) VALUES(${item.id}::uuid,${item.title},${new URL(`/g/${resolved.id}/c/${item.id}`,cfg.chatgpt.url).toString()})
+                ON CONFLICT(id) DO UPDATE SET title=CASE WHEN EXCLUDED.title<>'' THEN EXCLUDED.title ELSE chats.title END`;
+              await recordChatBrowser(sql,item.id,runtime.name);
+              await sql`INSERT INTO chatgpt_watcher_project_scans(browser_name,project_id,chat_id,project_order,updated_at)
+                VALUES(${runtime.name},${resolved.id},${item.id}::uuid,${item.order},NOW())
+                ON CONFLICT(browser_name,project_id,chat_id) DO UPDATE SET project_order=EXCLUDED.project_order,updated_at=NOW()`;
+            }
+            const pending = await sql`SELECT chat_id::text AS id,project_order AS "order",scanned_at
+              FROM chatgpt_watcher_project_scans WHERE browser_name=${runtime.name} AND project_id=${resolved.id}
+              ORDER BY project_order ASC`;
+            return Response.json({ok:true,browser_name:runtime.name,project_id:resolved.id,
+              chats:pending.filter(r=>chats.some(c=>c.id===r.id)).map(r=>({id:r.id,order:r.order,scanned:Boolean(r.scanned_at)}))});
+          } finally { pagesReadingAttachmentHistory.delete(listingPage); await listingPage.close().catch(()=>{}); }
+        }
         if (url.pathname === "/rescan") {
           const requestedId = body.chat_id ? normalizeUuid(body.chat_id) : null;
           if (body.chat_id && !requestedId) return Response.json({error: 'invalid chat_id'}, {status: 400});
           const existing = requestedId
-            ? openConversationPages(runtimes).find(item => item.chatId === requestedId)
+            ? openConversationPages(runtimes).find(item => item.chatId === requestedId && (!body.browser_name || item.runtime.name===body.browser_name))
             : (() => { try { return getVirtualFocus(focus, runtimes); } catch { return undefined; } })();
           const chatId = requestedId ?? existing?.chatId;
           if (!chatId) return Response.json({error:'no chat selected or under virtual focus'}, {status:404});
           // Guard by chat, not just by page: a poll already in flight, or the
           // first poll after traversal, must never apply historical archives.
           rescanHookQuarantine.set(chatId, new Set());
-          const runtime = existing?.runtime ?? await ensureRuntimeForChat(chatId);
+          const selectedRuntime = body.browser_name ? runtimes.find(r=>r.name===body.browser_name) : undefined;
+          if (body.browser_name && !selectedRuntime) throw new Error(`browser '${body.browser_name}' not running`);
+          const runtime = existing?.runtime ?? selectedRuntime ?? await ensureRuntimeForChat(chatId);
           const temporary = !existing;
           const page = existing?.page ?? await runtime.context.newPage();
           try {
             if (temporary) {
               configurePage(page,cfg);
-              await page.goto(new URL(`/c/${chatId}`, cfg.chatgpt.url).toString(), {
+              await page.goto(new URL(body.project_id ? `/g/${body.project_id}/c/${chatId}` : `/c/${chatId}`, cfg.chatgpt.url).toString(), {
                 waitUntil:'domcontentloaded', timeout:cfg.browser?.navigation_timeout_ms ?? 45_000
               });
               // Suppress hooks before any historical navigation.
@@ -3021,7 +3150,24 @@ function startControlServer(
               await waitForConversationReady(page,chatId,cfg.browser?.navigation_timeout_ms ?? 45_000);
             }
             const stats = await rescanChatHistory(sql,page,chatId,runtime.name);
+            // A manual `ctl rescan` also completes any existing project scan
+            // inventory entries for this chat, even when the chat is opened at
+            // the ordinary /c/ URL with no project breadcrumb.
+            await sql`UPDATE chatgpt_watcher_project_scans SET scanned_at=NOW(),last_error=NULL,updated_at=NOW()
+              WHERE browser_name=${runtime.name} AND chat_id=${chatId}::uuid`;
+            const projectId = body.project_id || projectFromUrl(page.url()) || await projectForBrowser(sql,runtime.name);
+            if (projectId && projectSlugPattern.test(projectId)) {
+              await sql`INSERT INTO chatgpt_watcher_project_scans(browser_name,project_id,chat_id,project_order,scanned_at,last_error,updated_at)
+                VALUES(${runtime.name},${projectId},${chatId}::uuid,${Number.isInteger(body.project_order)?body.project_order:2147483647},NOW(),NULL,NOW())
+                ON CONFLICT(browser_name,project_id,chat_id) DO UPDATE SET scanned_at=NOW(),last_error=NULL,updated_at=NOW()`;
+            }
             return Response.json({ok:true,chat_id:chatId,...stats});
+          } catch (error) {
+            if (body.project_id && projectSlugPattern.test(body.project_id)) {
+              await sql`UPDATE chatgpt_watcher_project_scans SET last_error=${String(error).slice(0,2000)},updated_at=NOW()
+                WHERE browser_name=${runtime.name} AND project_id=${body.project_id} AND chat_id=${chatId}::uuid`.catch(()=>{});
+            }
+            throw error;
           } finally {
             if (temporary) { pagesReadingAttachmentHistory.delete(page); await page.close().catch(() => {}); }
           }
@@ -3173,7 +3319,7 @@ function startControlServer(
           const runtime = focus.runtime && runtimes.includes(focus.runtime) ? focus.runtime : chooseDefaultRuntime();
           if (!runtime) return Response.json({ error: "no browser open; use ctl open <chat> or ctl send --chat <chat> first" }, { status: 409 });
           const page = await makePage(runtime);
-          const target = new URL("/", cfg.chatgpt.url).toString();
+          const target = await newChatTarget(runtime);
           await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
           await page.locator('#prompt-textarea, [data-composer-markdown][contenteditable="true"], [contenteditable="true"][role="textbox"], textarea').first()
             .waitFor({ state: "visible", timeout: 30_000 });
@@ -3213,7 +3359,7 @@ function startControlServer(
             runtime = virtual.runtime;
             if (body.new_chat) {
               page = await makePage(runtime);
-              await page.goto(new URL("/", cfg.chatgpt.url).toString(), {
+              await page.goto(await newChatTarget(runtime), {
                 waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000,
               });
               await page.locator('#prompt-textarea, [data-composer-markdown][contenteditable="true"], [contenteditable="true"][role="textbox"], textarea').first()

@@ -154,6 +154,30 @@ enum Commands {
         chat_option: Option<String>,
     },
 
+    /// Set or show the default ChatGPT project for a watcher browser.
+    /// PROJECT may be a visible project title, g-p-* slug, or ChatGPT project URL.
+    /// Use 'clear' to disable the default project.
+    DefaultProject {
+        project: Option<String>,
+        #[arg(short = 'b', long = "browser")]
+        browser: Option<String>,
+    },
+
+    /// Scan every chat in a project newest-first; resume completed scans from DB.
+    RescanAll {
+        /// Project name, g-p-* ID or URL; defaults to browser's configured project
+        project: Option<String>,
+        /// Browser profile (defaults to current virtual-focus browser)
+        #[arg(short = 'b', long = "browser")]
+        browser: Option<String>,
+        /// Maximum simultaneous chat scans (1..=8)
+        #[arg(short = 'j', long = "jobs", default_value_t = 2, value_parser = clap::value_parser!(usize))]
+        jobs: usize,
+        /// Rescan completed chats again
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Browse persisted questions/answers and code blocks in a Ratatui interface.
     Watch {
         /// Chat UUID/title/live pane index; defaults to virtual focus
@@ -1283,7 +1307,7 @@ fn watcher_request(method: &str, path: &str, body: Option<&str>) -> Result<Strin
     let address = std::env::var("CHATGPT_CTL_ADDR").unwrap_or_else(|_| "127.0.0.1:17381".into());
     let mut stream = TcpStream::connect(&address)
         .with_context(|| format!("connect to watcher control server at {address}; start `bun run watch`"))?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(120)))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(600)))?;
     let payload = body.unwrap_or("");
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
@@ -1358,6 +1382,67 @@ async fn main() -> Result<()> {
             println!("Rescanned {}: {} messages, {} files, {} history steps",
                 chat_id, value["messages"].as_u64().unwrap_or(0),
                 value["files"].as_u64().unwrap_or(0), value["steps"].as_u64().unwrap_or(0));
+        }
+        Commands::DefaultProject { project, browser } => {
+            // Omit project key when reading existing configuration.
+            let payload = if let Some(project) = project {
+                serde_json::json!({"project":project,"browser_name":browser}).to_string()
+            } else {
+                serde_json::json!({"browser_name":browser}).to_string()
+            };
+            let response = watcher_request("POST", "/project/default", Some(&payload))?;
+            let value: serde_json::Value = serde_json::from_str(&response)?;
+            println!("browser {} default project: {}",value["browser_name"].as_str().unwrap_or("unknown"),
+                value["default_project"].as_str().unwrap_or("(none)"));
+        }
+        Commands::RescanAll { project, browser, jobs, force } => {
+            anyhow::ensure!((1..=8).contains(&jobs), "--jobs must be in 1..=8");
+            let payload = serde_json::json!({"project":project,"browser_name":browser}).to_string();
+            let list = watcher_request("POST", "/rescan-all/list", Some(&payload))?;
+            let value: serde_json::Value = serde_json::from_str(&list)?;
+            let browser_name = value["browser_name"].as_str().context("missing browser_name")?.to_owned();
+            let project_id = value["project_id"].as_str().context("missing project_id")?.to_owned();
+            let all = value["chats"].as_array().context("missing project chats")?;
+            let pending: Vec<(String,i64)> = all.iter().filter(|chat| force || !chat["scanned"].as_bool().unwrap_or(false))
+                .filter_map(|chat| Some((chat["id"].as_str()?.to_owned(),chat["order"].as_i64()?)))
+                .collect();
+            println!("project {project_id} [{browser_name}] : {} chats, {} pending, jobs={jobs}",all.len(),pending.len());
+            // Fixed worker pool. Each request uses an independent TCP connection;
+            // the watcher creates temporary pages and persists per-chat completion.
+            let queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(pending)));
+            let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let failed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            std::thread::scope(|scope| {
+                for _ in 0..jobs {
+                    let queue = queue.clone();
+                    let completed = completed.clone();
+                    let failed = failed.clone();
+                    let browser_name = browser_name.clone();
+                    let project_id = project_id.clone();
+                    scope.spawn(move || loop {
+                        let job = queue.lock().unwrap().pop_front();
+                        let Some((id, order)) = job else { break };
+                        let payload = serde_json::json!({"chat_id":id,"browser_name":browser_name,
+                            "project_id":project_id,"project_order":order}).to_string();
+                        match watcher_request("POST", "/rescan", Some(&payload)) {
+                            Ok(response) => {
+                                completed.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                                let data:serde_json::Value = serde_json::from_str(&response).unwrap_or_default();
+                                println!("[{}] scanned {}: {} messages, {} files",order+1,id,
+                                    data["messages"].as_u64().unwrap_or(0),data["files"].as_u64().unwrap_or(0));
+                            },
+                            Err(error) => {
+                                failed.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                                eprintln!("[{}] FAILED {}: {error:#}",order+1,id);
+                            }
+                        }
+                    });
+                }
+            });
+            let ok = completed.load(std::sync::atomic::Ordering::Relaxed);
+            let errors = failed.load(std::sync::atomic::Ordering::Relaxed);
+            println!("rescan-all completed: {ok} scanned, {errors} failed; completed chats persist across runs");
+            if errors > 0 { anyhow::bail!("{errors} chats failed; rerun the same command to resume"); }
         }
         Commands::Watch { chat, chat_option } => {
             let chat_id = match chat_option.or(chat) {
@@ -1670,6 +1755,27 @@ mod cli_completion_tests {
                 assert_eq!(chat_option.as_deref(), Some("-1"));
             }
             _ => panic!("expected open command"),
+        }
+    }
+
+    #[test]
+    fn project_commands_parse() {
+        let cli = Cli::try_parse_from(["chatgpt-ctl", "default-project", "Dima", "--browser", "olya"]).unwrap();
+        match cli.command {
+            Commands::DefaultProject { project, browser } => {
+                assert_eq!(project.as_deref(), Some("Dima"));
+                assert_eq!(browser.as_deref(), Some("olya"));
+            }
+            _ => panic!("expected default-project"),
+        }
+        let cli = Cli::try_parse_from(["chatgpt-ctl", "rescan-all", "Dima", "--jobs", "3"]).unwrap();
+        match cli.command {
+            Commands::RescanAll { project, jobs, force, .. } => {
+                assert_eq!(project.as_deref(), Some("Dima"));
+                assert_eq!(jobs, 3);
+                assert!(!force);
+            }
+            _ => panic!("expected rescan-all"),
         }
     }
 
