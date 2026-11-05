@@ -1,3 +1,14 @@
+## v0.1.45 — owner-scoped attachment downloads and unavailable-preview diagnostics
+
+`ctl files` now clicks resource-card Download controls only inside the selected attachment’s original message. If ChatGPT shows “Couldn’t load this file”, the CLI reports that failure rather than treating the error banner as file contents. This change cannot restore an attachment no longer served by ChatGPT.
+
+## v0.1.45 — verified hook diagnostic submission
+
+- Hook failure reports no longer equate a successful Playwright click with a successful ChatGPT submission.
+- `sendInPage` targets a visible Send control, waits for it to become enabled, and checks for a *new* user message matching the report.
+- If the draft remains in the composer, submission may be retried (up to three bounded attempts). If the composer clears without message confirmation, submission is reported as ambiguous and **not retried**, preventing duplicate posts.
+- Log entries distinguish `confirmed submitted`, `draft remains`, and ambiguous submission. `ctl send` uses the same safety checks.
+
 ## v0.1.43 — wrapped TUI preview and syntax-colored assistant code
 
 - `ctl watch` **Enter** opens the in-terminal question/answer or code-block viewer with **word wrapping enabled by default**. Press `w` while viewing to toggle wrap on/off. Wrapping preserves indentation (`Wrap { trim: false }`), and the mode is shown in the footer. The setting is retained when switching between previews in a watch session.

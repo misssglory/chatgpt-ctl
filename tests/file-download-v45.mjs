@@ -1,0 +1,12 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+const text = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+const start = text.indexOf('async function retrieveFileFromControl');
+const end = text.indexOf('/** Scroll the actual conversation viewport', start);
+const fn = text.slice(start, end);
+assert(fn.includes('messageId: file.messageId'), 'fallback must receive owner message ID');
+assert(fn.includes('if (!owner) return false'), 'fallback must fail closed for unknown owner');
+assert(fn.includes('owner.querySelectorAll<HTMLButtonElement>'), 'file card must belong to owning message');
+assert(fn.includes('previewUnavailable'), 'explicitly detect inaccessible previews');
+assert(text.includes('Never save that error banner as if it were file contents'));
+console.log('attachment owner-scoping and preview errors passed');

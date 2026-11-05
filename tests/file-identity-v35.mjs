@@ -6,7 +6,7 @@ assert(source.includes('const unique = new Map<string, ChatFile & { priority: nu
 assert(source.includes('identity: `${key}|0`'));
 assert(source.includes('unique.set(key, next)'));
 assert(source.includes('trying explicit download link'));
-assert(source.includes('invoked matching resource-card Download'));
+assert(source.includes('invoked owner-scoped resource-card Download'));
 assert(source.includes('AND label = ${file.label} AND identity <> ${file.identity}'));
 assert(cli.includes('other.identity = concat(other.message_id'));
 assert(source.includes('setTimeout(restore, 650)'));

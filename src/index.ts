@@ -1955,6 +1955,10 @@ async function readFilePreview(viewer: Page, previousDialogs: number, isPopup: b
     const value = target instanceof HTMLTextAreaElement ? target.value :
       (target.innerText || target.textContent || '');
     const cleaned = value.replace(/\r\n/g, '\n').trim();
+    // An unavailable ChatGPT file may open a preview shell containing an
+    // error. Never save that error banner as if it were file contents.
+    if (/^(?:couldn[’']t|cannot|unable to) load (?:this |the )?file\.?$/i.test(cleaned) ||
+        /^(?:file (?:not found|unavailable)|failed to load file)\.?$/i.test(cleaned)) return null;
     const controls = Array.from(root.querySelectorAll('button')).map(e =>
       (e.getAttribute('aria-label') || e.textContent || '').trim());
     if (!content && (cleaned.length < 40 || (controls.length && cleaned.length < 100))) return null;
@@ -2051,20 +2055,25 @@ async function retrieveFileFromControl(page: Page, file: ChatFile, directory: st
       }
     }
     if (!download && !isPopup) {
-      // A resource card has a full-size transparent preview overlay over its
-      // toolbar. Resolve the card by exact filename, then dispatch the toolbar
-      // button directly in the browser DOM to avoid Playwright hit-test races.
-      const cardWasClicked = await page.evaluate((name) => {
-        const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>('button[aria-label^="Open preview of "]'));
+      // The attachment card can remain usable even if the preview says
+      // "Couldn't load this file". Never click a same-name card in another
+      // message: many chats have successive revisions of the same filename.
+      // Resolve by the stable owning message UUID first, then exact filename.
+      const cardWasClicked = await page.evaluate(({ name, messageId }) => {
+        const owner = messageId ? Array.from(document.querySelectorAll<HTMLElement>('[data-dil-message-id], [data-chatgpt-search-message-ids]'))
+          .find(el => el.getAttribute('data-dil-message-id') === messageId ||
+            (el.getAttribute('data-chatgpt-search-message-ids') || '').split(/\s+/).includes(messageId)) : null;
+        if (!owner) return false; // Fail closed; never click an unrelated attachment.
+        const buttons = Array.from(owner.querySelectorAll<HTMLButtonElement>('button[aria-label^="Open preview of "]'));
         const preview = buttons.find(button => button.getAttribute('aria-label') === `Open preview of ${name}`);
         const row = preview?.parentElement;
         const target = row?.querySelector<HTMLButtonElement>('button[aria-label="Download file"]');
-        if (!target || target.disabled) return false;
+        if (!target || target.disabled || !target.getClientRects().length) return false;
         target.click();
         return true;
-      }, file.label).catch(() => false);
+      }, { name: file.label, messageId: file.messageId }).catch(() => false);
       if (cardWasClicked) {
-        log.debug(`[files] invoked matching resource-card Download for '${file.label}'`);
+        log.debug(`[files] invoked owner-scoped resource-card Download for '${file.label}'`);
         download = await collector.next(12_000);
       }
     }
@@ -2098,6 +2107,10 @@ async function retrieveFileFromControl(page: Page, file: ChatFile, directory: st
     // the browser itself has already begun saving the attachment.
     download = await collector.next(5000);
     if (download) return await save(download);
+    const previewUnavailable = await viewer.getByText(/(?:couldn[’']t|cannot|unable to) load (?:this |the )?file/i)
+      .first().isVisible().catch(() => false);
+    if (previewUnavailable) throw new Error(
+      `'${file.label}' preview reports "Couldn't load this file" and the exact attachment's Download action produced no browser download. ChatGPT may no longer serve this attachment; try opening the original message or regenerating the file.`);
     throw new Error(`'${file.label}' yielded neither a captured browser download nor readable file preview`);
   } finally {
     collector.stop();
@@ -2551,24 +2564,72 @@ async function sendInPage(page: Page, text: string, chatId?: string, files: stri
   }
   if (text.trim()) await composer.fill(text);
   const sendButtonSelector = 'button[data-testid="send-button"], button[aria-label="Send message" i], button[aria-label="Send" i], button[data-composer-navigation-target="send"]';
-  const sendButton = page.locator(sendButtonSelector).first();
+  // There can be hidden, disabled, or stale send controls in other mounted
+  // surfaces. Scope to a *visible and enabled* control on every attempt.
+  const sendButton = page.locator(sendButtonSelector).filter({ visible: true }).last();
   await sendButton.waitFor({ state: "visible", timeout: 8000 });
+  await page.waitForFunction((selector) => {
+    return Array.from(document.querySelectorAll<HTMLButtonElement>(selector)).some(button => {
+      const rect = button.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && !button.disabled &&
+        button.getAttribute("aria-disabled") !== "true" &&
+        !button.closest("[inert], [aria-hidden=true]");
+    });
+  }, sendButtonSelector, { timeout: 30_000 });
   if (!submit) {
-    // Wait until ChatGPT enables submission (including any asynchronous file
-    // upload) but never click it. This leaves a complete, editable draft.
-    await page.waitForFunction((selector) => {
-      return Array.from(document.querySelectorAll(selector)).some((element) => {
-        const button = element as HTMLButtonElement;
-        const rect = button.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0 && !button.disabled && button.getAttribute("aria-disabled") !== "true";
-      });
-    }, sendButtonSelector, { timeout: 30_000 });
     log.info(`[send] draft prepared text_chars=${text.length} files=${files.length} url=${page.url()}`);
     return;
   }
-  await sendButton.click();
-  await page.waitForTimeout(700);
-  log.info(`[send] submitted text_chars=${text.length} files=${files.length} url=${page.url()}`);
+
+  // A click resolving does NOT mean a message was submitted. Capture the
+  // current user-message identities first, and confirm a genuinely new message
+  // containing this report before logging success. This prevents silent draft
+  // retention and accidental duplicate submission after a slow UI response.
+  const initial = await scrapeCurrentChat(page);
+  const existingUserIds = new Set(initial?.messages.filter(m => m.role === "user").map(m => m.id) || []);
+  const expected = text.replace(/\s+/g, " ").trim().slice(0, 110);
+  const composerText = async () => composer.evaluate(element =>
+    element instanceof HTMLTextAreaElement ? element.value : (element.textContent || "")
+  ).catch(() => "");
+  const observed = async () => {
+    const chat = await scrapeCurrentChat(page).catch(() => null);
+    return Boolean(chat?.messages.some(m => m.role === "user" &&
+      !existingUserIds.has(m.id) &&
+      (!expected || m.content.replace(/\s+/g, " ").trim().startsWith(expected))));
+  };
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    let clickError: unknown;
+    try {
+      await sendButton.click({ timeout: 8_000 });
+    } catch (error) {
+      clickError = error;
+      log.warn(`[send] submit click attempt=${attempt} failed: ${formatError(error)}`);
+    }
+    const deadline = Date.now() + 12_000;
+    let emptied = false;
+    while (Date.now() < deadline) {
+      if (await observed()) {
+        log.info(`[send] confirmed submitted attempt=${attempt} text_chars=${text.length} files=${files.length} url=${page.url()}`);
+        return;
+      }
+      const draft = await composerText();
+      if (!draft.trim()) emptied = true;
+      await page.waitForTimeout(400);
+    }
+    // Empty composer without a new message is *ambiguous*: ChatGPT may still
+    // be committing it. Do not risk sending an identical diagnostic twice.
+    if (emptied || !(await composerText()).trim()) {
+      throw new Error(`send: composer cleared but no matching user message was observed after attempt ${attempt}; submission uncertain (no automatic retry)`);
+    }
+    if (await observed()) {
+      log.info(`[send] confirmed submitted after delayed render attempt=${attempt}`);
+      return;
+    }
+    if (clickError && attempt === 3) throw clickError;
+    log.warn(`[send] no user message after attempt=${attempt}; draft remains in composer; retrying`);
+  }
+  throw new Error("send: report remained in composer after 3 submit attempts; not confirmed sent");
 }
 
 async function runHookForZip(
