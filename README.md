@@ -1,3 +1,9 @@
+## v0.1.48 — chat-centric file search and index-only inventory
+
+- `ctl files --open-chat`: dynamic fzf search over **indexed filenames**, showing one row per matching conversation. Each row displays the highest-ranked filename, abbreviated conversation title/UUID, project recency index (`0` = newest, `-` = not inventoried), and number of matching files. `Enter` calls the existing `/open` endpoint to open or focus the chat; it never downloads the file. This mode requires `fzf` and `python3` and cannot be combined with `--copy`, `--edit`, or `--download`.
+- `ctl rescan-all Dima --index-only`: repeatedly expands `Show more`, refreshes project chat order/title/IDs in PostgreSQL, then exits **without running chat history workers**. Existing `scanned_at` markers remain intact. `--order-only` and `--recency-only` are aliases.
+- Fuzzy filename selection is recalculated on every query change without database round trips. Multiple files in the same conversation produce only one selectable chat row.
+
 ## v0.1.47 — complete project inventory before rescanning
 
 - `ctl rescan-all` now has an explicit **inventory phase**: opens the requested project, attempts to expand its project-specific **Show more** button until it disappears, waits for the number of chat links to grow after each click, and aborts instead of scanning only the first five chats if an expansion fails.

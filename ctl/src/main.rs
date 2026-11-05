@@ -176,6 +176,9 @@ enum Commands {
         /// Rescan completed chats again
         #[arg(long)]
         force: bool,
+        /// Only refresh project chat IDs, titles and newest-first indices; do not scan message history
+        #[arg(long = "index-only", alias = "order-only", alias = "recency-only")]
+        index_only: bool,
     },
 
     /// Browse persisted questions/answers and code blocks in a Ratatui interface.
@@ -219,6 +222,9 @@ enum Commands {
         /// Download selected file into this folder (without opening it)
         #[arg(short = 'd', long = "download", value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
         download: Option<PathBuf>,
+        /// Search indexed files but show one row per matching chat; Enter opens/focuses the chat
+        #[arg(long = "open-chat", conflicts_with_all = ["copy", "edit", "download"])]
+        open_chat: bool,
     },
 
     /// Print one message by id
@@ -1112,6 +1118,149 @@ async fn interactive_open(client: &Client) -> Result<Option<Uuid>> {
     Ok(Some(Uuid::parse_str(id).context("fzf returned an invalid chat ID")?))
 }
 
+/// Show a *chat* per fzf row, while searching every indexed filename in that chat.
+/// fzf's dynamic reload uses a short self-contained Python matcher fed from a local
+/// TSV snapshot; no DB query or browser automation occurs on each keystroke.
+/// The matcher ranks filename matches and reports how many files matched the query.
+async fn browse_files_open_chat(client: &Client, database_url: &str, chat: Option<&str>) -> Result<()> {
+    let chat_id = match chat {
+        Some(spec) => Some(resolve_live_chat_selector(database_url, spec).await?),
+        None => None,
+    };
+    let rows = client.query(
+        r#"SELECT f.chat_id, f.label, COALESCE(c.title,''),
+                  COALESCE(p.project_order, -1), COALESCE(p.project_id,''),
+                  COALESCE(p.browser_name,''), f.discovered_at
+           FROM chatgpt_watcher_files f
+           JOIN chats c ON c.id=f.chat_id
+           LEFT JOIN LATERAL (
+               SELECT s.project_order, s.project_id, s.browser_name
+               FROM chatgpt_watcher_project_scans s WHERE s.chat_id=f.chat_id
+               ORDER BY s.updated_at DESC, s.project_id, s.browser_name LIMIT 1
+           ) p ON TRUE
+           WHERE ($1::uuid IS NULL OR f.chat_id=$1)
+           AND f.id=(SELECT other.id FROM chatgpt_watcher_files other
+                     WHERE other.chat_id=f.chat_id
+                     AND other.message_id IS NOT DISTINCT FROM f.message_id
+                     AND other.label=f.label
+                     ORDER BY (other.identity=concat(other.message_id,'|',other.label,'|0')) DESC,
+                              other.id DESC LIMIT 1)
+           ORDER BY CASE WHEN p.project_order IS NULL THEN 1 ELSE 0 END,
+                    p.project_order ASC, f.discovered_at DESC"#,
+        &[&chat_id],
+    ).await.context("query indexed files with project recency positions")?;
+    if rows.is_empty() {
+        println!("No indexed files match this scope; run ctl rescan or ctl rescan-all first.");
+        return Ok(());
+    }
+    let unique = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4());
+    let dir = std::env::temp_dir().join(format!("chatgpt-ctl-open-chat-{unique}"));
+    std::fs::create_dir_all(&dir)?;
+    let result: Result<()> = async {
+        let data_file = dir.join("files.tsv");
+        let filter_file = dir.join("filter.py");
+        let mut file = std::fs::File::create(&data_file)?;
+        for row in &rows {
+            let id: Uuid = row.get(0);
+            let name: String = row.get(1);
+            let title: String = row.get(2);
+            let order: i32 = row.get(3);
+            let project: String = row.get(4);
+            let browser: String = row.get(5);
+            let sanitize = |s: &str| s.replace('\t', " " ).replace('\n', " " ).replace('\r', " " );
+            writeln!(file, "{}\t{}\t{}\t{}\t{}\t{}", id,
+                     sanitize(&name),sanitize(&title),order,sanitize(&project),sanitize(&browser))?;
+        }
+        std::fs::write(&filter_file, FILES_OPEN_CHAT_FILTER)?;
+        // fzf's {q} placeholder is shell-quoted by fzf. The file is a unique
+        // temporary snapshot and never embeds untrusted filenames in commands.
+        let reload = format!("python3 {} {} {{q}}", shell_quote(filter_file.to_string_lossy().as_ref()),
+                             shell_quote(data_file.to_string_lossy().as_ref()));
+        let mut child = Command::new("fzf")
+            .args(["--ansi", "--disabled", "--delimiter=\t", "--with-nth=2..6",
+                   "--layout=reverse", "--height=85%", "--prompt=chat-files> ",
+                   "--header=BEST MATCHED FILE | CHAT | SHORT ID | RECENCY# (0=newest) | MATCHES",
+                   "--bind", &format!("start:reload:{reload}"),
+                   "--bind", &format!("change:reload:{reload}")])
+            .stdout(std::process::Stdio::piped())
+            .spawn().context("start fzf chat file search (requires fzf and python3)")?;
+        let selection = child.wait_with_output().context("wait for fzf chat selection")?;
+        if !selection.status.success() { return Ok(()); }
+        let selected = String::from_utf8(selection.stdout)?;
+        let id = selected.split('\t').next().unwrap_or("").trim();
+        let chat_id = Uuid::parse_str(id).context("fzf returned invalid chat ID")?;
+        let response = watcher_request("POST", "/open", Some(&serde_json::json!({"chat_id":chat_id}).to_string()))?;
+        let response: serde_json::Value = serde_json::from_str(&response)?;
+        println!("{} chat {} [{}]", if response["already_open"].as_bool().unwrap_or(false) {"Focused"} else {"Opened"},
+                 chat_id, response["browser_name"].as_str().unwrap_or("unknown"));
+        Ok(())
+    }.await;
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// Quote a filesystem path, which is the only shell argument interpolated into
+/// fzf's reload command (the search query is supplied via fzf's escaped {q}).
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// One row per matching chat, with best filename and exact file match count.
+const FILES_OPEN_CHAT_FILTER: &str = r###"#!/usr/bin/env python3
+import sys
+from collections import OrderedDict
+
+path = sys.argv[1]
+query = ' '.join(sys.argv[2:]).casefold().strip()
+terms = query.split()
+groups = OrderedDict()
+with open(path, encoding='utf-8') as stream:
+    for raw in stream:
+        parts = raw.rstrip('\n').split('\t')
+        if len(parts) != 6:
+            continue
+        chat, filename, title, order, project, browser = parts
+        groups.setdefault(chat, []).append((filename, title, order, project, browser))
+
+def score(filename, title):
+    name = filename.casefold()
+    title = title.casefold()
+    if not terms:
+        return 0
+    total = 0
+    for term in terms:
+        if term in name:
+            total += 100 + 20 * name.startswith(term) - name.find(term)
+        elif term in title:
+            total += 20 - title.find(term) // 8
+        else:
+            # A lightweight fuzzy subsequence, comparable to fzf matching.
+            pos = -1
+            for ch in term:
+                pos = name.find(ch, pos + 1)
+                if pos < 0:
+                    return None
+            total += 1
+    return total
+
+matched = []
+for chat, files in groups.items():
+    scored = [(s, i, row) for i, row in enumerate(files)
+              if (s := score(row[0], row[1])) is not None]
+    if not scored:
+        continue
+    best = max(scored, key=lambda item: (item[0], -item[1]))[2]
+    filename, title, order, project, browser = best
+    label = title[:38] + ('…' if len(title) > 38 else '')
+    recency = order if order != '-1' else '-'
+    label = label.replace('\t',' ')
+    filename = filename[:55] + ('…' if len(filename) > 55 else '')
+    matched.append((int(order) if order != '-1' else 999999, chat,
+                    f'{chat}\t{filename}\t{label}\t{chat[:8]}\t{recency}\t{len(scored)}'))
+for _, _, line in sorted(matched):
+    print(line)
+"###;
+
 /// Select a previously observed file. The hidden first column is a stable database ID.
 /// Records survive closed browser panes; the watcher reopens the chat for download.
 async fn browse_files(client: &Client, database_url: &str, chat: Option<&str>, copy: bool, edit: bool, editor: Option<&str>, download: Option<PathBuf>) -> Result<()> {
@@ -1395,7 +1544,7 @@ async fn main() -> Result<()> {
             println!("browser {} default project: {}",value["browser_name"].as_str().unwrap_or("unknown"),
                 value["default_project"].as_str().unwrap_or("(none)"));
         }
-        Commands::RescanAll { project, browser, jobs, force } => {
+        Commands::RescanAll { project, browser, jobs, force, index_only } => {
             anyhow::ensure!((1..=8).contains(&jobs), "--jobs must be in 1..=8");
             let payload = serde_json::json!({"project":project,"browser_name":browser}).to_string();
             let list = watcher_request("POST", "/rescan-all/list", Some(&payload))?;
@@ -1406,8 +1555,12 @@ async fn main() -> Result<()> {
             let pending: Vec<(String,String,i64)> = all.iter().filter(|chat| force || !chat["scanned"].as_bool().unwrap_or(false))
                 .filter_map(|chat| Some((chat["id"].as_str()?.to_owned(),chat["title"].as_str().unwrap_or("").to_owned(),chat["order"].as_i64()?)))
                 .collect();
-            println!("[inventory] COMPLETE project {project_id} [{browser_name}]: {} chat IDs collected, {} pending, jobs={jobs}",all.len(),pending.len());
-            println!("[scan] START: inventory completed; scanning newest to oldest");
+            println!("[inventory] COMPLETE project {project_id} [{browser_name}]: {} chat IDs collected; {} pending",all.len(),pending.len());
+            if index_only {
+                println!("[index-only] Updated {} recency indices (0=newest); no chat content scanned and scan markers unchanged",all.len());
+                return Ok(());
+            }
+            println!("[scan] START: inventory completed; scanning newest to oldest; jobs={jobs}");
             // Fixed worker pool. Each request uses an independent TCP connection;
             // the watcher creates temporary pages and persists per-chat completion.
             let queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(pending)));
@@ -1530,9 +1683,13 @@ async fn main() -> Result<()> {
                 stdout.flush()?;
             }
         }
-        Commands::Files { chat, copy, edit, editor, download } => {
+        Commands::Files { chat, copy, edit, editor, download, open_chat } => {
             let client = connect(&url).await?;
-            browse_files(&client, &url, chat.as_deref(), copy, edit, editor.as_deref(), download).await?;
+            if open_chat {
+                browse_files_open_chat(&client, &url, chat.as_deref()).await?;
+            } else {
+                browse_files(&client, &url, chat.as_deref(), copy, edit, editor.as_deref(), download).await?;
+            }
         }
         Commands::Current { verbose } => {
             let (open, focused) = watcher_status();
@@ -1771,10 +1928,11 @@ mod cli_completion_tests {
         }
         let cli = Cli::try_parse_from(["chatgpt-ctl", "rescan-all", "Dima", "--jobs", "3"]).unwrap();
         match cli.command {
-            Commands::RescanAll { project, jobs, force, .. } => {
+            Commands::RescanAll { project, jobs, force, index_only, .. } => {
                 assert_eq!(project.as_deref(), Some("Dima"));
                 assert_eq!(jobs, 3);
                 assert!(!force);
+                assert!(!index_only);
             }
             _ => panic!("expected rescan-all"),
         }
