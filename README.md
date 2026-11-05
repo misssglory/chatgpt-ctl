@@ -1,3 +1,10 @@
+## v0.1.47 — complete project inventory before rescanning
+
+- `ctl rescan-all` now has an explicit **inventory phase**: opens the requested project, attempts to expand its project-specific **Show more** button until it disappears, waits for the number of chat links to grow after each click, and aborts instead of scanning only the first five chats if an expansion fails.
+- Watcher logs `inventory BEGIN`, `inventory click Show more`, `inventory expanded`, and `inventory COMPLETE`. Only after all chat IDs and list positions are stored in PostgreSQL does the CLI print `[inventory] COMPLETE` / `[scan] START` and launch concurrent scan workers.
+- Every scanned/failed row includes its ChatGPT title alongside its ID, and resumable runs retain the same order and previously scanned state.
+- The inventory is scoped to `role=list[aria-label^="Chats in "]`, never to a conversation message's `Show more` button. Tabs opened by the inventory/scanner are closed as before.
+
 ## v0.1.46 — per-browser default projects and resumable project rescans
 
 - `ctl default-project Dima` sets the default ChatGPT project for the virtually focused browser profile. `ctl default-project -b NAME Dima` selects a named browser, `ctl default-project` shows its current project, `ctl default-project clear` disables it. A ChatGPT project URL or `g-p-*` ID is also accepted.

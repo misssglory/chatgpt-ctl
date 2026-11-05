@@ -3002,33 +3002,85 @@ async function resolveProject(page: Page, selector: string): Promise<{id:string;
 async function enumerateProjectChats(page: Page, projectId: string, baseUrl: string): Promise<ProjectChat[]> {
   const route = `/g/${projectId}/project`;
   await page.goto(new URL(route, baseUrl).toString(), {waitUntil:'domcontentloaded', timeout:45000});
-  const list = page.locator('[role="list"][aria-label^="Chats in "]:visible').first();
-  await list.waitFor({state:'visible',timeout:30000});
-  await list.locator(`a[href*="/g/${projectId}/c/"], [role="listitem"] button`).first()
-    .waitFor({state:'attached',timeout:15000}).catch(()=>{});
-  let stalled = 0;
-  let oldCount = -1;
-  for (let step=0;step<2000;step++) {
-    const more = list.locator('[role="listitem"] button').filter({hasText:/^Show more$/i}).first();
-    if (!await more.count() || !await more.isVisible()) break;
-    await more.click();
-    await page.waitForTimeout(300);
-    const count = await list.locator(`a[href*="/g/${projectId}/c/"]`).count();
-    if (count === oldCount) stalled++; else stalled=0;
-    oldCount=count;
-    if (stalled >= 8) throw new Error(`Project list stuck at ${count} chats after Show more; refusing incomplete inventory`);
+
+  // Project pages use a separate sidebar state for each tab. Do not mistake a
+  // collapsed sidebar, or a not-yet-hydrated list, for the end of pagination.
+  const listSelector = '[role="list"][aria-label^="Chats in "]';
+  const list = page.locator(`${listSelector}:visible`).first();
+  if (!await list.isVisible().catch(() => false)) {
+    const sidebarTrigger = page.locator('[data-app-shell-sidebar-trigger][aria-expanded="false"]:visible').first();
+    if (await sidebarTrigger.count()) await sidebarTrigger.click();
   }
-  const rows = await list.locator(`a[href*="/g/${projectId}/c/"]`).evaluateAll(anchors => anchors.map(a => ({
+  await list.waitFor({state:'visible',timeout:30000});
+  const chatSelector = `a[href*="/g/${projectId}/c/"]`;
+  const showMoreSelector = '[role="listitem"] button';
+  await list.locator(`${chatSelector}, ${showMoreSelector}`).first()
+    .waitFor({state:'attached',timeout:20000});
+
+  let clicks = 0;
+  let previousCount = await list.locator(chatSelector).count();
+  log.info(`[rescan-all] inventory BEGIN project=${projectId} initial_chats=${previousCount}`);
+  if (!previousCount) throw new Error(`Project ${projectId} displayed zero chats; refusing to mark inventory complete`);
+
+  for (let step = 0; step < 2000; step++) {
+    // Use the project list ONLY: messages and unrelated sidebar sections also
+    // have buttons titled "Show more".
+    const more = list.locator(showMoreSelector).filter({hasText:/^\s*Show more\s*$/i}).first();
+    if (!await more.count()) {
+      // Allow time for asynchronous pagination to settle. Recheck the same
+      // project list before certifying that there are no more pages.
+      // Allow the sidebar to populate its lazily loaded footer before
+      // deciding pagination has ended. The project list can initially
+      // render only five chats while its Show more control hydrates.
+      await list.evaluate(el => {
+        const scroll = el.closest('[data-app-action-sidebar-scroll]');
+        if (scroll) scroll.scrollTop = scroll.scrollHeight;
+      }).catch(() => {});
+      await page.waitForTimeout(1500);
+      if (!await more.count()) {
+        log.info(`[rescan-all] inventory COMPLETE project=${projectId} chats=${previousCount} show_more_clicks=${clicks} pagination_exhausted=true`);
+        break;
+      }
+    }
+    if (!await more.isVisible()) {
+      // A present but hidden pagination button means the inventory is NOT
+      // complete. Opening the sidebar may be needed in a newly created tab.
+      const trigger = page.locator('[data-app-shell-sidebar-trigger][aria-expanded="false"]:visible').first();
+      if (await trigger.count()) await trigger.click();
+      await more.scrollIntoViewIfNeeded().catch(() => {});
+      if (!await more.isVisible()) throw new Error(`Project ${projectId}: Show more exists but is hidden; inventory incomplete`);
+    }
+    await more.scrollIntoViewIfNeeded();
+    log.info(`[rescan-all] inventory click Show more project=${projectId} click=${clicks+1} chats_before=${previousCount}`);
+    await more.click({timeout:15000});
+    clicks++;
+    // Explicitly wait for MORE entries, not simply for a fixed delay.
+    const deadline = Date.now() + 15000;
+    let count = previousCount;
+    while (Date.now() < deadline) {
+      count = await list.locator(chatSelector).count();
+      if (count > previousCount) break;
+      await page.waitForTimeout(200);
+    }
+    if (count <= previousCount) {
+      throw new Error(`Project ${projectId}: Show more click ${clicks} added no chats after 15s (still ${count}); inventory incomplete`);
+    }
+    log.info(`[rescan-all] inventory expanded project=${projectId} click=${clicks} chats=${count}`);
+    previousCount = count;
+    if (step === 1999) throw new Error(`Project ${projectId}: exceeded 2000 Show more clicks; inventory incomplete`);
+  }
+  const rows = await list.locator(chatSelector).evaluateAll(anchors => anchors.map(a => ({
     url:(a as HTMLAnchorElement).getAttribute('href')||'', title:(a.getAttribute('aria-label')||a.textContent||'').trim()
   })));
-  const result:ProjectChat[]=[];
-  const ids=new Set<string>();
+  const result: ProjectChat[] = [];
+  const ids = new Set<string>();
   for (const row of rows) {
-    const id=row.url.match(/\/c\/([0-9a-f-]{36})(?:\/|$)/i)?.[1];
+    const id = row.url.match(/\/c\/([0-9a-f-]{36})(?:\/|$)/i)?.[1];
     if (!id || ids.has(id)) continue;
     ids.add(id);
     result.push({id,title:row.title,order:result.length});
   }
+  if (result.length !== rows.length) throw new Error(`Project ${projectId}: ${rows.length} links but only ${result.length} distinct chat IDs; inventory incomplete`);
   return result;
 }
 
@@ -3120,7 +3172,7 @@ function startControlServer(
               FROM chatgpt_watcher_project_scans WHERE browser_name=${runtime.name} AND project_id=${resolved.id}
               ORDER BY project_order ASC`;
             return Response.json({ok:true,browser_name:runtime.name,project_id:resolved.id,
-              chats:pending.filter(r=>chats.some(c=>c.id===r.id)).map(r=>({id:r.id,order:r.order,scanned:Boolean(r.scanned_at)}))});
+              chats:pending.filter(r=>chats.some(c=>c.id===r.id)).map(r=>({id:r.id,title:chats.find(c=>c.id===r.id)?.title || r.id,order:r.order,scanned:Boolean(r.scanned_at)}))});
           } finally { pagesReadingAttachmentHistory.delete(listingPage); await listingPage.close().catch(()=>{}); }
         }
         if (url.pathname === "/rescan") {

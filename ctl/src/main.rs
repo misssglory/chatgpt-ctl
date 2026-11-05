@@ -1403,10 +1403,11 @@ async fn main() -> Result<()> {
             let browser_name = value["browser_name"].as_str().context("missing browser_name")?.to_owned();
             let project_id = value["project_id"].as_str().context("missing project_id")?.to_owned();
             let all = value["chats"].as_array().context("missing project chats")?;
-            let pending: Vec<(String,i64)> = all.iter().filter(|chat| force || !chat["scanned"].as_bool().unwrap_or(false))
-                .filter_map(|chat| Some((chat["id"].as_str()?.to_owned(),chat["order"].as_i64()?)))
+            let pending: Vec<(String,String,i64)> = all.iter().filter(|chat| force || !chat["scanned"].as_bool().unwrap_or(false))
+                .filter_map(|chat| Some((chat["id"].as_str()?.to_owned(),chat["title"].as_str().unwrap_or("").to_owned(),chat["order"].as_i64()?)))
                 .collect();
-            println!("project {project_id} [{browser_name}] : {} chats, {} pending, jobs={jobs}",all.len(),pending.len());
+            println!("[inventory] COMPLETE project {project_id} [{browser_name}]: {} chat IDs collected, {} pending, jobs={jobs}",all.len(),pending.len());
+            println!("[scan] START: inventory completed; scanning newest to oldest");
             // Fixed worker pool. Each request uses an independent TCP connection;
             // the watcher creates temporary pages and persists per-chat completion.
             let queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(pending)));
@@ -1421,19 +1422,19 @@ async fn main() -> Result<()> {
                     let project_id = project_id.clone();
                     scope.spawn(move || loop {
                         let job = queue.lock().unwrap().pop_front();
-                        let Some((id, order)) = job else { break };
+                        let Some((id, title, order)) = job else { break };
                         let payload = serde_json::json!({"chat_id":id,"browser_name":browser_name,
                             "project_id":project_id,"project_order":order}).to_string();
                         match watcher_request("POST", "/rescan", Some(&payload)) {
                             Ok(response) => {
                                 completed.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
                                 let data:serde_json::Value = serde_json::from_str(&response).unwrap_or_default();
-                                println!("[{}] scanned {}: {} messages, {} files",order+1,id,
+                                println!("[{}] scanned \"{}\" ({}) : {} messages, {} files",order+1,title,id,
                                     data["messages"].as_u64().unwrap_or(0),data["files"].as_u64().unwrap_or(0));
                             },
                             Err(error) => {
                                 failed.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
-                                eprintln!("[{}] FAILED {}: {error:#}",order+1,id);
+                                eprintln!("[{}] FAILED \"{}\" ({}): {error:#}",order+1,title,id);
                             }
                         }
                     });
