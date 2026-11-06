@@ -1,0 +1,13 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+const ts=readFileSync(new URL('../src/index.ts',import.meta.url),'utf8');
+const html=readFileSync('/mnt/data/captcha.html','utf8');
+assert.match(ts,/async function activeBrowserChallenge\(page: Page\)/);
+assert.match(ts,/manualVerificationContexts\.add\(originalContext\)/);
+assert.match(ts,/await originalContext\.close\(\)/);
+assert.match(ts,/await login\(cfg, configPath, runtime\.name, targetUrl\)/);
+assert.match(ts,/await launchContext\(cfg, configPath, cfg\.browser\?\.headless \?\? false, runtime\.name\)/);
+assert.match(ts,/await tab\.goto\(desired\[i\]!/);
+assert.match(ts,/if \(verification\) \{\s*await resolveCaptchaManually\(runtime, verification\);/);
+assert.ok(!/captcha|turnstile/i.test(html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi,'')), 'snapshot without active CAPTCHA marker must not force handoff');
+console.log('captcha handoff source regression passed');

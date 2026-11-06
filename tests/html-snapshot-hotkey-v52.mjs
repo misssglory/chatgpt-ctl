@@ -1,0 +1,13 @@
+import { readFileSync } from 'node:fs';
+import assert from 'node:assert/strict';
+const src = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+const cfg = readFileSync(new URL('../config.toml', import.meta.url), 'utf8');
+assert.match(src, /__chatgptWatcherSaveHtmlSnapshot/);
+assert.match(src, /addInitScript\(installListeners, shortcutOptions\)/);
+assert.match(src, /page\.evaluate\(installListeners, shortcutOptions\)/);
+assert.match(src, /document\.visibilityState === "visible" && document\.hasFocus\(\)/);
+assert.match(src, /await page\.content\(\)/);
+assert.match(src, /path\.resolve\(process\.cwd\(\), cfg\.snapshots\?\.directory/);
+assert.match(src, /await writeFile\(destination, html, \{ flag: "wx" \}\)/);
+assert.match(cfg, /\[snapshots\][\s\S]*hotkey = "Alt\+Shift\+H"/);
+console.log('HTML snapshot hotkey source checks passed');

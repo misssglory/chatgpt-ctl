@@ -66,6 +66,7 @@ interface Config {
   };
   debug?: { network?: boolean };
   downloads?: { directory?: string };
+  snapshots?: { hotkey?: string; directory?: string };
 }
 
 interface ScrapedMessage {
@@ -965,6 +966,56 @@ async function launchContext(
   }
 }
 
+/**
+ * Detect *active* browser-verification UI, not incidental mentions of CAPTCHA in
+ * a conversation or Cloudflare's ubiquitous background JS detector.
+ * Captcha iframes may live in shadow DOM; inspect live iframe URLs as well.
+ */
+async function activeBrowserChallenge(page: Page): Promise<string | null> {
+  if (page.isClosed()) return null;
+  try {
+    return await page.evaluate(() => {
+      const pathname = location.pathname.toLowerCase();
+      if (/\/cdn-cgi\/challenge-platform\//.test(pathname) || /\/challenge\/?$/.test(pathname)) {
+        return `verification route: ${pathname}`;
+      }
+      const title = document.title.trim();
+      if (/^(?:just a moment|attention required|security check|verify you are human|human verification)(?:[.!… ]*)$/i.test(title)) {
+        return `verification title: ${title}`;
+      }
+      const isVisible = (element: Element) => {
+        const node = element as HTMLElement;
+        const rect = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+      };
+      // Only inspect visible challenge *containers*: normal message content
+      // must not trigger browser shutdown just because it discusses CAPTCHAs.
+      for (const selector of [
+        'iframe[src*="challenges.cloudflare.com"]',
+        'iframe[src*="recaptcha/api2/"]',
+        'iframe[src*="hcaptcha.com/captcha"]',
+        '.cf-turnstile', '#cf-challenge-running', '#challenge-stage',
+        '#challenge-form', '[data-testid="captcha-challenge"]',
+      ]) {
+        for (const element of document.querySelectorAll(selector)) {
+          if (isVisible(element)) return `visible verification control: ${selector}`;
+        }
+      }
+      const challengeContainer = document.querySelector('#challenge-stage, #challenge-form, .cf-browser-verification');
+      if (challengeContainer && isVisible(challengeContainer) &&
+          /(?:verify you are human|checking your browser|verify that you are human|security check|unusual traffic)/i.test(challengeContainer.textContent ?? "")) {
+        return 'visible browser verification challenge';
+      }
+      return null;
+    });
+  } catch {
+    // Navigation or manual tab closure can race a check. Never assume that
+    // a page evaluation error means verification is needed.
+    return null;
+  }
+}
+
 async function getPage(context: BrowserContext): Promise<Page> {
   const pages = context.pages();
   if (pages.length > 0) return pages[0]!;
@@ -1516,7 +1567,7 @@ async function doctor(cfg: Config, configPath: string) {
  * Launch a NORMAL Chromium (no Playwright automation) so the user can log in.
  * Cookies / local storage land in profile_dir and are reused by watch/dump.
  */
-async function login(cfg: Config, configPath: string, browserName = "default") {
+async function login(cfg: Config, configPath: string, browserName = "default", initialUrl?: string) {
   browserName = normalizeBrowserName(browserName);
   const executablePath = await resolveBrowserExecutable(cfg, configPath);
   const profileDir = resolveBrowserProfileDir(cfg, configPath, browserName);
@@ -1536,7 +1587,7 @@ async function login(cfg: Config, configPath: string, browserName = "default") {
       "--no-first-run",
       "--no-default-browser-check",
       "--new-window",
-      cfg.chatgpt.url,
+      initialUrl ?? cfg.chatgpt.url,
     ],
     {
       stdin: "inherit",
@@ -1941,7 +1992,18 @@ async function indexChatFiles(sql: Sql, page: Page, chat: ScrapedChat): Promise<
 /** Identify a file preview opened by this request. Never search the entire chat
  * for an unqualified "Download file" button: attachment cards have their own
  * controls and overlays which intercept clicks on unrelated buttons. */
-async function openedFilePreviewRoot(viewer: Page, previousDialogs: number, isPopup: boolean) {
+async function openedFilePreviewRoot(viewer: Page, previousDialogs: number, isPopup: boolean, filename?: string) {
+  // ChatGPT's newer file viewer opens a *right-hand tab panel*, not a dialog.
+  // Match the exact filename to avoid downloading an unrelated open file tab.
+  if (filename) {
+    const tabs = viewer.locator('[role="tabpanel"][data-tab-id^="chatgpt-file:"]');
+    for (const tab of await tabs.all()) {
+      if (!(await tab.isVisible().catch(() => false))) continue;
+      const name = await tab.getAttribute('aria-label');
+      const id = await tab.getAttribute('data-tab-id');
+      if (name === filename || id?.endsWith(`:${filename}`)) return tab;
+    }
+  }
   const selectors = '[role="dialog"], [data-radix-dialog-content], [data-testid*="file-preview"], [data-testid*="preview-panel"]';
   const roots = viewer.locator(selectors).filter({ visible: true });
   const count = await roots.count();
@@ -1951,16 +2013,23 @@ async function openedFilePreviewRoot(viewer: Page, previousDialogs: number, isPo
 }
 
 /** Extract displayed text only from a newly opened preview, not the chat itself. */
-async function readFilePreview(viewer: Page, previousDialogs: number, isPopup: boolean): Promise<string | null> {
-  return viewer.evaluate(({ previousCount, popup }) => {
+async function readFilePreview(viewer: Page, previousDialogs: number, isPopup: boolean, filename?: string): Promise<string | null> {
+  return viewer.evaluate(({ previousCount, popup, name }) => {
     const visible = (el: HTMLElement) => el.getClientRects().length > 0 &&
       getComputedStyle(el).visibility !== 'hidden';
     const dialogs = Array.from(document.querySelectorAll<HTMLElement>(
       '[role="dialog"], [data-radix-dialog-content], [data-testid*="file-preview"], [data-testid*="preview-panel"]'
     )).filter(visible);
-    const root = dialogs.length > previousCount ? dialogs.at(-1) :
-      (popup ? document.querySelector<HTMLElement>('main') || document.body : null);
+    const tabs = Array.from(document.querySelectorAll<HTMLElement>(
+      '[role="tabpanel"][data-tab-id^="chatgpt-file:"]')).filter(visible);
+    const matchedTab = name ? tabs.find(el => el.getAttribute('aria-label') === name ||
+      (el.getAttribute('data-tab-id') || '').endsWith(`:${name}`)) : null;
+    const root = matchedTab || (dialogs.length > previousCount ? dialogs.at(-1) :
+      (popup ? document.querySelector<HTMLElement>('main') || document.body : null));
     if (!root) return null;
+    // The ZIP viewer advertises an unsupported archive preview. That banner
+    // must never be saved as the contents of the requested ZIP file.
+    if (matchedTab && /archive previews aren.t supported yet/i.test(root.innerText || '')) return null;
     const content = root.querySelector<HTMLElement>(
       '[data-testid*="file-preview"] pre, [data-testid*="preview-content"], .monaco-editor .view-lines, '
       + '[role="code"], pre code, pre, [data-language], textarea, article'
@@ -1977,7 +2046,7 @@ async function readFilePreview(viewer: Page, previousDialogs: number, isPopup: b
       (e.getAttribute('aria-label') || e.textContent || '').trim());
     if (!content && (cleaned.length < 40 || (controls.length && cleaned.length < 100))) return null;
     return cleaned.length ? cleaned + '\n' : null;
-  }, { previousCount: previousDialogs, popup: isPopup }).catch(() => null);
+  }, { previousCount: previousDialogs, popup: isPopup, name: filename }).catch(() => null);
 }
 
 /** Collect downloads across the originating chat and any preview popup. A download
@@ -2022,6 +2091,116 @@ function watchAttachmentDownloads(page: Page) {
 }
 
 /** Click an indexed attachment and retrieve the actual download or its text preview. */
+/** The top chat/project Files menu renders a separate right-side "Files in chat"
+ * tab. It contains named file buttons independent of the virtualized transcript.
+ * Never search a generic Download button outside the selected file's preview.
+ */
+function chatFilesPanel(page: Page) {
+  return page.locator('[role="tabpanel"][aria-label="Files in chat"]:visible');
+}
+
+async function ensureChatFilesPanel(page: Page): Promise<boolean> {
+  if (await chatFilesPanel(page).count()) return true;
+  // ChatGPT exposes the menu from its chat header in some builds, and from
+  // the chat sidebar options in others. A missing menu is a normal fallback.
+  for (const selector of ['button[aria-label="Chat sidebar options"]', 'button[aria-label="Chat actions"]']) {
+    const trigger = page.locator(selector).filter({ visible: true }).first();
+    if (!(await trigger.count())) continue;
+    try {
+      await trigger.click({ timeout: 1800 });
+      const menu = page.getByRole('menuitem', { name: /^(?:files|files in chat|view files)$/i }).first();
+      if (await menu.isVisible().catch(() => false)) {
+        await menu.click({ timeout: 1800 });
+        if (await chatFilesPanel(page).count()) return true;
+      }
+      await page.keyboard.press('Escape').catch(() => {});
+    } catch { await page.keyboard.press('Escape').catch(() => {}); }
+  }
+  return (await chatFilesPanel(page).count()) > 0;
+}
+
+async function filePanelNames(page: Page): Promise<string[]> {
+  if (!(await ensureChatFilesPanel(page))) return [];
+  // DOM order in the screenshot is newest first; retain it, including repeated
+  // names, rather than guessing recency from lexical filenames.
+  return chatFilesPanel(page).locator('ul[aria-label="Files in chat"] > li > button[aria-label]')
+    .evaluateAll(buttons => buttons.map(button => button.getAttribute('aria-label') || '')
+      .filter(Boolean));
+}
+
+async function downloadFromChatFilesPanel(page: Page, filename: string, directory: string, zipOnly = false): Promise<string | null> {
+  const names = await filePanelNames(page);
+  if (!names.includes(filename)) return null;
+  const panel = chatFilesPanel(page);
+  // When names repeat, the topmost entry is the most recent in the Files menu.
+  // Some Playwright versions do not resolve a button nested under a button
+  // locator using getByRole. Use a CSS attribute with an escaped string.
+  const button = panel.locator('ul[aria-label="Files in chat"] > li > button[aria-label]');
+  const index = names.indexOf(filename);
+  if (index < 0 || !(await button.nth(index).count())) return null;
+  const collector = watchAttachmentDownloads(page);
+  let previewOpened = false;
+  try {
+    log.info(`[files] trying Files-in-chat menu name='${filename}'`);
+    await button.nth(index).click({ timeout: 5000 });
+    let event = await collector.next(900);
+    let preview = await openedFilePreviewRoot(page, 0, false, filename);
+    for (let attempt = 0; !event && !preview && attempt < 10; attempt++) {
+      await page.waitForTimeout(250);
+      preview = await openedFilePreviewRoot(page, 0, false, filename);
+    }
+    previewOpened = !!preview;
+    if (!event && preview) {
+      const download = preview.locator('[data-testid="viewer-header"]')
+        .getByRole('button', { name: 'Download', exact: true }).first();
+      const fallback = preview.getByRole('button', { name: /^download(?: file)?$/i }).first();
+      const target = await download.isVisible().catch(() => false) ? download : fallback;
+      if (await target.isVisible().catch(() => false)) {
+        log.info(`[files] clicking Files-in-chat preview Download name='${filename}'`);
+        await target.click({ timeout: 5000 });
+        event = await collector.next(12_000);
+      }
+    }
+    if (!event) return null;
+    await mkdir(directory, { recursive: true });
+    const suggested = fileNameForDownload(event.suggestedFilename() || filename);
+    // Avoid surprising cross-file downloads from a stale selected viewer.
+    if (suggested.toLowerCase() !== fileNameForDownload(filename).toLowerCase()) {
+      log.warn(`[files] menu download filename mismatch selected='${filename}' actual='${suggested}'`);
+      return null;
+    }
+    const dest = path.join(directory, `${crypto.randomUUID().slice(0, 8)}-${suggested}`);
+    await event.saveAs(dest);
+    const info = await stat(dest);
+    if (!info.isFile() || info.size === 0) { await rm(dest, { force: true }); return null; }
+    if (zipOnly) {
+      const handle = await open(dest, 'r');
+      const magic = Buffer.alloc(4);
+      try { await handle.read(magic, 0, 4, 0); } finally { await handle.close(); }
+      if (!(magic[0] === 0x50 && magic[1] === 0x4b &&
+        ((magic[2] === 3 && magic[3] === 4) || (magic[2] === 5 && magic[3] === 6) || (magic[2] === 7 && magic[3] === 8)))) {
+        await rm(dest, { force: true });
+        log.warn(`[files] rejected non-ZIP from Files-in-chat name='${filename}'`);
+        return null;
+      }
+    }
+    log.info(`[files] downloaded from Files-in-chat name='${filename}' bytes=${info.size} path=${dest}`);
+    return dest;
+  } catch (error) {
+    log.warn(`[files] Files-in-chat download failed name='${filename}': ${String(error)}`);
+    return null;
+  } finally {
+    collector.stop();
+    if (previewOpened) {
+      const tab = page.getByRole('tab', { name: filename, exact: true });
+      // The preview can be hosted beside the Files-in-chat pane; only close
+      // a filename-specific tab, never the entire chat.
+      const close = tab.getByRole('button', { name: /close/i }).first();
+      if (await close.isVisible().catch(() => false)) await close.click().catch(() => {});
+    }
+  }
+}
+
 async function retrieveFileFromControl(page: Page, file: ChatFile, directory: string): Promise<string> {
   const locator = page.locator(file.selector).nth(file.index);
   const previewSelectors = '[role="dialog"], [data-radix-dialog-content], [data-testid*="file-preview"], [data-testid*="preview-panel"]';
@@ -2051,15 +2230,29 @@ async function retrieveFileFromControl(page: Page, file: ChatFile, directory: st
     const popup = page.context().pages().find(p => !existingPages.has(p) && !p.isClosed());
     if (popup) viewer = popup;
     const isPopup = viewer !== page;
-    const previewRoot = await openedFilePreviewRoot(viewer, isPopup ? 0 : dialogsBefore, isPopup);
+    // The file tab is mounted asynchronously; give ChatGPT a short window
+    // to mount it before falling back to attachment-card controls.
+    let previewRoot = await openedFilePreviewRoot(viewer, isPopup ? 0 : dialogsBefore, isPopup, file.label);
+    if (!download && !previewRoot) {
+      for (let attempt = 0; attempt < 8 && !previewRoot; attempt++) {
+        await page.waitForTimeout(250);
+        previewRoot = await openedFilePreviewRoot(viewer, isPopup ? 0 : dialogsBefore, isPopup, file.label);
+      }
+    }
     previewOpened = !!previewRoot;
     if (!download && previewRoot) {
-      const action = previewRoot.getByRole('button', { name: /^download(?: file)?$/i }).first();
+      // In the right-side viewer the icon-only Download button belongs to
+      // [data-testid="viewer-header"], not the message attachment card.
+      const headerAction = previewRoot.locator('[data-testid="viewer-header"]')
+        .getByRole('button', { name: 'Download', exact: true }).first();
+      const action = await headerAction.isVisible().catch(() => false) ? headerAction :
+        previewRoot.getByRole('button', { name: /^download(?: file)?$/i }).first();
       const link = previewRoot.getByRole('link', { name: /^download(?: file)?$/i }).first();
       const target = await action.isVisible().catch(() => false) ? action : link;
       if (await target.isVisible().catch(() => false)) {
         try {
-          await target.click({ timeout: 2000, force: true });
+          log.info(`[files] clicking file preview Download name='${file.label}'`);
+          await target.click({ timeout: 5000 });
           download = await collector.next(12_000);
         } catch (error) {
           log.debug(`[files] preview Download click failed for '${file.label}': ${String(error)}`);
@@ -2106,7 +2299,7 @@ async function retrieveFileFromControl(page: Page, file: ChatFile, directory: st
       return target;
     };
     if (download) return await save(download);
-    const text = await readFilePreview(viewer, isPopup ? 0 : dialogsBefore, isPopup);
+    const text = await readFilePreview(viewer, isPopup ? 0 : dialogsBefore, isPopup, file.label);
     if (text !== null) {
       // A late download still takes precedence over a text approximation.
       download = await collector.next(350);
@@ -2130,11 +2323,22 @@ async function retrieveFileFromControl(page: Page, file: ChatFile, directory: st
     collector.stop();
     if (viewer !== page) await viewer.close().catch(() => {});
     else if (previewOpened) {
-      const active = await openedFilePreviewRoot(page, dialogsBefore, false);
-      const close = active?.getByRole('button', { name: /close|dismiss/i }).first();
+      const active = await openedFilePreviewRoot(page, dialogsBefore, false, file.label);
+      // File tabs have their own close button outside the tab panel. Do not
+      // issue Escape on an unrelated chat when a file tab was opened.
+      const fileTab = active && (await active.getAttribute('data-tab-id').catch(() => null))?.startsWith('chatgpt-file:');
+      if (fileTab) {
+        // Closing the viewer is optional; use its OWN header, not a global
+        // Escape that could affect the chat composer or another file tab.
+        const closeViewer = active!.locator('[data-testid="viewer-header"]')
+          .getByRole('button', { name: 'Close viewer', exact: true }).first();
+        if (await closeViewer.isVisible().catch(() => false))
+          await closeViewer.click({ timeout: 1500 }).catch(() => {});
+      }
+      const close = fileTab ? null : active?.getByRole('button', { name: /close|dismiss/i }).first();
       if (close && await close.isVisible().catch(() => false)) {
         await close.click({ timeout: 1000, force: true }).catch(() => page.keyboard.press('Escape').catch(() => {}));
-      } else await page.keyboard.press('Escape').catch(() => {});
+      } else if (!fileTab) await page.keyboard.press('Escape').catch(() => {});
     }
   }
 }
@@ -2306,6 +2510,14 @@ async function downloadChatFile(page: Page, expectedChatId: string, identity: st
     (window as unknown as { __ctlFileScrollState?: typeof state }).__ctlFileScrollState = state;
   });
   try {
+    // The Files-in-chat menu is independent of transcript virtualization.
+    // Try it first, then retain the older message-scoped retrieval path.
+    const parts = identity.split('|');
+    const requestedName = parts.slice(1, -1).join('|');
+    if (requestedName) {
+      const fromMenu = await downloadFromChatFilesPanel(page, requestedName, directory);
+      if (fromMenu) return fromMenu;
+    }
     const file = await findIndexedFileInHistory(page, expectedChatId, identity);
     if (!file) throw new Error(`indexed attachment '${identity}' not found after incremental history loading`);
     return await retrieveFileFromControl(page, file, directory);
@@ -2830,7 +3042,24 @@ async function runHookWithLastZip(
   }
   await waitForConversationReady(page, chatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
   const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
-  const archive = await downloadLastZip(page, archiveDir);
+  // Compare the latest ZIP in the chat's Files menu to the most recent
+  // assistant-owned ZIP in the conversation. If their filenames differ, use
+  // the Files-menu archive first; otherwise preserve the existing ZIP cursor.
+  const current = await scrapeCurrentChat(page);
+  const chatTargets = current ? assistantZipTargets(await findZipTargets(page), current.messages).sort(newestZipFirst) : [];
+  const selectedChatZip = chatTargets.find(target => /\.zip(?:$|[?#\s])/i.test(target.label));
+  const menuNames = await filePanelNames(page);
+  const menuZip = menuNames.find(name => /\.zip$/i.test(name));
+  let archive: string | null = null;
+  if (menuZip && selectedChatZip && fileNameForDownload(menuZip).toLowerCase() !==
+      fileNameForDownload(selectedChatZip.label).toLowerCase()) {
+    log.info(`[hook] Files-in-chat ZIP differs from latest assistant ZIP menu='${menuZip}' chat='${selectedChatZip.label}'; preferring menu`);
+    archive = await downloadFromChatFilesPanel(page, menuZip, archiveDir, true);
+  } else if (menuZip && !selectedChatZip) {
+    log.info(`[hook] no visible assistant ZIP; trying Files-in-chat ZIP='${menuZip}'`);
+    archive = await downloadFromChatFilesPanel(page, menuZip, archiveDir, true);
+  }
+  archive ||= await downloadLastZip(page, archiveDir);
   if (!archive) throw new Error(`chat=${chatId}: no ZIP available to run`);
   await runHookForZip(page, chatId, hook, archive, configPath);
   return archive;
@@ -2902,7 +3131,45 @@ async function runtimeForChat(
     ?? runtimes[0]!;
 }
 
-async function installFocusTracking(runtime: BrowserRuntime, focus: VirtualFocus) {
+/** Save a complete DOM snapshot of the foreground browser pane without changing it. */
+async function saveFocusedHtmlSnapshot(page: Page, browserName: string, directory: string): Promise<string> {
+  const html = await page.content();
+  const chatId = normalizeUuid(page.url()) ?? "page";
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const safeBrowser = browserName.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const filename = `chatgpt-${safeBrowser}-${chatId}-${stamp}.html`;
+  await mkdir(directory, { recursive: true });
+  const destination = path.join(directory, filename);
+  // Exclusive creation prevents snapshots taken within the same millisecond overwriting one another.
+  await writeFile(destination, html, { flag: "wx" });
+  log.info(`[snapshot] saved browser=${browserName} chat=${chatId} bytes=${Buffer.byteLength(html)} file=${destination}`);
+  return destination;
+}
+
+async function installFocusTracking(runtime: BrowserRuntime, focus: VirtualFocus, cfg: Config) {
+  const snapshotShortcut = (cfg.snapshots?.hotkey ?? "Alt+Shift+H").trim();
+  const snapshotDirectory = path.resolve(process.cwd(), cfg.snapshots?.directory || ".");
+  // The shortcut is evaluated in the browser, not the Zellij/terminal key stream.
+  // Empty/"off" disables it. Multiple modifiers are supported, including Ctrl/Meta.
+  const keys = snapshotShortcut.toLowerCase().split("+").map(s => s.trim()).filter(Boolean);
+  const hotkeyEnabled = snapshotShortcut !== "" && snapshotShortcut.toLowerCase() !== "off";
+  const hotkeyKey = keys.at(-1) ?? "";
+  const allowedModifiers = new Set(["ctrl", "control", "alt", "shift", "meta", "cmd"]);
+  if (hotkeyEnabled && (!/^[a-z0-9]$/.test(hotkeyKey) || keys.slice(0, -1).some(key => !allowedModifiers.has(key)))) {
+    throw new Error(`Invalid snapshots.hotkey '${snapshotShortcut}' (example: Alt+Shift+H)`);
+  }
+  await runtime.context.exposeBinding("__chatgptWatcherSaveHtmlSnapshot", async (source) => {
+    const page = source.page;
+    if (page.isClosed() || focus.restoring) return;
+    const isForeground = await page.evaluate(() => document.visibilityState === "visible" && document.hasFocus()).catch(() => false);
+    if (!isForeground) return;
+    try {
+      setVirtualFocus(focus, runtime, page, "manual");
+      await saveFocusedHtmlSnapshot(page, runtime.name, snapshotDirectory);
+    } catch (error) {
+      log.error(`[snapshot] browser=${runtime.name} save failed: ${formatError(error)}`);
+    }
+  });
   // The browser itself is authoritative: no desktop/window-manager IPC or
   // background reconciliation loop is needed. Do not clear virtual focus when
   // the user switches to a terminal or another application.
@@ -2916,7 +3183,7 @@ async function installFocusTracking(runtime: BrowserRuntime, focus: VirtualFocus
     }
   });
 
-  const installListeners = () => {
+  const installListeners = (shortcut: { enabled: boolean; key: string; ctrl: boolean; alt: boolean; shift: boolean; meta: boolean }) => {
     const notify = () => {
       // A background tab's focus handler must not steal virtual focus.
       if (document.visibilityState !== "visible" || !document.hasFocus()) return;
@@ -2927,15 +3194,34 @@ async function installFocusTracking(runtime: BrowserRuntime, focus: VirtualFocus
     const key = "__chatgptCtlFocusListenersInstalled";
     if ((window as any)[key]) return;
     (window as any)[key] = true;
+    if (shortcut.enabled) {
+      window.addEventListener("keydown", (event: KeyboardEvent) => {
+        if (event.repeat || event.isComposing || document.visibilityState !== "visible" || !document.hasFocus()) return;
+        if (event.key.toLowerCase() !== shortcut.key || event.ctrlKey !== shortcut.ctrl ||
+            event.altKey !== shortcut.alt || event.shiftKey !== shortcut.shift || event.metaKey !== shortcut.meta) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        const callback = (window as any).__chatgptWatcherSaveHtmlSnapshot;
+        if (typeof callback === "function") void callback();
+      }, true);
+    }
     window.addEventListener("focus", notify);
     document.addEventListener("visibilitychange", notify);
     window.addEventListener("pageshow", notify);
     document.addEventListener("focusin", notify);
   };
-  await runtime.context.addInitScript(installListeners);
+  const shortcutOptions = {
+    enabled: hotkeyEnabled,
+    key: hotkeyKey,
+    ctrl: keys.includes("ctrl") || keys.includes("control"),
+    alt: keys.includes("alt"),
+    shift: keys.includes("shift"),
+    meta: keys.includes("meta") || keys.includes("cmd"),
+  };
+  await runtime.context.addInitScript(installListeners, shortcutOptions);
 
   const attachPage = (page: Page) => {
-    void page.evaluate(installListeners).catch(() => undefined);
+    void page.evaluate(installListeners, shortcutOptions).catch(() => undefined);
     const markWhenActuallyFocused = async () => {
       const focused = await page.evaluate(() =>
         document.visibilityState === "visible" && document.hasFocus()
@@ -3630,12 +3916,14 @@ async function watch(cfg: Config, configPath: string) {
   const retryClickCooldowns = new Map<string, number>();
   const deliveryRetryState = new Map<string, { attempts: number; lastAttempt: number; absentPolls: number }>();
   const closedContexts = new WeakSet<BrowserContext>();
+  const manualVerificationContexts = new WeakSet<BrowserContext>();
+  const manualVerificationBrowsers = new Set<string>();
   let stopping = false;
   const attachBrowserClose = (runtime: BrowserRuntime) => {
     runtime.context.on("close", () => {
       closedContexts.add(runtime.context);
       runtime.activePage = undefined;
-      if (stopping) return;
+      if (stopping || manualVerificationContexts.has(runtime.context)) return;
       // Remove the runtime from the active set: /status and ctl chats must
       // immediately reflect only live browser panes.
       const index = runtimes.indexOf(runtime);
@@ -3651,6 +3939,65 @@ async function watch(cfg: Config, configPath: string) {
     });
   };
   for (const runtime of runtimes) attachBrowserClose(runtime);
+
+  /** Hand control to a non-automated Chromium using the exact same profile. */
+  const resolveCaptchaManually = async (runtime: BrowserRuntime, reason: string): Promise<void> => {
+    if (stopping || manualVerificationBrowsers.has(runtime.name)) return;
+    manualVerificationBrowsers.add(runtime.name);
+    const originalContext = runtime.context;
+    const originalPages = originalContext.pages().filter((page) => !page.isClosed());
+    const originalUrls = originalPages.map((page) => page.url())
+      .filter((url) => /^https?:\/\//.test(url));
+    const focusedUrl = focus.runtime === runtime ? focus.page?.url() : undefined;
+    const targetUrl = originalUrls.find((url) => normalizeUuid(url)) ??
+      originalUrls.find((url) => url.startsWith(new URL(cfg.chatgpt.url).origin)) ?? cfg.chatgpt.url;
+    log.warn(`[captcha] detected browser=${runtime.name} reason=${reason}; pausing automated browsing`);
+    try {
+      // This flush occurs while tabs are still alive, preserving chat order and
+      // virtual focus across the automation/manual-browser boundary.
+      sessionPersistence.schedule('captcha-handoff');
+      await sessionPersistence.flush();
+      manualVerificationContexts.add(originalContext);
+      // Browser profile locks require the automated process to exit first.
+      await originalContext.close();
+      log.warn(`[captcha] browser=${runtime.name} closed automation; opening NORMAL Chromium for manual verification`);
+      log.warn(`[captcha] resolve the challenge, then CLOSE the normal browser window to resume the watcher`);
+      await login(cfg, configPath, runtime.name, targetUrl);
+      if (stopping) return;
+      const replacement = await launchContext(cfg, configPath, cfg.browser?.headless ?? false, runtime.name);
+      runtime.context = replacement;
+      runtime.activePage = undefined;
+      attachBrowserClose(runtime);
+      await installFocusTracking(runtime, focus, cfg);
+      const tabs = replacement.pages().filter((page) => !page.isClosed());
+      const desired = originalUrls.length ? originalUrls : [targetUrl];
+      // Rebuild each previous tab in order without creating duplicate blank tabs.
+      for (let i = 0; i < desired.length; i++) {
+        const tab = tabs[i] ?? await replacement.newPage();
+        configurePage(tab, cfg);
+        await tab.goto(desired[i]!, { waitUntil: 'domcontentloaded', timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
+        attachNetworkDebug(tab, cfg);
+        if (desired[i] === focusedUrl || (!runtime.activePage && desired[i] === targetUrl)) {
+          runtime.activePage = tab;
+        }
+      }
+      runtime.activePage ??= replacement.pages().find((page) => !page.isClosed());
+      if (runtime.activePage && focusedUrl) setVirtualFocus(focus, runtime, runtime.activePage, 'ctl');
+      await setBrowserStartupEnabled(sql, runtime.name, true);
+      sessionPersistence.schedule('captcha-resumed');
+      log.info(`[captcha] resumed browser=${runtime.name} tabs=${desired.length} after manual verification`);
+    } catch (error) {
+      log.error(`[captcha] manual verification failed for browser=${runtime.name}: ${formatError(error)}`);
+      // An unattended retry must never launch a second automated browser on
+      // the locked/broken profile. Leave this browser paused for explicit retry.
+      const i = runtimes.indexOf(runtime);
+      if (i >= 0) runtimes.splice(i, 1);
+      if (focus.runtime === runtime) { focus.runtime = undefined; focus.page = undefined; }
+      await setBrowserStartupEnabled(sql, runtime.name, false).catch(() => undefined);
+    } finally {
+      manualVerificationBrowsers.delete(runtime.name);
+    }
+  };
 
   // Explicit ctl open/send may revive a closed profile, but ordinary scans
   // and watcher startup will never do so.
@@ -3673,7 +4020,7 @@ async function watch(cfg: Config, configPath: string) {
       attachBrowserClose(runtime);
       try {
         runtime.activePage = await getPage(context);
-        await installFocusTracking(runtime, focus);
+        await installFocusTracking(runtime, focus, cfg);
         attachNetworkDebug(runtime.activePage, cfg);
         await setBrowserStartupEnabled(sql, profile.name, true);
         sessionPersistence.schedule("ctl-browser-reopened");
@@ -3716,7 +4063,7 @@ async function watch(cfg: Config, configPath: string) {
     // tabs continue to update virtual focus across all browser profiles.
     for (const runtime of runtimes) {
       runtime.activePage = await getPage(runtime.context);
-      await installFocusTracking(runtime, focus);
+      await installFocusTracking(runtime, focus, cfg);
       attachNetworkDebug(runtime.activePage, cfg);
     }
 
@@ -3726,7 +4073,17 @@ async function watch(cfg: Config, configPath: string) {
       if (!runtime.activePage || runtime.activePage.isClosed()) {
         runtime.activePage = await getPage(runtime.context);
       }
-      await ensureCurrentChatGPTPage(runtime.activePage, cfg);
+      const initialPages = runtime.context.pages().filter((page) => !page.isClosed());
+      let verification: string | null = null;
+      for (const candidate of initialPages) {
+        verification = await activeBrowserChallenge(candidate);
+        if (verification) break;
+      }
+      if (!verification) await ensureCurrentChatGPTPage(runtime.activePage, cfg);
+      if (verification) {
+        await resolveCaptchaManually(runtime, verification);
+        if (!runtime.activePage) continue;
+      }
       const sidebarChats = await syncSidebarChats(runtime.activePage, sql, true, runtime.name);
       initialTotal += sidebarChats.length;
       log.info(`[watch] browser=${runtime.name} synchronized ${sidebarChats.length} sidebar chats`);
@@ -3761,6 +4118,16 @@ async function watch(cfg: Config, configPath: string) {
             }
             if (!runtime.activePage || runtime.activePage.isClosed() || !pages.includes(runtime.activePage)) {
               runtime.activePage = pages[0];
+            }
+            // Test every live tab (the challenge may be in a background chat).
+            let verification: string | null = null;
+            for (const page of pages) {
+              verification = await activeBrowserChallenge(page);
+              if (verification) break;
+            }
+            if (verification) {
+              await resolveCaptchaManually(runtime, verification);
+              continue; // Next poll uses the restored browser/tab objects.
             }
             if (runtime.activePage) {
               await syncSidebarChats(runtime.activePage, sql, false, runtime.name);

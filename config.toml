@@ -49,3 +49,9 @@ network = false
 # Default destination for `chatgpt-ctl download-last-zip`.
 [downloads]
 directory = "./var/downloads"
+
+# Browser shortcut for saving the currently focused ChatGPT pane's HTML.
+# The destination is relative to the watcher process working directory.
+[snapshots]
+hotkey = "Alt+Shift+H"
+directory = "."

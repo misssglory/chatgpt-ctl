@@ -1,3 +1,45 @@
+## v0.1.52 — Save focused browser pane HTML by hotkey
+
+While `bun run watch` is running, focus any ChatGPT browser pane and press
+**Alt+Shift+H**. The watcher saves the complete current DOM HTML to the directory
+where the watcher was launched, named
+`chatgpt-<browser>-<chat-uuid>-<UTC-timestamp>.html`.
+
+Configure in `config.toml`:
+
+```toml
+[snapshots]
+hotkey = "Alt+Shift+H"  # or "Ctrl+Shift+H"; "off" disables
+directory = "."       # relative to the watcher's process cwd
+```
+
+This is a Chromium-page hotkey, not a Zellij hotkey. It works on the foreground
+browser tab, including when a project/file popup is open. It does not navigate
+or change focus. Saved HTML contains page contents and possibly private data;
+handle it accordingly. The shortcut is installed in each browser profile and
+reinstalled after CAPTCHA/manual-login handoff.
+
+## v0.1.52 — Files-in-chat menu first, ZIP-hook source comparison
+
+- `ctl files` now attempts to download the selected exact filename using the right-hand **Files in chat** panel (`[role="tabpanel"][aria-label="Files in chat"]`) first. It opens that file’s preview and clicks the **Download** control in its viewer header. If the panel or file is unavailable, the existing message-scoped attachment downloader remains the fallback.
+- Manual `ctl hook run` compares the first ZIP in the Files-in-chat panel (displayed newest-first) against the latest assistant-owned ZIP in the chat. If the filenames differ, it downloads and ZIP-signature-verifies the panel ZIP before running the hook; if they match, the chat ZIP workflow stays unchanged. Failed panel downloads fall back to the chat ZIP.
+- Project-file retrieval is scoped to the **Files in chat** panel found in the supplied snapshot; the panel must be accessible in the active ChatGPT UI. Live navigation to the panel and actual browser downloads still require verification.
+
+## v0.1.50 — Manual CAPTCHA handoff and resume
+
+When a visible browser verification challenge is detected, `bun run watch` saves
+its currently open tabs/focus, closes only the affected automated Chromium
+context (releasing its profile lock), launches the **normal non-Playwright**
+Chromium on the **same named profile** (identical to `bun run login --browser-name
+<browser>`), and waits until you close it. The watcher then recreates the
+previous tabs on a fresh automated context and resumes without restarting the
+watcher process. No CAPTCHA solver or automated challenge-bypass code is used.
+
+Detection intentionally requires active challenge UI or challenge navigation;
+normal chat text discussing CAPTCHA and the background Cloudflare JS include do
+not count. If manual login/browser relaunch fails, that browser is left paused
+and a log entry is emitted rather than automatically retrying in a loop.
+
 ## v0.1.48 — chat-centric file search and index-only inventory
 
 - `ctl files --open-chat`: dynamic fzf search over **indexed filenames**, showing one row per matching conversation. Each row displays the highest-ranked filename, abbreviated conversation title/UUID, project recency index (`0` = newest, `-` = not inventoried), and number of matching files. `Enter` calls the existing `/open` endpoint to open or focus the chat; it never downloads the file. This mode requires `fzf` and `python3` and cannot be combined with `--copy`, `--edit`, or `--download`.
@@ -1018,3 +1060,8 @@ Rust/Bash/Python/JS syntax in the Code tab.
 ## v0.1.39 — rescan must never run historical ZIP hooks
 
 `ctl rescan` now quarantines automatic hooks **by chat**, before navigation begins and after the history walk completes. Page-level scrolling suppression alone was insufficient: the regular poll reclassified older ZIP controls as fresh as soon as the scan ended. The quarantine survives until a user sends a genuinely new message (not merely an older virtualized DOM window becoming visible). On release, the watcher rebases ZIP identities and ignores that transition poll. Explicit `ctl hook run` remains available. A guard is also checked immediately before an in-flight automatic build.
+
+
+### v0.1.49 — ChatGPT file-tab downloads
+
+Recognizes the file preview right-hand `role="tabpanel"` (`data-tab-id="chatgpt-file:…"`) and clicks its header Download button for the exact requested filename. Archive unsupported preview messages are not accepted as file contents.

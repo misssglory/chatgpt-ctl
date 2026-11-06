@@ -1,0 +1,13 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+const source = fs.readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+const html = fs.readFileSync(new URL('./fixtures/file-tab-preview.html', import.meta.url), 'utf8');
+assert.match(html, /data-testid="viewer-header"/);
+assert.match(html, /aria-label="Download"/);
+assert.match(html, /role="tabpanel"[^>]*data-tab-id="chatgpt-file:/);
+assert.match(html, /Archive previews aren't supported yet/);
+assert.match(source, /\[role="tabpanel"\]\[data-tab-id\^="chatgpt-file:"\]/);
+assert.match(source, /getByRole\('button', \{ name: 'Download', exact: true \}\)/);
+assert.match(source, /archive previews aren.t supported yet/i);
+assert.match(source, /getByRole\('button', \{ name: 'Close viewer', exact: true \}\)/);
+console.log('file-tab-download-v49 passed');
