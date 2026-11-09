@@ -19,6 +19,7 @@ import { createHash } from "node:crypto";
 import postgres from "postgres";
 import { zipTargetsAfterCursor, zipTargetIsAfterCursor } from "./zip-cursor.mjs";
 import { autoZipCandidates } from "./auto-zip-candidates.mjs";
+import { nextZipAutoRetry, pendingZipCandidates } from "./auto-zip-retry.mjs";
 import { freshZipCandidates } from "./fresh-zip-candidates.mjs";
 
 const log = new Logger({
@@ -67,6 +68,7 @@ interface Config {
   debug?: { network?: boolean };
   downloads?: { directory?: string };
   snapshots?: { hotkey?: string; directory?: string };
+  hooks?: { default_build_command?: string; failure_report_max_chars?: number };
 }
 
 interface ScrapedMessage {
@@ -2802,6 +2804,8 @@ async function sendInPage(page: Page, text: string, chatId?: string, files: stri
     ).first();
     if (!(await fileInput.count())) throw new Error("send: could not find ChatGPT's file upload input");
     await fileInput.setInputFiles(files);
+    // Wait for the UI to recognize the attachment; don't scrape chat history.
+    // A fixed delay alone can cause the Send button to fire before upload.
     await page.waitForTimeout(1000);
   }
   if (text.trim()) await composer.fill(text);
@@ -2828,17 +2832,25 @@ async function sendInPage(page: Page, text: string, chatId?: string, files: stri
   // current user-message identities first, and confirm a genuinely new message
   // containing this report before logging success. This prevents silent draft
   // retention and accidental duplicate submission after a slow UI response.
-  const initial = await scrapeCurrentChat(page);
-  const existingUserIds = new Set(initial?.messages.filter(m => m.role === "user").map(m => m.id) || []);
+  // Lightweight acknowledgement: examine only the last few *user* bubbles,
+  // not every message and code block in a potentially massive conversation.
+  // Full scrapeCurrentChat() on every 400ms poll freezes long chat panes.
   const expected = text.replace(/\s+/g, " ").trim().slice(0, 110);
+  const userMessageSnapshot = async () => page.evaluate(() => {
+    const nodes = document.querySelectorAll('[data-message-author-role="user"]');
+    const last = nodes[nodes.length - 1];
+    return { count: nodes.length, id: last?.getAttribute("data-message-id") || "",
+      text: (last?.textContent || "").replace(/\s+/g, " ").trim().slice(0, 150) };
+  });
+  const initial = await userMessageSnapshot();
   const composerText = async () => composer.evaluate(element =>
     element instanceof HTMLTextAreaElement ? element.value : (element.textContent || "")
   ).catch(() => "");
   const observed = async () => {
-    const chat = await scrapeCurrentChat(page).catch(() => null);
-    return Boolean(chat?.messages.some(m => m.role === "user" &&
-      !existingUserIds.has(m.id) &&
-      (!expected || m.content.replace(/\s+/g, " ").trim().startsWith(expected))));
+    const last = await userMessageSnapshot().catch(() => null);
+    return Boolean(last && (last.count > initial.count ||
+      (last.id && last.id !== initial.id)) &&
+      (!expected || last.text.startsWith(expected)));
   };
 
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -2860,7 +2872,7 @@ async function sendInPage(page: Page, text: string, chatId?: string, files: stri
       }
       const draft = await composerText();
       if (!draft.trim()) emptied = true;
-      await page.waitForTimeout(400);
+      await page.waitForTimeout(900);
     }
     // Empty composer without a new message is *ambiguous*: ChatGPT may still
     // be committing it. Do not risk sending an identical diagnostic twice.
@@ -2990,6 +3002,11 @@ async function runHookForZip(
     return allowed;
   }
 
+  // A stored legacy "wcc build" value represents the old default. Resolve it
+  // through config.toml, without overriding explicit custom per-chat commands.
+  const hookDefaults = (await loadConfig(configPath)).hooks;
+  const defaultBuildCommand = hookDefaults?.default_build_command?.trim() || "wcc build -o";
+  const failureReportMaxChars = Math.max(1024, Math.min(24000, hookDefaults?.failure_report_max_chars ?? 6500));
   const stages = hook.stages;
   for (let index = 0; index < stages.length; index++) {
     const stage = stages[index]!;
@@ -2997,8 +3014,10 @@ async function runHookForZip(
     const started = performance.now();
     log.info(`[hook] stage START chat=${chatId} stage=${label} cwd=${stage.type === "custom" || stage.type === "build" ? buildDir : projectDir}`);
     if (stage.type === "build" || stage.type === "custom") {
-      const shellCommand = stage.type === "build" ? hook.build_command : stage.command;
-      if (!shellCommand?.trim()) {
+      const shellCommand = stage.type === "build"
+        ? (hook.build_command === "wcc build" ? defaultBuildCommand : hook.build_command)
+        : stage.command;
+      if (!shellCommand?.trim() || shellCommand.trim().toLowerCase() === "none") {
         log.info(`[hook] stage SKIP chat=${chatId} stage=${label} (no command)`);
         continue;
       }
@@ -3010,30 +3029,35 @@ async function runHookForZip(
       log.info(`[hook] command FINISHED chat=${chatId} stage=${label} exit=${result.code} duration_ms=${Math.round(performance.now() - started)}${result.stderr ? ` stderr=${result.stderr.slice(-1000)}` : ""}`);
       if (result.code !== 0) {
         if (stage.type === "build") {
-          const clipboardCommand = hook.clipboard_command?.length ? hook.clipboard_command : ["wl-paste", "-n"];
-          // Prefer the actual failed build process output; clipboard contents
-          // can be stale or hang when there is no active Wayland clipboard owner.
-          // Only use the clipboard as a fallback, with a hard 3s process budget.
-          let diagnostic = [result.stderr, result.stdout].filter(Boolean).join("\n");
-          if (!diagnostic.trim()) {
-            try {
-              const clipboard = await commandOutput(clipboardCommand, undefined, undefined, 3_000);
-              diagnostic = clipboard.stdout || clipboard.stderr;
-            } catch (clipboardError) {
-              log.warn(`[hook] clipboard fallback failed: ${formatError(clipboardError)}`);
-            }
+          // `wcc build -o` prints the same clean output that wcc copies to the
+          // clipboard. stdout is the primary source; stderr is only a fallback.
+          // Never invoke wl-paste: its output is stale and can block on Wayland.
+          const diagnostic = result.stdout || result.stderr ||
+            `build command failed with exit code ${result.code}`;
+          // failure_report_max_chars is an INLINE threshold, never a truncation
+          // limit. Preserve complete stdout (or stderr fallback) in a local file
+          // before attempting to upload, so no compiler diagnostics are lost.
+          const heading = `Build failed (exit code ${result.code}). Pipeline stopped at ${label}.`;
+          let report = `${heading}\n\n${diagnostic}`;
+          const attachments: string[] = [];
+          if (report.length > failureReportMaxChars) {
+            const logsDir = resolveFromConfig(configPath, "./var/build-logs");
+            await mkdir(logsDir, { recursive: true });
+            const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+            const logFile = path.join(logsDir, `build-${chatId}-${stamp}.log`);
+            await writeFile(logFile, `${heading}\nCommand: ${shellCommand}\n\n${diagnostic}\n`, "utf8");
+            attachments.push(logFile);
+            report = `${heading}\nFull build output attached as ${path.basename(logFile)} (${Buffer.byteLength(diagnostic, "utf8")} bytes).`;
+            log.info(`[hook] complete build log saved chat=${chatId} path=${logFile} bytes=${Buffer.byteLength(diagnostic, "utf8")}`);
           }
-          diagnostic ||= `build command failed with exit code ${result.code}`;
-          // Prevent huge diagnostics from monopolizing the ChatGPT editor.
-          const report = `Build failed (exit code ${result.code}). Pipeline stopped at ${label}. Latest build output:\n\n${diagnostic.slice(-24_000)}`;
-          log.info(`[hook] sending build diagnostic chat=${chatId} chars=${report.length}`);
+          log.info(`[hook] sending build diagnostic chat=${chatId} inline_chars=${report.length} attachments=${attachments.length}`);
           try {
-            await sendInPage(page, report, chatId);
+            await sendInPage(page, report, chatId, attachments);
           } catch (sendError) {
-            log.error(`[hook] failed to send build diagnostic chat=${chatId}: ${formatError(sendError)}`);
+            log.error(`[hook] failed to send build diagnostic chat=${chatId} saved_log=${attachments[0] || "inline"}: ${formatError(sendError)}`);
           }
         }
-        throw new Error(`hook ${label} failed (exit ${result.code}): ${result.stderr || result.stdout}`);
+        throw new Error(`hook ${label} failed (exit ${result.code}): ${(result.stderr || result.stdout).slice(-1800)}`);
       }
     } else if (stage.type === "git-add") {
       eligiblePaths = await stageArchiveFiles();
@@ -3823,6 +3847,12 @@ function startControlServer(
           : virtualTarget!.page;
         if ((url.pathname === "/hook/run" || url.pathname === "/download-last-zip") && requestedChatId && !page) {
           page = await makePage(runtime);
+          if (url.pathname === "/hook/run") {
+            // Focus immediately, independently of the potentially slow navigation
+            // and build. Do not await the window manager before starting work.
+            setVirtualFocus(focus, runtime, page, "ctl");
+            void page.bringToFront().catch((error) => log.warn(`[hook] focus failed: ${formatError(error)}`));
+          }
           const target = new URL(`/c/${requestedChatId}`, cfg.chatgpt.url).toString();
           await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
           await waitForConversationReady(page, requestedChatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
@@ -3838,6 +3868,13 @@ function startControlServer(
           if (!chatId) return Response.json({
             error: "virtual focus is not on a conversation; use `chatgpt-ctl open <chat>` or `chatgpt-ctl hook run <chat>` first"
           }, { status: 409 });
+          // An explicit hook run selects the chat as soon as it is targeted,
+          // before ZIP download or compilation. The focus request is deliberately
+          // fire-and-forget so it cannot delay the command pipeline.
+          if (requestedChatId) {
+            setVirtualFocus(focus, runtime, page, "ctl");
+            void page.bringToFront().catch((error) => log.warn(`[hook] focus failed: ${formatError(error)}`));
+          }
           const hook = await loadChatHook(sql, chatId);
           if (!hook) return Response.json({ error: `no hook configured for ${chatId}` }, { status: 404 });
           const archive = await runHookWithLastZip(page, chatId, hook, cfg, configPath);
@@ -3940,6 +3977,9 @@ async function watch(cfg: Config, configPath: string) {
   const baselineUserSequenceByChat = new Map<string, number | null>();
   let controlServer: ReturnType<typeof Bun.serve> | undefined;
   const handledHookDownloads = new Set<string>();
+  // An automatic ZIP may become downloadable minutes after its link appears.
+  // Keep first-seen eligibility across polls; never blacklist a transient failure.
+  const pendingZipDownloads = new Map<string, { attempts: number; firstAt: number; nextAt: number }>();
   const initializedHookChats = new Set<string>();
   // Newly completed assistant message ids are retained briefly because the
   // downloadable ZIP control can render a poll or two after its message.
@@ -4368,7 +4408,14 @@ async function watch(cfg: Config, configPath: string) {
                 // is not a new assistant artifact. Compare stable turn numbers,
                 // not volatile DOM positions or database insertion timestamps.
                 const baselineTurn = baselineAssistantTurnByChat.get(chat.id) ?? null;
-                const associated = freshZipCandidates(observed, baselineTurn, newAssistantMessages);
+                const fresh = freshZipCandidates(observed, baselineTurn, newAssistantMessages);
+                const pendingIds = new Set<string>();
+                for (const key of pendingZipDownloads.keys()) {
+                  if (key.startsWith(`${chat.id}:`)) pendingIds.add(key.slice(chat.id.length + 1));
+                }
+                // Retain file eligibility after the numeric assistant-turn baseline
+                // advances. Otherwise the first failed click permanently loses it.
+                const associated = pendingZipCandidates(observed, fresh, pendingIds);
                 for (const historical of observed) {
                   if (!associated.includes(historical)) {
                     handledHookDownloads.add(`${chat.id}:${historical.identity}`);
@@ -4378,11 +4425,6 @@ async function watch(cfg: Config, configPath: string) {
                   .filter((message) => message.role === "assistant" && message.turnOrder !== undefined)
                   .reduce<number | null>((max, message) => max === null ? message.turnOrder! : Math.max(max, message.turnOrder!), baselineTurn);
                 if (newestVisibleTurn !== null) baselineAssistantTurnByChat.set(chat.id, newestVisibleTurn);
-                // The in-memory baseline records what was already rendered when
-                // this chat became ready. A new assistant-owned attachment is
-                // an event even when it appears later in an existing assistant
-                // turn, so do NOT prefilter it using saved cursor turn/index.
-                // Re-observing the persisted successful attachment is not new.
                 const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
                 const savedCursor = (await loadSuccessfulZips(archiveDir))[chat.id];
                 const unseen = autoZipCandidates(
@@ -4391,46 +4433,55 @@ async function watch(cfg: Config, configPath: string) {
                   savedCursor?.targetIdentity
                 );
                 if (unseen.length && !activeHookChats.has(chat.id) && !rescanHookQuarantine.has(chat.id)) {
-                    const newest = unseen[0]!;
-                    const hookKey = `${chat.id}:${newest.identity}`;
-                    if (!handledHookDownloads.has(hookKey)) {
-                    activeHookChats.add(chat.id);
-                    // Record the attempt before clicking: a broken/non-ZIP link
-                    // must not trigger a new download every scan. A genuinely
-                    // new attachment has a different identity and remains eligible.
+                  // Only retry the newest candidate. Older contemporaneous ZIPs
+                  // must never be applied just because the newest is unavailable.
+                  const newest = unseen[0]!;
+                  const hookKey = `${chat.id}:${newest.identity}`;
+                  const retry = pendingZipDownloads.get(hookKey);
+                  if (retry && Date.now() < retry.nextAt) return;
+                  for (const older of unseen.slice(1)) {
+                    handledHookDownloads.add(`${chat.id}:${older.identity}`);
+                    pendingZipDownloads.delete(`${chat.id}:${older.identity}`);
+                  }
+                  activeHookChats.add(chat.id);
+                  let downloaded = false;
+                  try {
+                    log.info(`[hook] auto ZIP attempt chat=${chat.id} attempt=${(retry?.attempts ?? 0) + 1} label='${newest.label}' cursor='${savedCursor?.label ?? "none"}'`);
+                    // Auto downloads are restricted to THIS new artifact. Never
+                    // probe or build a previous release on transient failure.
+                    const archive = await downloadLastZip(page, archiveDir, undefined, true, new Set([newest.identity]));
+                    if (!archive) throw new Error(`automatic ZIP not downloadable yet: ${newest.label}`);
+                    downloaded = true;
+                    pendingZipDownloads.delete(hookKey);
+                    // Mark after verification, before running the hook. Build
+                    // failures should not cause the same source to be reapplied.
                     handledHookDownloads.add(hookKey);
-                    try {
-                      // Limit the downloader to NEW attachments. Falling back to
-                      // older verified ZIPs must never run an automatic hook.
-                      const eligible = new Set(unseen.map((target) => target.identity));
-                      log.info(`[hook] auto candidate chat=${chat.id} new=${eligible.size} latest='${newest.label}' cursor='${savedCursor?.label ?? "none"}'`);
-                      const archive = await downloadLastZip(page, archiveDir, undefined, true, eligible);
-                      if (!archive) {
-                        log.debug(`[hook] chat=${chat.id} no newer verified ZIP; skipping`);
-                        return;
-                      }
-                      // Mark successful ZIP downloads before running the hook;
-                      // a build failure must not repeatedly reapply the archive.
-                      const successful = (await loadSuccessfulZips(archiveDir))[chat.id];
-                      if (successful?.targetIdentity) {
-                        handledHookDownloads.add(`${chat.id}:${successful.targetIdentity}`);
-                      }
-                      // Older or non-ZIP candidates are not retried every scan;
-                      // subsequent newly generated attachments remain eligible.
-                      log.info(`[hook] new ZIP in open pane chat=${chat.id} browser=${runtime.name} (virtual focus unchanged)`);
-                      if (rescanHookQuarantine.has(chat.id)) {
-                        log.warn(`[hook] discarded auto ZIP after rescan began chat=${chat.id}; refusing historical build`);
-                        return;
-                      }
-                      await runHookForZip(page, chat.id, hook, archive, configPath);
-                    } catch (hookError) {
-                      log.error(`[hook] chat=${chat.id} failed: ${formatError(hookError)}`);
-                    } finally {
-                      // Do not repeatedly click the same failed candidates on
-                      // every poll; subsequent assistant attachments remain eligible.
-                      for (const target of unseen) handledHookDownloads.add(`${chat.id}:${target.identity}`);
-                      activeHookChats.delete(chat.id);
+                    const successful = (await loadSuccessfulZips(archiveDir))[chat.id];
+                    if (successful?.targetIdentity) handledHookDownloads.add(`${chat.id}:${successful.targetIdentity}`);
+                    log.info(`[hook] new ZIP in open pane chat=${chat.id} browser=${runtime.name} (virtual focus unchanged)`);
+                    if (rescanHookQuarantine.has(chat.id)) {
+                      log.warn(`[hook] discarded auto ZIP after rescan began chat=${chat.id}; refusing historical build`);
+                      return;
                     }
+                    await runHookForZip(page, chat.id, hook, archive, configPath);
+                  } catch (hookError) {
+                    if (downloaded) {
+                      // A verified archive reached extraction/build; never retry
+                      // a failing build automatically.
+                      log.error(`[hook] chat=${chat.id} failed: ${formatError(hookError)}`);
+                    } else {
+                      const next = nextZipAutoRetry(retry, Date.now());
+                      if (next.exhausted) {
+                        handledHookDownloads.add(hookKey);
+                        pendingZipDownloads.delete(hookKey);
+                        log.error(`[hook] auto ZIP exhausted after ${next.attempts} attempts chat=${chat.id} file='${newest.label}': ${formatError(hookError)}`);
+                      } else {
+                        pendingZipDownloads.set(hookKey, next);
+                        log.warn(`[hook] auto ZIP not ready chat=${chat.id} attempt=${next.attempts} retry_in_ms=${next.nextAt - Date.now()} file='${newest.label}': ${formatError(hookError)}`);
+                      }
+                    }
+                  } finally {
+                    activeHookChats.delete(chat.id);
                   }
                 }
               }

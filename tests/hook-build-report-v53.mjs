@@ -5,11 +5,11 @@ const src = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
 const hook = src.slice(src.indexOf('async function runHookForZip('), src.indexOf('async function runHookWithLastZip('));
 const send = src.slice(src.indexOf('async function sendInPage('), src.indexOf('async function runHookForZip('));
 
-test('build failure reports actual captured output before using bounded clipboard fallback', () => {
-  assert.match(hook, /let diagnostic = \[result\.stderr, result\.stdout\]\.filter\(Boolean\)\.join\("\\n"\)/);
-  assert.match(hook, /if \(!diagnostic\.trim\(\)\)/);
-  assert.match(hook, /commandOutput\(clipboardCommand, undefined, undefined, 3_000\)/);
-  assert.match(hook, /diagnostic\.slice\(-24_000\)/);
+test('build failure reports wcc -o stdout without clipboard and persists large logs', () => {
+  assert.match(hook, /const diagnostic = result.stdout \|\| result.stderr/);
+  assert.doesNotMatch(hook, /commandOutput\(clipboardCommand/);
+  assert.match(hook, /writeFile\(logFile, [\s\S]*diagnostic/);
+  assert.match(hook, /defaultBuildCommand = hookDefaults/);
 });
 test('submission resolves button in current composer form and does not trust click alone', () => {
   assert.match(send, /composer\.locator\('xpath=ancestor::form\[1\]'\)/);

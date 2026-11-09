@@ -55,3 +55,9 @@ directory = "./var/downloads"
 [snapshots]
 hotkey = "Alt+Shift+H"
 directory = "."
+
+# Defaults for hook builds. Per-chat custom commands still override this value.
+[hooks]
+default_build_command = "wcc build -o"
+# Maximum characters to put directly into the chat; larger output is attached as a complete .log file.
+failure_report_max_chars = 6500

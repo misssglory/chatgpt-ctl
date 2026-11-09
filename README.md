@@ -1,4 +1,18 @@
-## v0.1.53 — Reliable build failure diagnostic submission
+## v0.1.56 — Retry newly generated ZIPs until downloadable
+
+Automatic ZIP hooks no longer mark transient download failures as handled. Newly observed assistant-owned archives remain eligible for bounded, backoff-based retries across subsequent watcher polls, even after the assistant-turn baseline advances. Only the newest new ZIP is attempted. Successful verified downloads are marked handled before build; build failures are not retried.
+
+## v0.1.55 — Lossless failed-build logs and immediate hook focus
+
+`[hooks] failure_report_max_chars` now sets the inline-report threshold (default 6500), **not** a limit on diagnostics. Short failed-build output is sent inline; longer output is saved intact under `./var/build-logs/build-<chat-id>-<timestamp>.log` and attached to the ChatGPT failure message. The local log remains available if the upload or message send fails. The source is still `wcc build -o` stdout, with stderr used only if stdout is empty. Existing hook-failure exceptions are abbreviated for readability, but the complete build diagnostic is never truncated before persistence or upload.
+
+`ctl hook run <chat>` now selects and focuses the target Chromium tab before downloading/building, using a non-blocking focus request. A new target tab is also focused immediately before its navigation/readiness wait; the full hook command itself remains synchronous and reports its final outcome.
+
+## v0.1.54 — Configurable build default and low-lag failure reports
+
+Set `[hooks] default_build_command = "wcc build -o"` in config.toml. Existing legacy chat hooks that store `wcc build` resolve to this configurable default; explicit per-chat commands still override it. `none` still skips the build. The build's stdout (the `-o` output) is used directly for failure diagnostics, with stderr fallback; clipboard reads were removed. The failure report is capped by `failure_report_max_chars` (default 6500, 1024–24000). Submission acknowledgement inspects only the latest user DOM bubble rather than scraping the full conversation repeatedly, reducing long-thread CPU/UI load.
+
+## v0.1.54 — Reliable build failure diagnostic submission
 
 - Build hooks now use their captured stdout/stderr as the primary diagnostic source, rather than invoking `wl-paste` before posting.
 - When command output is empty, clipboard fallback is bounded to 3 seconds.

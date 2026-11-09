@@ -4,8 +4,8 @@ import test from 'node:test';
 const src = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
 const send = src.slice(src.indexOf('async function sendInPage('), src.indexOf('async function runHookForZip('));
 test('hook diagnostic only logs submission after observing new matching user message', () => {
-  assert.match(send, /const existingUserIds = new Set\(/);
-  assert.match(send, /!existingUserIds\.has\(m\.id\)/);
+  assert.match(send, /const userMessageSnapshot = async/);
+  assert.doesNotMatch(send, /await scrapeCurrentChat\(page\)/);
   assert.match(send, /startsWith\(expected\)/);
   assert.match(send, /if \(await observed\(\)\)/);
   assert.match(send, /\[send\] confirmed submitted/);
