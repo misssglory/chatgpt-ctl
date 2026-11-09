@@ -1,3 +1,11 @@
+## v0.1.53 — Reliable build failure diagnostic submission
+
+- Build hooks now use their captured stdout/stderr as the primary diagnostic source, rather than invoking `wl-paste` before posting.
+- When command output is empty, clipboard fallback is bounded to 3 seconds.
+- Reports are capped to the last 24,000 characters to avoid flooding the browser editor.
+- Send is scoped to the active composer form before falling back to the visible page control; a new locator is obtained on retries.
+- Retains v0.1.44's message-confirmation and duplicate-prevention behavior.
+
 ## v0.1.52 — Save focused browser pane HTML by hotkey
 
 While `bun run watch` is running, focus any ChatGPT browser pane and press

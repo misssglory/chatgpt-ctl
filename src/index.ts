@@ -236,6 +236,7 @@ async function commandOutput(
   cmd: string[],
   cwd?: string,
   stdinText?: string,
+  timeoutMs?: number,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn(cmd, {
     cwd,
@@ -252,8 +253,23 @@ async function commandOutput(
     await proc.stdin.write(stdinText);
     proc.stdin.end();
   }
-  const [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
-  const code = await proc.exited;
+  // External clipboard commands may wait indefinitely for a Wayland owner.
+  // Fail within a small budget so build-error reporting cannot block the UI.
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  if (timeoutMs && timeoutMs > 0) {
+    timeout = setTimeout(() => {
+      try { proc.kill(); } catch { /* already exited */ }
+    }, timeoutMs);
+  }
+  let stdout: string;
+  let stderr: string;
+  let code: number;
+  try {
+    [stdout, stderr] = await Promise.all([stdoutPromise, stderrPromise]);
+    code = await proc.exited;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
   // Preserve NUL-delimited output exactly for --stdin protocols such as
   // `git check-ignore -z`; trimming can corrupt filenames that begin with space.
   return { code, stdout: stdinText === undefined ? stdout.trim() : stdout, stderr: stderr.trim() };
@@ -2790,18 +2806,19 @@ async function sendInPage(page: Page, text: string, chatId?: string, files: stri
   }
   if (text.trim()) await composer.fill(text);
   const sendButtonSelector = 'button[data-testid="send-button"], button[aria-label="Send message" i], button[aria-label="Send" i], button[data-composer-navigation-target="send"]';
-  // There can be hidden, disabled, or stale send controls in other mounted
-  // surfaces. Scope to a *visible and enabled* control on every attempt.
-  const sendButton = page.locator(sendButtonSelector).filter({ visible: true }).last();
-  await sendButton.waitFor({ state: "visible", timeout: 8000 });
-  await page.waitForFunction((selector) => {
-    return Array.from(document.querySelectorAll<HTMLButtonElement>(selector)).some(button => {
-      const rect = button.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0 && !button.disabled &&
-        button.getAttribute("aria-disabled") !== "true" &&
-        !button.closest("[inert], [aria-hidden=true]");
-    });
-  }, sendButtonSelector, { timeout: 30_000 });
+  // Never click a Send control belonging to an unrelated mounted composer.
+  // ChatGPT may render multiple visible editor surfaces (side panels included).
+  const form = composer.locator('xpath=ancestor::form[1]');
+  const scopedSend = form.locator(sendButtonSelector).filter({ visible: true });
+  const fallbackSend = page.locator(sendButtonSelector).filter({ visible: true });
+  const chooseSendButton = async () => {
+    const inForm = await scopedSend.count();
+    return inForm ? scopedSend.last() : fallbackSend.last();
+  };
+  const readySendButton = await chooseSendButton();
+  await readySendButton.waitFor({ state: "visible", timeout: 8000 });
+  // Avoid a 30s page-wide wait for a different enabled Send button.
+  await readySendButton.waitFor({ state: "attached", timeout: 8000 });
   if (!submit) {
     log.info(`[send] draft prepared text_chars=${text.length} files=${files.length} url=${page.url()}`);
     return;
@@ -2827,7 +2844,9 @@ async function sendInPage(page: Page, text: string, chatId?: string, files: stri
   for (let attempt = 1; attempt <= 3; attempt++) {
     let clickError: unknown;
     try {
-      await sendButton.click({ timeout: 8_000 });
+      const button = await chooseSendButton();
+      await button.waitFor({ state: "visible", timeout: 8_000 });
+      await button.click({ timeout: 8_000 });
     } catch (error) {
       clickError = error;
       log.warn(`[send] submit click attempt=${attempt} failed: ${formatError(error)}`);
@@ -2992,12 +3011,26 @@ async function runHookForZip(
       if (result.code !== 0) {
         if (stage.type === "build") {
           const clipboardCommand = hook.clipboard_command?.length ? hook.clipboard_command : ["wl-paste", "-n"];
-          const clipboard = await commandOutput(clipboardCommand);
-          const diagnostic = clipboard.stdout || clipboard.stderr || result.stderr || result.stdout || `build command failed with exit code ${result.code}`;
+          // Prefer the actual failed build process output; clipboard contents
+          // can be stale or hang when there is no active Wayland clipboard owner.
+          // Only use the clipboard as a fallback, with a hard 3s process budget.
+          let diagnostic = [result.stderr, result.stdout].filter(Boolean).join("\n");
+          if (!diagnostic.trim()) {
+            try {
+              const clipboard = await commandOutput(clipboardCommand, undefined, undefined, 3_000);
+              diagnostic = clipboard.stdout || clipboard.stderr;
+            } catch (clipboardError) {
+              log.warn(`[hook] clipboard fallback failed: ${formatError(clipboardError)}`);
+            }
+          }
+          diagnostic ||= `build command failed with exit code ${result.code}`;
+          // Prevent huge diagnostics from monopolizing the ChatGPT editor.
+          const report = `Build failed (exit code ${result.code}). Pipeline stopped at ${label}. Latest build output:\n\n${diagnostic.slice(-24_000)}`;
+          log.info(`[hook] sending build diagnostic chat=${chatId} chars=${report.length}`);
           try {
-            await sendInPage(page, `Build failed (exit code ${result.code}). Pipeline stopped at ${label}. Latest build output:\n\n${diagnostic}`, chatId);
+            await sendInPage(page, report, chatId);
           } catch (sendError) {
-            log.error(`[hook] failed to send build diagnostic: ${String(sendError)}`);
+            log.error(`[hook] failed to send build diagnostic chat=${chatId}: ${formatError(sendError)}`);
           }
         }
         throw new Error(`hook ${label} failed (exit ${result.code}): ${result.stderr || result.stdout}`);
