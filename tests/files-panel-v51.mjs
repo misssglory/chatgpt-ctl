@@ -12,7 +12,8 @@ test('hook run compares last chat ZIP with Files-in-chat ZIP and verifies select
  const body = src.slice(src.indexOf('async function runHookWithLastZip('), src.indexOf('function openConversationPages('));
  assert.match(body,/fileNameForDownload\(menuZip\).*fileNameForDownload\(selectedChatZip\.label\)/s);
  assert.match(body,/downloadFromChatFilesPanel\(page, menuZip, archiveDir, true\)/);
- assert.match(body,/archive \|\|= await downloadLastZip/);
+ assert.match(body,/archive = await downloadLastZip/);
+ assert.match(body,/retrieveFileFromControl\(page, file, archiveDir\)/);
 });
 test('Files-in-chat exact scoped filename and viewer header Download', () => {
  assert.match(src,/\[role="tabpanel"\]\[aria-label="Files in chat"\]/);

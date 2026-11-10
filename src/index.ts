@@ -15,12 +15,14 @@ import { Logger } from "tslog";
 import { access, constants, lstat, mkdir, mkdtemp, readdir, rename, rm, readFile, writeFile, open, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { createHash } from "node:crypto";
 import postgres from "postgres";
 import { zipTargetsAfterCursor, zipTargetIsAfterCursor } from "./zip-cursor.mjs";
 import { autoZipCandidates } from "./auto-zip-candidates.mjs";
 import { nextZipAutoRetry, pendingZipCandidates } from "./auto-zip-retry.mjs";
 import { freshZipCandidates } from "./fresh-zip-candidates.mjs";
+import { conversationLengthLimitPattern } from "./conversation-length-limit.mjs";
 
 const log = new Logger({
   type: "pretty",
@@ -1723,7 +1725,7 @@ type ZipTarget = { index: number; label: string; selector: string; kind: "link" 
  * buttons. Keep ordinary anchors as a fallback for older ChatGPT builds.
  */
 async function findZipTargets(page: Page): Promise<ZipTarget[]> {
-  const selector = 'a[href], [role="link"][aria-label], button[aria-label]';
+  const selector = 'a[href], [role="link"], button[aria-label]';
   return page.locator(selector).evaluateAll((elements) => {
     const result: ZipTarget[] = [];
     elements.forEach((element, index) => {
@@ -2819,14 +2821,15 @@ async function sendInPage(page: Page, text: string, chatId?: string, files: stri
     const inForm = await scopedSend.count();
     return inForm ? scopedSend.last() : fallbackSend.last();
   };
-  const readySendButton = await chooseSendButton();
-  await readySendButton.waitFor({ state: "visible", timeout: 8000 });
-  // Avoid a 30s page-wide wait for a different enabled Send button.
-  await readySendButton.waitFor({ state: "attached", timeout: 8000 });
   if (!submit) {
+    // Drafts do not need a Send button: ChatGPT may hide it while the file is
+    // being processed or while the composer contains only an attachment.
     log.info(`[send] draft prepared text_chars=${text.length} files=${files.length} url=${page.url()}`);
     return;
   }
+  const readySendButton = await chooseSendButton();
+  await readySendButton.waitFor({ state: "visible", timeout: 8000 });
+  await readySendButton.waitFor({ state: "attached", timeout: 8000 });
 
   // A click resolving does NOT mean a message was submitted. Capture the
   // current user-message identities first, and confirm a genuinely new message
@@ -3116,7 +3119,38 @@ async function runHookWithLastZip(
     log.info(`[hook] no visible assistant ZIP; trying Files-in-chat ZIP='${menuZip}'`);
     archive = await downloadFromChatFilesPanel(page, menuZip, archiveDir, true);
   }
-  archive ||= await downloadLastZip(page, archiveDir);
+  if (!archive) {
+    try {
+      archive = await downloadLastZip(page, archiveDir);
+    } catch (error) {
+      // The files index recognizes more ChatGPT layouts than the older ZIP
+      // scanner. Reuse its assistant-owned controls, but never run an
+      // unverified download or a user-uploaded archive as a build hook.
+      log.warn(`[hook] primary ZIP selection failed chat=${chatId}: ${String(error)}`);
+      const snapshot = await scrapeCurrentChat(page);
+      const files = snapshot ? (await findChatFiles(page, snapshot.messages))
+        .filter(file => file.role === "assistant" && /\.zip(?:$|[?#\s])|\bZIP\b/i.test(file.label))
+        .sort((a, b) => (b.messageOrder ?? -1) - (a.messageOrder ?? -1) || b.position - a.position) : [];
+      for (const file of files) {
+        try {
+          const found = await retrieveFileFromControl(page, file, archiveDir);
+          const handle = await open(found, "r");
+          const magic = Buffer.alloc(4);
+          try { await handle.read(magic, 0, 4, 0); } finally { await handle.close(); }
+          if (magic[0] === 0x50 && magic[1] === 0x4b &&
+            ((magic[2] === 3 && magic[3] === 4) || (magic[2] === 5 && magic[3] === 6) || (magic[2] === 7 && magic[3] === 8))) {
+            log.info(`[hook] recovered verified ZIP from indexed assistant file chat=${chatId} label='${file.label}'`);
+            archive = found;
+            break;
+          }
+          await rm(found, { force: true });
+        } catch (failure) {
+          log.warn(`[hook] indexed ZIP candidate failed chat=${chatId} label='${file.label}': ${String(failure)}`);
+        }
+      }
+      if (!archive) throw error;
+    }
+  }
   if (!archive) throw new Error(`chat=${chatId}: no ZIP available to run`);
   await runHookForZip(page, chatId, hook, archive, configPath);
   return archive;
@@ -3731,7 +3765,9 @@ function startControlServer(
           const text = body.text || "";
           const files = Array.isArray(body.files) ? body.files.map((file) => path.resolve(file)) : [];
           const draft = Boolean(body.draft);
-          if (!text.trim() && files.length === 0) return Response.json({ error: "text or at least one file is required" }, { status: 400 });
+          const sendExisting = Boolean(body.send_existing);
+          if (!text.trim() && files.length === 0 && !sendExisting) return Response.json({ error: "text or at least one file is required" }, { status: 400 });
+          if (sendExisting && (draft || body.new_chat || text.trim() || files.length)) return Response.json({ error: "send_existing must submit only the current composer" }, { status: 400 });
           if (draft && body.new_chat) return Response.json({ error: "--draft cannot be combined with --new-chat; open a blank chat first" }, { status: 400 });
           for (const file of files) await access(file, constants.R_OK);
         const requestedChatId = normalizeUuid(body.chat_id || "");
@@ -3774,6 +3810,14 @@ function startControlServer(
           void page.bringToFront().catch((error) => {
             log.warn(`[ctl] asynchronous send pane activation failed chat=${requestedChatId || normalizeUuid(page.url()) || "new"}: ${String(error)}`);
           });
+          if (sendExisting) {
+            const activeComposer = page.locator('#prompt-textarea:visible, [data-composer-markdown][contenteditable="true"]:visible, [contenteditable="true"][role="textbox"]:visible, textarea:visible').last();
+            await activeComposer.waitFor({ state: "visible", timeout: 20_000 });
+            const form = activeComposer.locator('xpath=ancestor::form[1]');
+            const send = form.locator('button[data-testid="send-button"], button[aria-label="Send message" i], button[aria-label="Send" i], button[data-composer-navigation-target="send"]').filter({ visible: true }).last();
+            if (!await send.count() || !await send.isEnabled()) throw new Error("send: current composer has no enabled Send button or is still uploading");
+            log.info(`[send] submitting existing composer chat=${requestedChatId || normalizeUuid(page.url()) || 'focused'}`);
+          }
           await sendInPage(page, text, undefined, files, !draft);
           if (body.new_chat) {
             await page.waitForFunction(() =>
@@ -3938,9 +3982,60 @@ function startControlServer(
   return server;
 }
 
+async function ensureChatLinkSchema(sql: Sql): Promise<void> {
+  await sql.unsafe(`CREATE TABLE IF NOT EXISTS chatgpt_watcher_chat_links (
+    previous_chat_id uuid PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+    next_chat_id uuid NOT NULL UNIQUE REFERENCES chats(id) ON DELETE CASCADE,
+    draft_ready boolean NOT NULL DEFAULT true,
+    archive_created boolean NOT NULL DEFAULT false,
+    archive_path text,
+    last_error text,
+    linked_at timestamptz NOT NULL DEFAULT now(),
+    CHECK (previous_chat_id <> next_chat_id)
+  )`);
+}
+
+/** Only examine visible application controls, never message bodies. A quoted
+ * 'conversation too long' inside chat content must not start a new chat. */
+async function hasConversationLengthLimit(page: Page): Promise<boolean> {
+  return page.evaluate((patternSource) => {
+    const phrase = new RegExp(patternSource, "i");
+    const candidates = document.querySelectorAll('[role="alert"], [role="status"], [role="dialog"], [data-testid*="conversation-limit"], [data-testid*="chat-limit"], [data-testid*="max-length"], [data-testid*="conversation-too-long"], [data-testid*="composer-error"], form [class*="error"], [data-testid="conversation-turn-limit"], main [class*="notice"], main [class*="warning"], form button, footer');
+    for (const element of candidates) {
+      if (element.closest('[data-message-author-role], article[data-testid*="conversation-turn"]')) continue;
+      const rect = element.getBoundingClientRect();
+      if (!rect.width || !rect.height || getComputedStyle(element).visibility === "hidden") continue;
+      if (phrase.test((element.textContent || "").slice(0, 800))) return true;
+    }
+    // Some versions render a non-alert banner next to the composer. Limit
+    // traversal to its nearby wrappers: full chat DOM traversal each poll can
+    // freeze very long conversations (the exact problem we're fixing).
+    const composer = document.querySelector('#prompt-textarea, [data-testid="prompt-textarea"], textarea[placeholder]');
+    let wrapper = composer?.parentElement;
+    for (let depth = 0; depth < 6 && wrapper; depth++, wrapper = wrapper.parentElement) {
+      const leaves = wrapper.querySelectorAll('span, p, button');
+      if (leaves.length > 180) break;
+      for (const node of leaves) {
+        if (node.children.length || node.closest('[data-message-author-role], article[data-testid*="conversation-turn"]')) continue;
+        const label = (node.textContent || '').trim();
+        if (label.length < 12 || label.length > 230 || !phrase.test(label)) continue;
+        const rect = node.getBoundingClientRect();
+        if (rect.width && rect.height && getComputedStyle(node).visibility !== 'hidden') return true;
+      }
+    }
+    // ChatGPT can show the limit as a disabled composer placeholder.
+    if (composer) {
+      const placeholder = composer.getAttribute('placeholder') || composer.getAttribute('data-placeholder') || '';
+      if (phrase.test(placeholder)) return true;
+    }
+    return false;
+  }, conversationLengthLimitPattern.source);
+}
+
 async function watch(cfg: Config, configPath: string) {
   const sql = openDb(cfg);
   await ensureHookSchema(sql);
+  await ensureChatLinkSchema(sql);
   await ensureRetrySchema(sql);
   await ensureBrowserSchema(sql);
   await ensureChatFilesSchema(sql);
@@ -3976,6 +4071,133 @@ async function watch(cfg: Config, configPath: string) {
   const baselineUserMessageByChat = new Map<string, string | null>();
   const baselineUserSequenceByChat = new Map<string, number | null>();
   let controlServer: ReturnType<typeof Bun.serve> | undefined;
+  const activeRollovers = new Set<string>();
+  const rolloverRetryAt = new Map<string, number>();
+  const rolloverChats = async (runtime: BrowserRuntime, old: ScrapedChat, hook: ChatHook) => {
+    if (activeRollovers.has(old.id) || Date.now() < (rolloverRetryAt.get(old.id) || 0)) return;
+    activeRollovers.add(old.id);
+    let successor: Page | undefined;
+    try {
+      const existing = await sql`SELECT next_chat_id::text AS next_id, draft_ready, archive_path, archive_created
+        FROM chatgpt_watcher_chat_links WHERE previous_chat_id=${old.id}::uuid`;
+      if (existing.length && existing[0]!.draft_ready) return;
+      const base = path.basename(path.resolve(resolveFromConfig(configPath, hook.folder)));
+      const expectedZip = path.join(os.homedir(), "zips", `${base}.zip`);
+      let nextId: string | null = existing.length ? String(existing[0]!.next_id) : null;
+      let archive = existing.length ? String(existing[0]!.archive_path || expectedZip) : expectedZip;
+      let archiveCreated = Boolean(existing[0]?.archive_created);
+      if (!nextId) {
+        // Create the actual successor first, then run wcz asynchronously.
+        // ChatGPT cannot provide a UUID for a blank chat before its first send.
+        const projectRows = await sql`SELECT project_id FROM chatgpt_watcher_project_scans
+          WHERE chat_id=${old.id}::uuid AND browser_name=${runtime.name}
+          ORDER BY updated_at DESC LIMIT 1`;
+        const project = projectRows[0]?.project_id || await projectForBrowser(sql, runtime.name);
+        const target = new URL(project ? `/g/${project}/project` : "/", cfg.chatgpt.url).toString();
+        successor = await runtime.context.newPage();
+        configurePage(successor, cfg);
+        attachNetworkDebug(successor, cfg);
+        await successor.goto(target, {waitUntil:"domcontentloaded", timeout:cfg.browser?.navigation_timeout_ms ?? 45000});
+        await successor.locator('#prompt-textarea:visible, [data-composer-markdown][contenteditable="true"]:visible, [contenteditable="true"][role="textbox"]:visible, textarea:visible').last()
+          .waitFor({state:"visible",timeout:30000});
+        // A blank ChatGPT tab has NO conversation ID. Create a real first turn,
+        // then capture its stable UUID before copying hooks or linking.
+        try {
+          await sendInPage(successor,
+            `Continuing the previous conversation: ${new URL(`/c/${old.id}`, cfg.chatgpt.url)}. The original chat reached its length limit. An updated project ZIP will be attached as a draft for the next request.`,
+            undefined, [], true);
+        } catch (error) {
+          // ChatGPT can update the route before our lightweight acknowledgement
+          // sees the new user bubble. An actual new UUID is stronger evidence
+          // than a timeout; recover it instead of creating another chat.
+          await successor.waitForFunction(() => /\/c\/[0-9a-f]{8}-[0-9a-f-]{27,}/i.test(location.pathname),
+            null, {timeout:7000}).catch(() => undefined);
+          if (!normalizeUuid(successor.url()) || normalizeUuid(successor.url()) === old.id) throw error;
+          log.warn(`[rollover] initial send acknowledgement uncertain but new URL exists: ${successor.url()}`);
+        }
+        await successor.waitForFunction(() => /\/c\/[0-9a-f]{8}-[0-9a-f-]{27,}/i.test(location.pathname), null, {timeout:45000});
+        nextId = normalizeUuid(successor.url());
+        if (!nextId || nextId === old.id) throw new Error('successor chat has no distinct UUID after initial message');
+        // Do not scrape the entire just-created conversation while it is
+        // streaming. Persist the known UUID immediately to avoid orphaning it.
+        await upsertChat(sql, {id:nextId, title:`Continuation of ${old.title}`,
+          url:successor.url(), messages:[], isStreaming:false}, runtime.name);
+        await sql.begin(async tx => {
+          await tx`INSERT INTO chatgpt_watcher_chat_links (previous_chat_id,next_chat_id,draft_ready,archive_path)
+            VALUES (${old.id}::uuid,${nextId!}::uuid,false,${archive})`;
+          await tx`INSERT INTO chat_hooks (chat_id, folder, child_folder, nix_flake, clipboard_command, build_command, stages, enabled)
+            SELECT ${nextId!}::uuid, folder, child_folder, nix_flake, clipboard_command, build_command, stages, enabled
+            FROM chat_hooks WHERE chat_id=${old.id}::uuid ON CONFLICT (chat_id) DO NOTHING`;
+        });
+        await recordChatBrowser(sql, nextId, runtime.name);
+        log.info(`[rollover] linked previous=${old.id} next=${nextId} archive=${archive}`);
+      } else {
+        successor = openConversationPages([runtime]).find(p => p.chatId===nextId)?.page;
+        if (!successor) {
+          successor = await runtime.context.newPage();
+          configurePage(successor, cfg);
+          attachNetworkDebug(successor, cfg);
+          await successor.goto(new URL(`/c/${nextId}`, cfg.chatgpt.url).toString(), {waitUntil:"domcontentloaded"});
+        }
+      }
+      if (!successor) throw new Error('successor browser pane unavailable');
+      setVirtualFocus(focus, runtime, successor, "ctl");
+      void successor.bringToFront().catch(() => {});
+      if (!archiveCreated) {
+        const started = Date.now();
+        log.info(`[rollover] archiving previous=${old.id} successor=${nextId} cwd=${hook.folder} command='wcz .'`);
+        // `wcz` may be a zsh/bash function from the user's interactive config,
+        // not an executable on PATH. Use their shell when available.
+        const userShell = process.env.SHELL && existsSync(process.env.SHELL) ? process.env.SHELL : "sh";
+        const shellFlag = /(?:^|\/)(?:zsh|bash|fish)$/.test(userShell) ? "-ic" : "-lc";
+        const proc = Bun.spawn([userShell, shellFlag, "wcz ."], {
+          cwd: resolveFromConfig(configPath, hook.folder), stdout: "pipe", stderr: "pipe",
+        });
+        const [exit, stdout, stderr] = await Promise.all([
+          proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text(),
+        ]);
+        if (exit !== 0) throw new Error(`wcz . exited ${exit}: ${(stderr || stdout).slice(-1200)}`);
+        const info = await stat(expectedZip);
+        if (!info.isFile() || info.size < 4 || info.mtimeMs < started - 2500)
+          throw new Error(`wcz . did not refresh expected archive ${expectedZip}`);
+        archive = expectedZip;
+      }
+      await access(archive, constants.R_OK);
+      const f = await open(archive, "r");
+      try {
+        const bytes = Buffer.alloc(4);
+        await f.read(bytes, 0, 4, 0);
+        if (bytes[0] !== 0x50 || bytes[1] !== 0x4b || ![3, 5, 7].includes(bytes[2]))
+          throw new Error(`archive is not a ZIP: ${archive}`);
+      } finally { await f.close(); }
+      const zipCheck = await commandOutput(["unzip", "-tqq", archive]);
+      if (zipCheck.code !== 0) throw new Error(`archive failed integrity check: ${zipCheck.stderr || zipCheck.stdout}`);
+      if (!archiveCreated) {
+        await sql`UPDATE chatgpt_watcher_chat_links SET archive_created=true,archive_path=${archive},last_error=NULL
+          WHERE previous_chat_id=${old.id}::uuid`;
+      }
+      await successor.locator('button[data-testid="stop-button"]:visible, button[aria-label="Stop generating" i]:visible').first()
+        .waitFor({state:"hidden",timeout:90000}).catch(() => undefined);
+      // This is the same operation as `ctl send --draft -f ~/zips/<folder>.zip`.
+      // Do not submit the ZIP and do not trigger the successor hook.
+      const alreadyDrafted = await successor.evaluate((name) => {
+        const composer = document.querySelector('form:has(#prompt-textarea), form:has([data-composer-markdown])');
+        if (!composer) return false;
+        return Array.from(composer.querySelectorAll('[data-testid*="attachment"], [data-testid*="file"], [title]'))
+          .some(el => (el.getAttribute('title') || el.getAttribute('aria-label') || el.textContent || '').includes(name));
+      }, path.basename(archive));
+      if (!alreadyDrafted) await sendInPage(successor, "", undefined, [archive], false);
+      await sql`UPDATE chatgpt_watcher_chat_links SET draft_ready=true,last_error=NULL
+        WHERE previous_chat_id=${old.id}::uuid`;
+      log.info(`[rollover] COMPLETE previous=${old.id} next=${nextId} draft=${archive}`);
+    } catch (err) {
+      rolloverRetryAt.set(old.id, Date.now()+60_000);
+      await sql`UPDATE chatgpt_watcher_chat_links SET last_error=${String(err).slice(0,2000)}
+        WHERE previous_chat_id=${old.id}::uuid`.catch(()=>{});
+      log.error(`[rollover] chat=${old.id} failed (retry in 60s): ${formatError(err)}`);
+      // Don't close a successor with an unsent draft; it may be recoverable.
+    } finally { activeRollovers.delete(old.id); }
+  };
   const handledHookDownloads = new Set<string>();
   // An automatic ZIP may become downloadable minutes after its link appears.
   // Keep first-seen eligibility across polls; never blacklist a transient failure.
@@ -4276,6 +4498,11 @@ async function watch(cfg: Config, configPath: string) {
               baselineUserSequenceByChat.set(chat.id, lastUser?.sequence ?? null);
               readyChatByPage.set(page, chat.id);
               lastSeenChatByPage.set(page, chat.id);
+              const rolloverHook = await loadChatHook(sql, chat.id);
+              if (rolloverHook?.enabled && await hasConversationLengthLimit(page)) {
+                void rolloverChats(runtime, chat, rolloverHook);
+                return;
+              }
 
               const initialHook = await loadChatHook(sql, chat.id);
               if (initialHook?.enabled) {
@@ -4292,6 +4519,12 @@ async function watch(cfg: Config, configPath: string) {
             }
 
             const hook = await loadChatHook(sql, chat.id);
+            if (hook?.enabled && await hasConversationLengthLimit(page)) {
+              // Separate task: polling/persistence remains responsive while wcz
+              // and the UI prepare the new conversation. Deduplicated by ID.
+              void rolloverChats(runtime, chat, hook);
+              return;
+            }
             const hookWasInitialized = initializedHookChats.has(chat.id);
             await recordChatBrowser(sql, chat.id, runtime.name);
             // Historical scans own their DB refresh and must not race the

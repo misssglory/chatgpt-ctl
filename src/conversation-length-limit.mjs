@@ -1,0 +1,2 @@
+/** UI-level length-limit phrases. Do NOT apply this to message content. */
+export const conversationLengthLimitPattern = /(?:maximum (?:conversation )?length|conversation (?:has )?(?:reached|exceeded) (?:its |the )?(?:maximum|length|limit)|conversation (?:is|has become) too long|(?:this )?(?:chat|conversation) (?:has |is )?(?:too long|full)|start a new chat to continue|(?:you.ve|you have) reached (?:the |your )?(?:conversation|chat|length|maximum|limit).*?(?:limit|length|chat)|chat length limit|continue (?:this )?conversation in a new chat)/i;

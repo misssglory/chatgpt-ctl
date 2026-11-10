@@ -96,3 +96,17 @@ CREATE TABLE IF NOT EXISTS chatgpt_watcher_project_scans (
 CREATE INDEX IF NOT EXISTS watcher_project_scans_pending
     ON chatgpt_watcher_project_scans (browser_name, project_id, project_order)
     WHERE scanned_at IS NULL;
+
+-- Ordered successor chain; one previous and one next chat per link.
+CREATE TABLE IF NOT EXISTS chatgpt_watcher_chat_links (
+    previous_chat_id uuid PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+    next_chat_id uuid NOT NULL UNIQUE REFERENCES chats(id) ON DELETE CASCADE,
+    draft_ready boolean NOT NULL DEFAULT true,
+    archive_created boolean NOT NULL DEFAULT false,
+    archive_path text,
+    last_error text,
+    linked_at timestamptz NOT NULL DEFAULT now(),
+    CHECK (previous_chat_id <> next_chat_id)
+);
+CREATE INDEX IF NOT EXISTS chatgpt_watcher_chat_links_next_idx
+    ON chatgpt_watcher_chat_links (next_chat_id);

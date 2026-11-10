@@ -58,7 +58,7 @@ enum Commands {
 
     /// Send to virtual focus, or select a chat with -c UUID/TITLE/OPEN_INDEX. Updates focus and activates its browser pane.
     Send {
-        /// Optional message text (quote text containing spaces); may be omitted when attaching files
+        /// Optional message text. With no text/files, submit the current composer as-is (including draft attachments)
         text: Option<String>,
         /// UUID, title, or open-pane index (-c 0 = first, -c -1 = last, -c -2 = second-last)
         #[arg(short = 'c', long = "chat", value_name = "CHAT", conflicts_with = "new_chat", allow_hyphen_values = true)]
@@ -241,6 +241,22 @@ enum Commands {
         chat: String,
         /// Whether automatic retry clicking is enabled
         mode: RetryMode,
+    },
+
+    /// Link two existing chats in chronological order: PREVIOUS -> NEXT.
+    Link {
+        /// Older chat UUID, title, or live-pane index
+        #[arg(allow_hyphen_values = true)]
+        previous: String,
+        /// Successor chat UUID, title, or live-pane index
+        #[arg(allow_hyphen_values = true)]
+        next: String,
+    },
+
+    /// Show previous and next chats linked to CHAT.
+    Links {
+        #[arg(allow_hyphen_values = true)]
+        chat: String,
     },
 
     /// Manage per-conversation ZIP/build automation hooks (stored in PostgreSQL)
@@ -701,6 +717,56 @@ async fn set_retry_setting(client: &Client, chat: &str, mode: RetryMode) -> Resu
         &[&id, &enabled],
     ).await?;
     println!("automatic Retry clicking {} for {id}", if enabled { "enabled" } else { "disabled" });
+    Ok(())
+}
+
+async fn ensure_chat_link_table(client: &Client) -> Result<()> {
+    client.batch_execute(r#"
+        CREATE TABLE IF NOT EXISTS chatgpt_watcher_chat_links (
+            previous_chat_id uuid PRIMARY KEY REFERENCES chats(id) ON DELETE CASCADE,
+            next_chat_id uuid NOT NULL UNIQUE REFERENCES chats(id) ON DELETE CASCADE,
+            draft_ready boolean NOT NULL DEFAULT true,
+            archive_created boolean NOT NULL DEFAULT false,
+            archive_path text,
+            last_error text,
+            linked_at timestamptz NOT NULL DEFAULT now(),
+            CHECK (previous_chat_id <> next_chat_id)
+        );
+    "#).await?;
+    client.batch_execute("ALTER TABLE chatgpt_watcher_chat_links ADD COLUMN IF NOT EXISTS archive_created boolean NOT NULL DEFAULT false").await?;
+    Ok(())
+}
+
+async fn create_ordered_chat_link(client: &Client, previous: &str, next: &str) -> Result<()> {
+    ensure_chat_link_table(client).await?;
+    let previous_id = resolve_chat_id(client, previous).await?;
+    let next_id = resolve_chat_id(client, next).await?;
+    anyhow::ensure!(previous_id != next_id, "cannot link chat to itself");
+    // An existing chain must remain linear, acyclic, and unambiguous.
+    let found = client.query_opt(r#"
+        WITH RECURSIVE chain(id) AS (
+            SELECT $1::uuid
+            UNION
+            SELECT l.next_chat_id FROM chatgpt_watcher_chat_links l
+              JOIN chain c ON c.id=l.previous_chat_id
+        ) SELECT 1 FROM chain WHERE id=$2::uuid
+    "#, &[&next_id,&previous_id]).await?;
+    anyhow::ensure!(found.is_none(), "link would create a cycle");
+    // Permit an already-identical link, without clearing rollover draft state.
+    let already = client.query_opt("SELECT next_chat_id FROM chatgpt_watcher_chat_links WHERE previous_chat_id=$1", &[&previous_id]).await?;
+    if let Some(row) = already {
+        let existing: Uuid = row.get(0);
+        anyhow::ensure!(existing == next_id,
+            "previous chat already has a different successor: {}", existing);
+        println!("link already exists: {} -> {}", previous_id, next_id);
+        return Ok(());
+    }
+    client.execute(r#"
+        INSERT INTO chatgpt_watcher_chat_links (previous_chat_id,next_chat_id,draft_ready)
+        VALUES ($1,$2,true)
+    "#, &[&previous_id,&next_id]).await
+        .context("link conflict: successor already has a predecessor")?;
+    println!("linked previous={} -> next={}",previous_id,next_id);
     Ok(())
 }
 
@@ -1484,6 +1550,28 @@ async fn main() -> Result<()> {
         Commands::Version => {
             println!("{}", env!("CARGO_PKG_VERSION"));
         }
+        Commands::Link { previous, next } => {
+            let client = connect(&url).await?;
+            create_ordered_chat_link(&client, &previous, &next).await?;
+        }
+        Commands::Links { chat } => {
+            let client = connect(&url).await?;
+            ensure_chat_link_table(&client).await?;
+            let id = resolve_chat_id(&client, &chat).await?;
+            let rows = client.query(r#"
+                SELECT previous_chat_id, next_chat_id, draft_ready, archive_path
+                FROM chatgpt_watcher_chat_links
+                WHERE previous_chat_id=$1 OR next_chat_id=$1
+                ORDER BY linked_at
+            "#, &[&id]).await?;
+            if rows.is_empty() { println!("no links for {id}"); }
+            for row in rows {
+                let old:Uuid=row.get(0); let new:Uuid=row.get(1);
+                let ready:bool=row.get(2); let archive:Option<String>=row.get(3);
+                println!("{old} -> {new} [{}]{}", if ready { "ready" } else { "draft pending" },
+                    archive.map(|a| format!(" archive={a}")).unwrap_or_default());
+            }
+        }
         Commands::Retry { chat, mode } => {
             let client = connect(&url).await?;
             set_retry_setting(&client, &chat, mode).await?;
@@ -1705,7 +1793,8 @@ async fn main() -> Result<()> {
         }
         Commands::Send { text, chat, files, new_chat, draft } => {
             let text = text.unwrap_or_default();
-            if text.trim().is_empty() && files.is_empty() {
+            let send_existing = text.trim().is_empty() && files.is_empty() && !draft && !new_chat;
+            if text.trim().is_empty() && files.is_empty() && !send_existing {
                 anyhow::bail!("send: provide message text or at least one --file attachment");
             }
             let chat_id = match chat {
@@ -1725,6 +1814,7 @@ async fn main() -> Result<()> {
                 "text": text,
                 "files": resolved_files,
                 "draft": draft,
+                "send_existing": send_existing,
             }).to_string();
             let response = watcher_request("POST", "/send", Some(&body))?;
             let value: serde_json::Value = serde_json::from_str(&response)?;
@@ -1990,6 +2080,32 @@ mod cli_completion_tests {
                 assert!(!new_chat);
             }
             _ => panic!("expected send command"),
+        }
+    }
+
+    #[test]
+    fn links_preserve_argument_order() {
+        let cli=Cli::try_parse_from(["chatgpt-ctl", "link", "older", "newer"]).unwrap();
+        match cli.command {
+            Commands::Link { previous, next } => {
+                assert_eq!(previous,"older");
+                assert_eq!(next,"newer");
+            }
+            other => panic!("expected ordered link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_without_arguments_submits_existing_composer() {
+        let cli = Cli::try_parse_from(["chatgpt-ctl", "send"]).expect("send should accept no args");
+        match cli.command {
+            Commands::Send { text, chat, files, draft, new_chat } => {
+                assert!(text.is_none());
+                assert!(chat.is_none());
+                assert!(files.is_empty());
+                assert!(!draft && !new_chat);
+            }
+            other => panic!("expected send command, got {other:?}"),
         }
     }
 

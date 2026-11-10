@@ -1,4 +1,55 @@
-## v0.1.56 — Retry newly generated ZIPs until downloadable
+## v0.1.58 — Recover DIL ZIP downloads and send existing composer
+
+- `ctl hook run` detects assistant-owned `[role="link"]` ZIP pressables even when ChatGPT provides no `aria-label` (verified against `zip_fail.html`).
+- Before scanning transcript attachments, hook tries the chat Files menu; if the primary ZIP scanner fails, it tries assistant-owned indexed file controls and verifies the ZIP header before extraction. Never execute user-uploaded content.
+- `ctl send` with no arguments submits the *already populated* focused composer, including a staged attachment. It does not fill or erase text; `ctl send -c CHAT` works too. A disabled or missing Send button fails safely.
+- `ctl send --draft -f FILE` remains unchanged; `ctl send --new-chat` still requires text or an attachment.
+
+## v0.1.57 — Automatic chat-length rollover and ordered chat links
+
+When a **visible conversation-length limit** is shown in a chat with an enabled
+hook, the watcher creates a successor chat in the same project when its project
+is known (otherwise uses the browser's default project). A short continuation
+message containing the predecessor URL is sent to materialize the new chat UUID.
+The watcher then persists the predecessor → successor relation and copies the
+old `chat_hooks` record, including the folder, child folder, build command,
+pipeline stages and enabled state.
+
+After opening/focusing the successor, the watcher executes `wcz .` through
+the user's `$SHELL` (interactive zsh/bash/fish when available, otherwise `sh`),
+with `cwd` set to the predecessor hook's `folder`. It expects a fresh
+`~/zips/<folder_basename>.zip`, verifies the ZIP header and `unzip -tqq`, and
+prepares that attachment in the new chat using the same composer/upload code as
+`ctl send --draft -f ~/zips/<folder_basename>.zip`. **The ZIP is not sent**;
+the user can write the next instruction and send the message manually.
+
+The link and archive/draft progress persist in PostgreSQL. A failed `wcz` or
+upload is retried after 60 seconds without creating another successor, and
+once the ZIP was built successfully an upload retry reuses the archive.
+The old conversation and old hook remain unchanged; no hook build runs on
+this handoff. Each old chat has at most one successor and each successor at
+most one predecessor.
+
+Ordered manual links:
+
+```bash
+ctl link OLD_CHAT NEW_CHAT       # previous -> next (UUID, title, or pane index)
+ctl links OLD_CHAT              # show adjacent predecessor/successor links
+ctl links NEW_CHAT
+```
+
+Link insertion rejects self-links, cycles, and ambiguous branching. Manually
+linked chats don't automatically stage a ZIP; automatic rollover applies only
+when the old chat reaches a visible length limit and has an enabled hook.
+
+**Detection caveat:** The exact new ChatGPT length-limit HTML was not available
+in this release's test files. The implementation uses several known UI phrases
+and restricts detection to visible warnings, controls, and composer-adjacent
+nodes, avoiding message content. A future DOM variant may need an additional
+selector. The watcher requires `wcz` (either on PATH or defined in the user's shell
+configuration) and `unzip` in its runtime environment.
+
+## v0.1.57 — Retry newly generated ZIPs until downloadable
 
 Automatic ZIP hooks no longer mark transient download failures as handled. Newly observed assistant-owned archives remain eligible for bounded, backoff-based retries across subsequent watcher polls, even after the assistant-turn baseline advances. Only the newest new ZIP is attempted. Successful verified downloads are marked handled before build; build failures are not retried.
 
