@@ -13,7 +13,9 @@ test('ZIP scanner recognizes DIL pressable role links without aria-label',()=>{
 });
 test('manual hook uses verified assistant files when primary ZIP selection fails',()=>{
  const fn=source.slice(source.indexOf('async function runHookWithLastZip('),source.indexOf('function openConversationPages('));
- assert.match(fn,/downloadFromChatFilesPanel\(page, menuZip, archiveDir, true\)/);
+ assert.match(fn,/archive = await downloadLastZip\(page, archiveDir\)/);
+ assert.match(fn,/indexed\[0\]/);
+ assert.doesNotMatch(fn,/downloadFromChatFilesPanel\(page, menuZip/);
  assert.match(fn,/file.role === "assistant"/);
  assert.match(fn,/retrieveFileFromControl\(page, file, archiveDir\)/);
  assert.match(fn,/magic\[0\] === 0x50 && magic\[1\] === 0x4b/);

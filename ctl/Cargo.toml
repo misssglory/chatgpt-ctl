@@ -1,6 +1,6 @@
 [package]
 name = "chatgpt-ctl"
-version = "0.1.58"
+version = "0.1.59"
 edition = "2021"
 description = "CLI to browse ChatGPT history stored by chatgpt-history-watcher"
 license = "MIT"

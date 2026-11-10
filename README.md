@@ -1,3 +1,11 @@
+## v0.1.59 — Never replay older ZIP when a newer assistant release exists
+
+- `ctl hook run` selects only the newest assistant-owned ZIP by message turn/position, not the previously successful ZIP, saved cursor, or arbitrary Files-in-chat menu order.
+- If a DIL download control opens a preview rather than downloading directly, retry through the exact message-owned file retrieval path, including preview-header Download.
+- If the newest ZIP cannot be verified, abort **without extracting or building an older release**.
+- The `wrong_zip.html` case contains a `v0.4.0` DIL link without `.zip`/`aria-label` in assistant turn 4 and the older `v0.3.zip` in turn 3. The scanner includes descriptive DIL download links and never downgrades.
+- When viewer filenames differ from DIL link labels, the downloader identifies the single newly opened file tab by comparing tab IDs captured before the click.
+
 ## v0.1.58 — Recover DIL ZIP downloads and send existing composer
 
 - `ctl hook run` detects assistant-owned `[role="link"]` ZIP pressables even when ChatGPT provides no `aria-label` (verified against `zip_fail.html`).

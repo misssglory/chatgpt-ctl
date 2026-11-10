@@ -8,10 +8,10 @@ test('Files-in-chat panel is tried before virtualized message history retrieval'
  const body = src.slice(a, src.indexOf('async function ', a+20));
  assert.ok(body.indexOf('downloadFromChatFilesPanel(page, requestedName, directory)') < body.indexOf('findIndexedFileInHistory(page, expectedChatId, identity)'));
 });
-test('hook run compares last chat ZIP with Files-in-chat ZIP and verifies selected archive', () => {
+test('hook run prioritizes newest assistant message and rejects stale Files-in-chat archives', () => {
  const body = src.slice(src.indexOf('async function runHookWithLastZip('), src.indexOf('function openConversationPages('));
- assert.match(body,/fileNameForDownload\(menuZip\).*fileNameForDownload\(selectedChatZip\.label\)/s);
- assert.match(body,/downloadFromChatFilesPanel\(page, menuZip, archiveDir, true\)/);
+ assert.match(body,/chatTargets\[0\]/);
+ assert.doesNotMatch(body,/downloadFromChatFilesPanel\(page, menuZip/);
  assert.match(body,/archive = await downloadLastZip/);
  assert.match(body,/retrieveFileFromControl\(page, file, archiveDir\)/);
 });

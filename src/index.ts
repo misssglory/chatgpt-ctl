@@ -1746,7 +1746,8 @@ async function findZipTargets(page: Page): Promise<ZipTarget[]> {
       // "Open Download <display name>" and often omit both the .zip suffix
       // and the word ZIP (e.g. "Download updated Watcher — v3").
       // Only accept a download-like link, then verify ZIP magic after clicking.
-      const isGeneratedDownload = isLink && /^Open\s+Download\b/i.test(aria);
+      const isGeneratedDownload = isLink && (/^Open\s+Download\b/i.test(aria) ||
+        (el.getAttribute("role") === "link" && /^Download\s+\S/i.test(text)));
       // User uploads are rendered as resource cards; never treat them as hook archives.
       // An assistant generated artifact must be a link, and must belong to a
       // message with a verifiable assistant identity (checked by caller).
@@ -2225,6 +2226,12 @@ async function retrieveFileFromControl(page: Page, file: ChatFile, directory: st
   const locator = page.locator(file.selector).nth(file.index);
   const previewSelectors = '[role="dialog"], [data-radix-dialog-content], [data-testid*="file-preview"], [data-testid*="preview-panel"]';
   const dialogsBefore = await page.locator(previewSelectors).filter({ visible: true }).count();
+  // A descriptive DIL link (e.g. "Download Rust Link Retriever v0.4.0")
+  // opens a viewer whose tab ID uses the actual `*.zip` filename instead.
+  // Track file tabs before clicking, so the new viewer can be identified
+  // without guessing its filename or selecting another already-open tab.
+  const previousFileTabIds = new Set(await page.locator('[role="tabpanel"][data-tab-id^="chatgpt-file:"]')
+    .evaluateAll(elements => elements.map(element => element.getAttribute('data-tab-id') || '')));
   const existingPages = new Set(page.context().pages());
   const collector = watchAttachmentDownloads(page);
   let viewer = page;
@@ -2254,9 +2261,19 @@ async function retrieveFileFromControl(page: Page, file: ChatFile, directory: st
     // to mount it before falling back to attachment-card controls.
     let previewRoot = await openedFilePreviewRoot(viewer, isPopup ? 0 : dialogsBefore, isPopup, file.label);
     if (!download && !previewRoot) {
+      // Avoid a CSS selector derived from an arbitrary file label: locate
+      // the single newly-created tab by its actual data-tab-id instead.
       for (let attempt = 0; attempt < 8 && !previewRoot; attempt++) {
-        await page.waitForTimeout(250);
-        previewRoot = await openedFilePreviewRoot(viewer, isPopup ? 0 : dialogsBefore, isPopup, file.label);
+        const newTabs = viewer.locator('[role="tabpanel"][data-tab-id^="chatgpt-file:"]');
+        const newIndexes = await newTabs.evaluateAll((elements, known) =>
+          elements.map((el, index) => ({ el, index })).filter(({ el }) =>
+            !known.includes(el.getAttribute('data-tab-id') || '') &&
+            (el as HTMLElement).getClientRects().length > 0).map(({index}) => index), [...previousFileTabIds]);
+        if (newIndexes.length === 1) previewRoot = newTabs.nth(newIndexes[0]!);
+        if (!previewRoot) {
+          await page.waitForTimeout(250);
+          previewRoot = await openedFilePreviewRoot(viewer, isPopup ? 0 : dialogsBefore, isPopup, file.label);
+        }
       }
     }
     previewOpened = !!previewRoot;
@@ -2343,7 +2360,14 @@ async function retrieveFileFromControl(page: Page, file: ChatFile, directory: st
     collector.stop();
     if (viewer !== page) await viewer.close().catch(() => {});
     else if (previewOpened) {
-      const active = await openedFilePreviewRoot(page, dialogsBefore, false, file.label);
+      const active = await openedFilePreviewRoot(page, dialogsBefore, false, file.label) ||
+        await (async () => {
+          const tabs = page.locator('[role="tabpanel"][data-tab-id^="chatgpt-file:"]');
+          const fresh = await tabs.evaluateAll((elements, known) => elements.map((el, i) => ({el, i}))
+            .filter(({el}) => !known.includes(el.getAttribute('data-tab-id') || '') &&
+              (el as HTMLElement).getClientRects().length > 0).map(({i}) => i), [...previousFileTabIds]);
+          return fresh.length === 1 ? tabs.nth(fresh[0]!) : null;
+        })();
       // File tabs have their own close button outside the tab panel. Do not
       // issue Escape on an unrelated chat when a file tab was opened.
       const fileTab = active && (await active.getAttribute('data-tab-id').catch(() => null))?.startsWith('chatgpt-file:');
@@ -2763,18 +2787,44 @@ async function downloadLastZip(page: Page, directory: string, _expectedAssistant
     return null;
   }
 
-  // Process newest to oldest, not "first to finish"; concurrent probing would
-  // otherwise select an older ZIP just because its download completed first.
-  const errors: string[] = [];
-  for (const target of candidates) {
-    const archive = await downloadZipTarget(page, target, directory);
-    if (!archive) { errors.push(`${target.label}: not a downloadable ZIP`); continue; }
+  // Hooks must NEVER downgrade to an older release if the newest control fails.
+  // An older verified archive is still the wrong artifact. Select one target,
+  // and fail closed if it cannot be downloaded or verified.
+  const target = candidates[0]!;
+  let archive = await downloadZipTarget(page, target, directory);
+  if (!archive) {
+    // The message's DIL link can open the file viewer instead of starting a
+    // browser download. Use the working `ctl files` retrieval path, scoped to
+    // this exact assistant message and label (never a same-name older card).
+    const matches = (await findChatFiles(page, chat.messages)).filter(file =>
+      file.role === "assistant" && file.label === target.label &&
+      (target.messageId ? file.messageId === target.messageId : file.messageOrder === target.messageOrder));
+    if (matches.length === 1) {
+      try {
+        const found = await retrieveFileFromControl(page, matches[0]!, directory);
+        const handle = await open(found, "r");
+        const magic = Buffer.alloc(4);
+        try { await handle.read(magic, 0, 4, 0); } finally { await handle.close(); }
+        if (magic[0] === 0x50 && magic[1] === 0x4b &&
+          ((magic[2] === 3 && magic[3] === 4) || (magic[2] === 5 && magic[3] === 6) || (magic[2] === 7 && magic[3] === 8))) {
+          archive = found;
+          log.info(`[download] recovered newest verified ZIP through file preview chat=${chatId} label='${target.label}'`);
+        } else {
+          await rm(found, { force: true });
+        }
+      } catch (error) {
+        log.warn(`[download] newest file viewer failed chat=${chatId} label='${target.label}': ${formatError(error)}`);
+      }
+    }
+  }
+  if (!archive) throw new Error(`newest assistant ZIP '${target.label}' (turn=${target.messageOrder}) could not be downloaded; refusing to build an older ZIP`);
+  {
     const assistant = chat.messages.find((message) => message.role === "assistant" &&
       (message.id.toLowerCase() === target.messageId ||
        (!target.messageId && message.turnOrder === target.messageOrder)));
     const newTurn = target.messageOrder ?? assistant?.turnOrder ?? null;
-    // Manual runs can inspect older archives when newer candidates are not
-    // downloadable, but only actual forward progress may advance the cursor.
+    // Cursor provenance advances only when this exact artifact is new.
+    // Replaying the same newest release is permitted for explicit manual runs.
     const replay = history?.targetIdentity === target.identity;
     const advances = autoEligibleIdentities?.has(target.identity) || !history || zipTargetIsAfterCursor(target, targets, history);
     if (advances) {
@@ -2785,7 +2835,6 @@ async function downloadLastZip(page: Page, directory: string, _expectedAssistant
     }
     return archive;
   }
-  throw new Error(`no assistant-owned candidate yielded a verified ZIP (${errors.join("; ")})`);
 }
 
 async function sendInPage(page: Page, text: string, chatId?: string, files: string[] = [], submit = true) {
@@ -3102,54 +3151,35 @@ async function runHookWithLastZip(
   }
   await waitForConversationReady(page, chatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
   const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
-  // Compare the latest ZIP in the chat's Files menu to the most recent
-  // assistant-owned ZIP in the conversation. If their filenames differ, use
-  // the Files-menu archive first; otherwise preserve the existing ZIP cursor.
+  // A manual hook must select the newest assistant-owned ZIP, regardless of
+  // the previous success cursor or the Files-in-chat menu's independent order.
+  // The menu can contain older releases; never let it silently override a
+  // newer assistant attachment. No fallback to historical ZIPs is permitted.
   const current = await scrapeCurrentChat(page);
   const chatTargets = current ? assistantZipTargets(await findZipTargets(page), current.messages).sort(newestZipFirst) : [];
-  const selectedChatZip = chatTargets.find(target => /\.zip(?:$|[?#\s])/i.test(target.label));
-  const menuNames = await filePanelNames(page);
-  const menuZip = menuNames.find(name => /\.zip$/i.test(name));
   let archive: string | null = null;
-  if (menuZip && selectedChatZip && fileNameForDownload(menuZip).toLowerCase() !==
-      fileNameForDownload(selectedChatZip.label).toLowerCase()) {
-    log.info(`[hook] Files-in-chat ZIP differs from latest assistant ZIP menu='${menuZip}' chat='${selectedChatZip.label}'; preferring menu`);
-    archive = await downloadFromChatFilesPanel(page, menuZip, archiveDir, true);
-  } else if (menuZip && !selectedChatZip) {
-    log.info(`[hook] no visible assistant ZIP; trying Files-in-chat ZIP='${menuZip}'`);
-    archive = await downloadFromChatFilesPanel(page, menuZip, archiveDir, true);
-  }
-  if (!archive) {
-    try {
-      archive = await downloadLastZip(page, archiveDir);
-    } catch (error) {
-      // The files index recognizes more ChatGPT layouts than the older ZIP
-      // scanner. Reuse its assistant-owned controls, but never run an
-      // unverified download or a user-uploaded archive as a build hook.
-      log.warn(`[hook] primary ZIP selection failed chat=${chatId}: ${String(error)}`);
-      const snapshot = await scrapeCurrentChat(page);
-      const files = snapshot ? (await findChatFiles(page, snapshot.messages))
-        .filter(file => file.role === "assistant" && /\.zip(?:$|[?#\s])|\bZIP\b/i.test(file.label))
-        .sort((a, b) => (b.messageOrder ?? -1) - (a.messageOrder ?? -1) || b.position - a.position) : [];
-      for (const file of files) {
-        try {
-          const found = await retrieveFileFromControl(page, file, archiveDir);
-          const handle = await open(found, "r");
-          const magic = Buffer.alloc(4);
-          try { await handle.read(magic, 0, 4, 0); } finally { await handle.close(); }
-          if (magic[0] === 0x50 && magic[1] === 0x4b &&
-            ((magic[2] === 3 && magic[3] === 4) || (magic[2] === 5 && magic[3] === 6) || (magic[2] === 7 && magic[3] === 8))) {
-            log.info(`[hook] recovered verified ZIP from indexed assistant file chat=${chatId} label='${file.label}'`);
-            archive = found;
-            break;
-          }
-          await rm(found, { force: true });
-        } catch (failure) {
-          log.warn(`[hook] indexed ZIP candidate failed chat=${chatId} label='${file.label}': ${String(failure)}`);
-        }
-      }
-      if (!archive) throw error;
+  if (chatTargets.length > 0) {
+    log.info(`[hook] newest assistant ZIP selected chat=${chatId} label='${chatTargets[0]!.label}' turn=${chatTargets[0]!.messageOrder} candidates=${chatTargets.length}`);
+    archive = await downloadLastZip(page, archiveDir);
+  } else {
+    // With no visible assistant ZIP, the only safe recovery is a file indexed
+    // with assistant ownership. A project menu file alone has no such proof.
+    const indexed = current ? (await findChatFiles(page, current.messages))
+      .filter(file => file.role === "assistant" && /\.zip(?:$|[?#\s])|\bZIP\b/i.test(file.label))
+      .sort((a, b) => (b.messageOrder ?? -1) - (a.messageOrder ?? -1) || b.position - a.position) : [];
+    if (!indexed.length) throw new Error(`chat=${chatId} has no assistant-owned ZIP download controls`);
+    const file = indexed[0]!;
+    const found = await retrieveFileFromControl(page, file, archiveDir);
+    const handle = await open(found, "r");
+    const magic = Buffer.alloc(4);
+    try { await handle.read(magic, 0, 4, 0); } finally { await handle.close(); }
+    if (!(magic[0] === 0x50 && magic[1] === 0x4b &&
+      ((magic[2] === 3 && magic[3] === 4) || (magic[2] === 5 && magic[3] === 6) || (magic[2] === 7 && magic[3] === 8)))) {
+      await rm(found, { force: true });
+      throw new Error(`newest indexed assistant file '${file.label}' is not a ZIP; refusing an older ZIP`);
     }
+    archive = found;
+    log.info(`[hook] recovered newest assistant ZIP through indexed file chat=${chatId} label='${file.label}'`);
   }
   if (!archive) throw new Error(`chat=${chatId}: no ZIP available to run`);
   await runHookForZip(page, chatId, hook, archive, configPath);
