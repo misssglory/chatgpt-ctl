@@ -1382,6 +1382,13 @@ async function waitForConversationReady(
   let previousSignature = "";
   let stableSamples = 0;
   while (Date.now() < deadline) {
+    // ChatGPT can reuse a mounted page while its route is being replaced.
+    // Do not spend 45 seconds waiting for a conversation which is no longer
+    // the active URL (or establish a ZIP baseline for that stale route).
+    const routeId = normalizeUuid(page.url());
+    if (routeId && routeId !== chatId) {
+      throw new Error(`conversation route changed while loading: expected=${chatId} actual=${routeId}`);
+    }
     // ChatGPT's scrollable thread container differs between UI revisions.
     // Move every scrollable descendant of main to its end, plus the document.
     await page.evaluate(() => {
@@ -3135,6 +3142,53 @@ async function runHookForZip(
   }
 }
 
+/**
+ * Explicit hook runs must not be blocked by the history watcher's stringent
+ * multi-snapshot readiness gate. A generated ZIP may already be available
+ * even while earlier messages are mounting, or when a local-chatgpt selection
+ * UUID differs from the canonical /c/ UUID. Only proceed after the URL is the
+ * requested chat, streaming has finished, and an assistant-owned file control
+ * has been observed consistently. Never use a user-uploaded archive.
+ */
+async function waitForHookDownloadReady(page: Page, chatId: string, timeoutMs = 20_000): Promise<ScrapedChat> {
+  const deadline = Date.now() + timeoutMs;
+  let previousIdentity = "";
+  let stable = 0;
+  let lastReason = "conversation not hydrated";
+  while (Date.now() < deadline) {
+    const routeId = normalizeUuid(page.url());
+    if (routeId !== chatId) {
+      lastReason = `wrong route (${routeId || "none"})`;
+    } else {
+      const chat = await scrapeCurrentChat(page).catch(() => null);
+      if (chat?.id === chatId && !chat.isStreaming && chat.messages.some(m => m.role === "assistant" && m.completed)) {
+        const zipTargets = assistantZipTargets(await findZipTargets(page), chat.messages).sort(newestZipFirst);
+        const indexed = zipTargets.length ? [] : (await findChatFiles(page, chat.messages))
+          .filter(f => f.role === "assistant" && /\.zip(?:$|[?#\s])|\bZIP\b/i.test(f.label));
+        const selected = zipTargets[0];
+        const identity = selected ? selected.identity : indexed[0]
+          ? `${indexed[0]!.messageId || indexed[0]!.messageOrder}|${indexed[0]!.label}` : "";
+        if (identity) {
+          stable = identity === previousIdentity ? stable + 1 : 0;
+          previousIdentity = identity;
+          if (stable >= 1) {
+            log.info(`[hook] ready assistant ZIP chat=${chatId} label='${selected?.label || indexed[0]!.label}' (without full-history readiness gate)`);
+            return chat;
+          }
+        } else {
+          lastReason = "no assistant-owned ZIP control mounted";
+          stable = 0;
+        }
+      } else {
+        lastReason = chat?.isStreaming ? "assistant response still streaming" : "assistant message not ready";
+        stable = 0;
+      }
+    }
+    await page.waitForTimeout(450);
+  }
+  throw new Error(`chat=${chatId} assistant ZIP not ready within ${timeoutMs}ms: ${lastReason}`);
+}
+
 async function runHookWithLastZip(
   page: Page,
   chatId: string,
@@ -3149,14 +3203,15 @@ async function runHookWithLastZip(
       timeout: cfg.browser?.navigation_timeout_ms ?? 45_000,
     });
   }
-  await waitForConversationReady(page, chatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
+  const readyChat = await waitForHookDownloadReady(page, chatId,
+    Math.min(20_000, cfg.browser?.navigation_timeout_ms ?? 45_000));
   const archiveDir = path.resolve(resolveFromConfig(configPath, hook.folder), ".chatgpt-ctl-downloads");
   // A manual hook must select the newest assistant-owned ZIP, regardless of
   // the previous success cursor or the Files-in-chat menu's independent order.
   // The menu can contain older releases; never let it silently override a
   // newer assistant attachment. No fallback to historical ZIPs is permitted.
-  const current = await scrapeCurrentChat(page);
-  const chatTargets = current ? assistantZipTargets(await findZipTargets(page), current.messages).sort(newestZipFirst) : [];
+  const current = readyChat;
+  const chatTargets = assistantZipTargets(await findZipTargets(page), current.messages).sort(newestZipFirst);
   let archive: string | null = null;
   if (chatTargets.length > 0) {
     log.info(`[hook] newest assistant ZIP selected chat=${chatId} label='${chatTargets[0]!.label}' turn=${chatTargets[0]!.messageOrder} candidates=${chatTargets.length}`);
@@ -3929,7 +3984,9 @@ function startControlServer(
           }
           const target = new URL(`/c/${requestedChatId}`, cfg.chatgpt.url).toString();
           await page.goto(target, { waitUntil: "domcontentloaded", timeout: cfg.browser?.navigation_timeout_ms ?? 45_000 });
-          await waitForConversationReady(page, requestedChatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
+          if (url.pathname !== "/hook/run") {
+            await waitForConversationReady(page, requestedChatId, cfg.browser?.navigation_timeout_ms ?? 45_000);
+          }
           await recordChatBrowser(sql, requestedChatId, runtime.name);
         }
         if (!page) return Response.json({ error: requestedChatId

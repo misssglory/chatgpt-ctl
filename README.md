@@ -1146,3 +1146,10 @@ Rust/Bash/Python/JS syntax in the Code tab.
 ### v0.1.49 — ChatGPT file-tab downloads
 
 Recognizes the file preview right-hand `role="tabpanel"` (`data-tab-id="chatgpt-file:…"`) and clicks its header Download button for the exact requested filename. Archive unsupported preview messages are not accepted as file contents.
+
+### v0.1.60 — manual hook readiness and current-route safeguards
+
+- Explicit `ctl hook run` now waits for a **stable assistant-owned ZIP** in the requested `/c/<uuid>` route instead of requiring the entire React message-history DOM to stabilize first. This handles generated files already present in the pane despite history-readiness timeout; it does not select user uploads.
+- Checks that the download belongs to the correct chat and the assistant has finished streaming, polling for up to 20 seconds by default. Selects the newest assistant-owned ZIP and refuses to downgrade on download failure.
+- Avoids the redundant 45-second full-history readiness wait when opening a new pane specifically for `hook run`.
+- General watcher readiness detects when the pane URL has changed and aborts stale-route waits instead of retrying the wrong chat for 45 seconds.
