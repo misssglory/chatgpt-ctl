@@ -23,6 +23,7 @@ import { autoZipCandidates } from "./auto-zip-candidates.mjs";
 import { nextZipAutoRetry, pendingZipCandidates } from "./auto-zip-retry.mjs";
 import { freshZipCandidates } from "./fresh-zip-candidates.mjs";
 import { conversationLengthLimitPattern } from "./conversation-length-limit.mjs";
+import { snapshotBrowserDownloads, recoverBrowserDownload } from "./download-fallback.mjs";
 
 const log = new Logger({
   type: "pretty",
@@ -2167,6 +2168,7 @@ async function downloadFromChatFilesPanel(page: Page, filename: string, director
   const index = names.indexOf(filename);
   if (index < 0 || !(await button.nth(index).count())) return null;
   const collector = watchAttachmentDownloads(page);
+  const downloadsBefore = await snapshotBrowserDownloads();
   let previewOpened = false;
   try {
     log.info(`[files] trying Files-in-chat menu name='${filename}'`);
@@ -2189,7 +2191,14 @@ async function downloadFromChatFilesPanel(page: Page, filename: string, director
         event = await collector.next(12_000);
       }
     }
-    if (!event) return null;
+    if (!event) {
+      const recovered = await recoverBrowserDownload({ before: downloadsBefore, label: filename, directory });
+      if (recovered) {
+        log.info(`[files] recovered missed Files-in-chat browser download name='${filename}' path=${recovered}`);
+        return recovered;
+      }
+      return null;
+    }
     await mkdir(directory, { recursive: true });
     const suggested = fileNameForDownload(event.suggestedFilename() || filename);
     // Avoid surprising cross-file downloads from a stale selected viewer.
@@ -2241,6 +2250,7 @@ async function retrieveFileFromControl(page: Page, file: ChatFile, directory: st
     .evaluateAll(elements => elements.map(element => element.getAttribute('data-tab-id') || '')));
   const existingPages = new Set(page.context().pages());
   const collector = watchAttachmentDownloads(page);
+  const downloadsBefore = await snapshotBrowserDownloads();
   let viewer = page;
   let previewOpened = false;
   try {
@@ -2360,8 +2370,21 @@ async function retrieveFileFromControl(page: Page, file: ChatFile, directory: st
     if (download) return await save(download);
     const previewUnavailable = await viewer.getByText(/(?:couldn[’']t|cannot|unable to) load (?:this |the )?file/i)
       .first().isVisible().catch(() => false);
+    const recoveredAfterPreview = await recoverBrowserDownload({ before: downloadsBefore, label: file.label, directory });
+    if (recoveredAfterPreview) {
+      log.info(`[files] recovered browser download after preview failure name='${file.label}' path=${recoveredAfterPreview}`);
+      return recoveredAfterPreview;
+    }
     if (previewUnavailable) throw new Error(
       `'${file.label}' preview reports "Couldn't load this file" and the exact attachment's Download action produced no browser download. ChatGPT may no longer serve this attachment; try opening the original message or regenerating the file.`);
+    // Some Chromium downloads are visible in the browser's Downloads UI but
+    // are not surfaced to the originating Playwright Page. Recover only a
+    // newly created, completed, unambiguous file from the browser download dir.
+    const recovered = await recoverBrowserDownload({ before: downloadsBefore, label: file.label, directory });
+    if (recovered) {
+      log.info(`[files] recovered missed browser download name='${file.label}' path=${recovered}`);
+      return recovered;
+    }
     throw new Error(`'${file.label}' yielded neither a captured browser download nor readable file preview`);
   } finally {
     collector.stop();
@@ -3553,6 +3576,7 @@ function startControlServer(
   configPath: string,
   sql: Sql,
   ensureRuntimeForChat: (chatId: string) => Promise<BrowserRuntime>,
+  sendGate: { activeHooks: Set<string>; pendingZips: Map<string, unknown>; checkedAssistants: Map<string, string> },
 ) {
   const chooseDefaultRuntime = () => runtimes.find((runtime) => runtime.name === "default") ?? runtimes[0];
   const makePage = async (runtime: BrowserRuntime): Promise<Page> => {
@@ -3565,6 +3589,56 @@ function startControlServer(
   const newChatTarget = async (runtime: BrowserRuntime): Promise<string> => {
     const project = await projectForBrowser(sql,runtime.name);
     return new URL(project ? `/g/${project}/project` : '/', cfg.chatgpt.url).toString();
+  };
+  // A send must not overtake either the assistant response or the ZIP hook
+  // associated with that response. Read the currently selected chat, not a
+  // stale globally focused page. The watcher marks each settled assistant turn
+  // after its ZIP detection/build path is evaluated.
+  const sendGateReason = async (page: Page): Promise<string | null> => {
+    const chatId = normalizeUuid(page.url());
+    if (!chatId) return null; // newly created chat has no predecessor
+    if (sendGate.activeHooks.has(chatId)) return "previous hook is running";
+    if (Array.from(sendGate.pendingZips.keys()).some(key => key.startsWith(`${chatId}:`)))
+      return "previous ZIP download/hook is awaiting retry";
+    const chat = await scrapeCurrentChat(page).catch(() => null);
+    if (!chat || chat.id !== chatId) return "previous conversation is still loading";
+    if (chat.isStreaming) return "previous assistant answer is still generating";
+    const turns = chat.messages.filter(m => m.role === "assistant" || m.role === "user");
+    const lastUserIndex = turns.findLastIndex(m => m.role === "user");
+    if (lastUserIndex < 0) return null;
+    const latest = turns.slice(lastUserIndex + 1).find(m => m.role === "assistant" && m.completed);
+    if (!latest) return "awaiting previous assistant answer";
+    const hook = await loadChatHook(sql, chatId);
+    if (hook?.enabled && sendGate.checkedAssistants.get(chatId) !== latest.id)
+      return "awaiting previous answer's ZIP hook check";
+    // Even after the previous poll succeeded, a ZIP may appear with a short
+    // rendering delay. Require two consistent idle samples in waitForSendGate.
+    return null;
+  };
+  const waitForSendGate = async (page: Page, chatId: string, timeoutMs = 540_000) => {
+    const deadline = Date.now() + timeoutMs;
+    let stable = 0;
+    let lastReason = "";
+    while (Date.now() < deadline) {
+      if (chatId && normalizeUuid(page.url()) !== chatId)
+        throw new Error(`send: target chat changed while waiting (${page.url()})`);
+      const reason = await sendGateReason(page);
+      if (!reason) {
+        stable++;
+        if (stable >= 3) {
+          if (lastReason) log.info(`[send] previous answer and hook completed chat=${chatId}`);
+          return;
+        }
+      } else {
+        stable = 0;
+        if (reason !== lastReason) {
+          log.info(`[send] awaiting previous answer chat=${chatId} reason='${reason}'`);
+          lastReason = reason;
+        }
+      }
+      await page.waitForTimeout(950);
+    }
+    throw new Error(`send: timed out awaiting previous answer and hook chat=${chatId} reason='${lastReason}' (draft not sent)`);
   };
   const server = Bun.serve({
     hostname: CONTROL_HOST,
@@ -3583,6 +3657,15 @@ function startControlServer(
           url: active?.page.url() ?? null,
         });
       }
+        if (request.method === "GET" && url.pathname === "/send/readiness") {
+          const requested = normalizeUuid(url.searchParams.get("chat_id") || "");
+          const selected = requested
+            ? openConversationPages(runtimes).find(p => p.chatId === requested)?.page
+            : (() => { try { return getVirtualFocus(focus, runtimes).page; } catch { return undefined; } })();
+          if (!selected) return Response.json({ ready: false, reason: "chat pane is not open" });
+          const reason = await sendGateReason(selected);
+          return Response.json({ ready: !reason, reason, chat_id: normalizeUuid(selected.url()) });
+        }
       if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
       try {
         const body = await request.json().catch(() => ({})) as {
@@ -3895,6 +3978,11 @@ function startControlServer(
           void page.bringToFront().catch((error) => {
             log.warn(`[ctl] asynchronous send pane activation failed chat=${requestedChatId || normalizeUuid(page.url()) || "new"}: ${String(error)}`);
           });
+          if (!draft && !body.new_chat) {
+            // Wait BEFORE filling or clicking the composer. Existing drafts and
+            // attachments survive unchanged during the previous hook.
+            await waitForSendGate(page, requestedChatId || normalizeUuid(page.url()));
+          }
           if (sendExisting) {
             const activeComposer = page.locator('#prompt-textarea:visible, [data-composer-markdown][contenteditable="true"]:visible, [contenteditable="true"][role="textbox"]:visible, textarea:visible').last();
             await activeComposer.waitFor({ state: "visible", timeout: 20_000 });
@@ -4008,7 +4096,11 @@ function startControlServer(
           }
           const hook = await loadChatHook(sql, chatId);
           if (!hook) return Response.json({ error: `no hook configured for ${chatId}` }, { status: 404 });
-          const archive = await runHookWithLastZip(page, chatId, hook, cfg, configPath);
+          if (sendGate.activeHooks.has(chatId)) throw new Error(`hook already running chat=${chatId}`);
+          sendGate.activeHooks.add(chatId);
+          let archive: string;
+          try { archive = await runHookWithLastZip(page, chatId, hook, cfg, configPath); }
+          finally { sendGate.activeHooks.delete(chatId); }
           setVirtualFocus(focus, runtime, page, "ctl");
           return Response.json({ ok: true, chat_id: chatId, browser_name: runtime.name, archive, url: page.url() });
         }
@@ -4295,6 +4387,7 @@ async function watch(cfg: Config, configPath: string) {
   const pendingHookMessages = new Map<string, Map<string, number>>();
   // Multiple open panes can show the same conversation. Never run its hook twice concurrently.
   const activeHookChats = new Set<string>();
+  const hookCheckedAssistantByChat = new Map<string, string>();
   const retryClickCooldowns = new Map<string, number>();
   const deliveryRetryState = new Map<string, { attempts: number; lastAttempt: number; absentPolls: number }>();
   const closedContexts = new WeakSet<BrowserContext>();
@@ -4481,7 +4574,8 @@ async function watch(cfg: Config, configPath: string) {
     sessionPersistence.schedule("watch-startup");
     await sessionPersistence.flush();
     log.info(`[watch] restored ${restoredCount} previously open chat pane(s)`);
-    controlServer = startControlServer(runtimes, focus, cfg, configPath, sql, ensureRuntimeForChat);
+    controlServer = startControlServer(runtimes, focus, cfg, configPath, sql, ensureRuntimeForChat,
+      { activeHooks: activeHookChats, pendingZips: pendingZipDownloads, checkedAssistants: hookCheckedAssistantByChat });
     log.info(`[watch] synchronized ${initialTotal} sidebar chats across ${runtimes.length} browser profile(s)`);
     log.info(`[watch] poll=${pollMs}ms settle=${settleMs}ms multi-pane and multi-browser enabled`);
 
@@ -4584,6 +4678,8 @@ async function watch(cfg: Config, configPath: string) {
               baselineUserMessageByChat.set(chat.id, lastUser?.id ?? null);
               baselineUserSequenceByChat.set(chat.id, lastUser?.sequence ?? null);
               readyChatByPage.set(page, chat.id);
+              if (lastAssistant?.completed && !readySnapshot.isStreaming)
+                hookCheckedAssistantByChat.set(chat.id, lastAssistant.id);
               lastSeenChatByPage.set(page, chat.id);
               const rolloverHook = await loadChatHook(sql, chat.id);
               if (rolloverHook?.enabled && await hasConversationLengthLimit(page)) {
@@ -4808,6 +4904,11 @@ async function watch(cfg: Config, configPath: string) {
             } else {
               initializedHookChats.delete(chat.id);
               pendingHookMessages.delete(chat.id);
+            }
+            if (!chat.isStreaming && !activeHookChats.has(chat.id) &&
+                !Array.from(pendingZipDownloads.keys()).some(key => key.startsWith(`${chat.id}:`))) {
+              const latestAssistant = latestAssistantFromMessages(chat.messages);
+              if (latestAssistant?.completed) hookCheckedAssistantByChat.set(chat.id, latestAssistant.id);
             }
           } catch (pageError) {
             if (page.isClosed() || closedContexts.has(runtime.context) || isClosedTargetError(pageError)) return;

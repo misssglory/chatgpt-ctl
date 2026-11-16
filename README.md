@@ -1,3 +1,19 @@
+## v0.1.62 — wait for previous answer and hook before ctl send
+
+`ctl send` (including no-argument submission of the existing composer) now **waits** before uploading, replacing or sending anything when the target conversation has an unanswered user message, a streaming assistant response, an active hook, a pending ZIP retry, or an assistant response whose ZIP hook check has not finished. The watcher observes the same selected conversation through its existing browser pane and runs a three-sample idle barrier to avoid racing a newly completed response. Hook failures that have finished are considered *performed*, not successful; exhausted download retries do not silently block forever. The wait has a 9-minute timeout (the CLI request timeout is 10 minutes), failing without sending on timeout or navigation away from the selected chat.
+
+When blocked, `ctl` prints an immediate informational message, for example:
+
+```text
+[send] Awaiting previous answer and hook: previous assistant answer is still generating. New message will be sent automatically when ready.
+```
+
+The watcher also logs state transitions under `[send] awaiting previous answer ...`. The CLI checks `GET /send/readiness` for the immediate status but **the server enforces the wait again** before submitting. `ctl send --draft` and `ctl send --new-chat` bypass the predecessor barrier. No new database migration is needed. **Rebuild the Rust ctl binary** for the CLI-side status; watcher-side gating is in `src/index.ts`.
+
+## v0.1.61 — recover missed native browser downloads
+
+If the browser completes a download but Playwright misses its download event, `ctl files` now inspects newly created files in the browser download directory (`$XDG_DOWNLOAD_DIR` or `~/Downloads`), requires an unambiguous filename and completed stable bytes, and verifies ZIP magic before copying into the requested watcher destination. Existing Playwright downloads remain the first choice. No preexisting or ambiguous file is reused.
+
 ## v0.1.59 — Never replay older ZIP when a newer assistant release exists
 
 - `ctl hook run` selects only the newest assistant-owned ZIP by message turn/position, not the previously successful ZIP, saved cursor, or arbitrary Files-in-chat menu order.

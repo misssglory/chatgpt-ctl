@@ -1816,6 +1816,23 @@ async fn main() -> Result<()> {
                 "draft": draft,
                 "send_existing": send_existing,
             }).to_string();
+            // Explain why the CLI may remain blocked before posting the draft.
+            // The server rechecks atomically at submission time; this is only
+            // an informative, best-effort preflight status.
+            if !draft && !new_chat {
+                let route = match &chat_id {
+                    Some(id) => format!("/send/readiness?chat_id={id}"),
+                    None => "/send/readiness".to_string(),
+                };
+                if let Ok(status) = watcher_request("GET", &route, None) {
+                    if let Ok(state) = serde_json::from_str::<serde_json::Value>(&status) {
+                        if state.get("ready").and_then(|v| v.as_bool()) == Some(false) {
+                            let reason = state.get("reason").and_then(|v| v.as_str()).unwrap_or("previous answer or hook pending");
+                            eprintln!("[send] Awaiting previous answer and hook: {reason}. New message will be sent automatically when ready.");
+                        }
+                    }
+                }
+            }
             let response = watcher_request("POST", "/send", Some(&body))?;
             let value: serde_json::Value = serde_json::from_str(&response)?;
             let destination = value.get("chat_id").and_then(|v| v.as_str()).unwrap_or("focused chat");
